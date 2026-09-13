@@ -182,7 +182,7 @@ int breeze_generator_prefill(breeze_generator * gen, const char * text,
         std::vector<float> emb_c = breeze::text_encoder_forward(gen->model, tokens);
         int total_c = (int) tokens.size();
 
-        const int max_new = gen->model.cfg.max_new_tokens > 0 ? gen->model.cfg.max_new_tokens : 800;
+        const int max_new = gen->model.cfg.max_new_tokens > 0 ? gen->model.cfg.max_new_tokens : 2048;
         if (gen->st_init) gen->st.free();
         gen->st.init(gen->model, total_c + max_new + 8);
         gen->st_init = true;
