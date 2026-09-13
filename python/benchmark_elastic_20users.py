@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--out-dir", type=str, default="elastic_20user_audio", help="Output audio directory")
     parser.add_argument("--n-users", type=int, default=20, help="Number of concurrent users")
     parser.add_argument("--quantum", type=int, default=2, help="Adaptive quantum frame count (default: 2)")
+    parser.add_argument("--max-slots", type=int, default=8, help="Max active sessions per GPU (default: 8)")
     parser.add_argument("--enable-q4-burst", action="store_true", help="Enable surge Q4 tiering for high load")
     parser.add_argument("--q4-model", type=str, default=None, help="Path to Q4 GGUF model for surge tiering")
     parser.add_argument("--q4-threshold", type=int, default=10, help="Per-GPU slot threshold to trigger Q4 tiering")
@@ -54,6 +55,7 @@ def main():
     else:
         print("Surge Q4 Tier:   Disabled (100% Q8_0 High-Fidelity)")
     print(f"Quantum Frames:  {args.quantum} (Initial TTFA: 1 frame)")
+    print(f"Max Slots / GPU: {args.max_slots}")
     print(f"Output:          {args.out_dir}")
 
     cluster = DualInstanceCluster(
@@ -81,7 +83,8 @@ def main():
         tasks,
         out_dir=args.out_dir,
         on_progress=progress_cb,
-        quantum_frames=args.quantum
+        quantum_frames=args.quantum,
+        max_slots_per_gpu=args.max_slots
     )
     total_wall = time.time() - t_start
 

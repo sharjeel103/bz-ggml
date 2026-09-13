@@ -83,7 +83,8 @@ class DualInstanceCluster:
         out_dir: str = "audio_out",
         arrival_delays: Optional[List[float]] = None,
         on_progress: Optional[Callable[[ClusterResult], None]] = None,
-        quantum_frames: int = 2
+        quantum_frames: int = 2,
+        max_slots_per_gpu: int = 8
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
 
@@ -299,11 +300,11 @@ class DualInstanceCluster:
 
         worker_a = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance A", self.gen_a, self.gen_a_q4, voc_a_queue, 0, 15)
+            args=("Instance A", self.gen_a, self.gen_a_q4, voc_a_queue, 0, max_slots_per_gpu)
         )
         worker_b = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance B", self.gen_b, self.gen_b_q4, voc_b_queue, 1, 15)
+            args=("Instance B", self.gen_b, self.gen_b_q4, voc_b_queue, 1, max_slots_per_gpu)
         )
         worker_a.start()
         worker_b.start()
