@@ -79,6 +79,28 @@ BREEZE_API void breeze_vocoder_free(breeze_vocoder * voc);
 BREEZE_API int breeze_vocoder_stream_decode(breeze_vocoder * voc, const int * frames, 
                                             int n_frames, float * out_pcm);
 
+// --- Multi-Session Continuous Batching / Dynamic Interleaved Scheduling C API ---
+// Create and prefill an independent session slot inside the generator's local GPU memory
+BREEZE_API int breeze_generator_session_create(breeze_generator * gen, int session_id, 
+                                               const char * text, const char * instruction, 
+                                               float cfg_scale, unsigned int seed, int * out_cb0);
+
+// Step 1 frame for a specific active session. Returns next cb0 (or -1 if EOS reached)
+BREEZE_API int breeze_generator_session_step(breeze_generator * gen, int session_id, 
+                                             unsigned int seed, int * out_frame_16);
+
+// Free an individual session slot upon EOS, releasing its local KV cache
+BREEZE_API int breeze_generator_session_free(breeze_generator * gen, int session_id);
+
+// Query active session count
+BREEZE_API int breeze_generator_session_count(breeze_generator * gen);
+
+// Step 1 round across an array of active sessions in a single C++ dispatch
+BREEZE_API int breeze_generator_sessions_step_round(breeze_generator * gen, 
+                                                    const int * session_ids, int num_sessions, 
+                                                    unsigned int seed,
+                                                    int * out_frames_16, int * out_next_cb0);
+
 #ifdef __cplusplus
 }
 #endif

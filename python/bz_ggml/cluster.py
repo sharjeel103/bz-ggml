@@ -14,7 +14,9 @@ class UserTask:
     id: int
     text: str
     instruction: str = "Speak clearly and naturally."
+    cfg_scale: float = 1.0
     seed: int = 42
+    max_steps: int = 750
 
 @dataclass
 class ClusterResult:
@@ -146,61 +148,102 @@ class DualInstanceCluster:
         voc_thread = threading.Thread(target=vocoder_loop)
         voc_thread.start()
 
-        # 2. Generator Worker Loop
-        def generator_loop(worker_name: str, gen: GeneratorHandle, gpu_id: int):
+        # 2. Generator Multi-Session Worker Loop
+        all_dispatched = threading.Event()
+
+        def generator_multi_session_loop(worker_name: str, gen: GeneratorHandle, gpu_id: int, max_slots: int = 10):
+            active_sessions = {}
+            chunk_size = 4  # 4 frames = 320ms audio chunks for smooth streaming
+
             while not workers_stopping:
-                try:
-                    task_item, arr_time = job_queue.get(timeout=0.05)
-                except queue.Empty:
-                    continue
-                if task_item is None:
-                    break
-
-                t_exec_start = time.time()
-                words = len(task_item.text.split())
-
-                # Stage 1: Prefill
-                cb0 = gen.prefill(task_item.text, task_item.instruction, task_item.seed + task_item.id)
-
-                # Stage 2: Frame Loop
-                chunk_buffer = []
-                chunk_size = 8
-                total_frames = 0
-                max_steps = 700
-
-                for step in range(max_steps):
-                    if cb0 < 0:
+                # A. Admit waiting tasks up to max_slots capacity
+                while len(active_sessions) < max_slots and not workers_stopping:
+                    try:
+                        task_item, arr_time = job_queue.get_nowait()
+                    except queue.Empty:
                         break
 
-                    next_cb0, frame16 = gen.step_frame(cb0, task_item.seed + step)
-                    total_frames += 1
-                    chunk_buffer.extend(frame16)
+                    if task_item is None:
+                        break
 
-                    # Immediate Frame 1 dispatch for low TTFA
-                    if total_frames == 1:
+                    t_exec_start = time.time()
+                    words = len(task_item.text.split())
+                    cfg_scale = getattr(task_item, "cfg_scale", 1.0)
+                    sid = task_item.id
+
+                    try:
+                        cb0 = gen.session_create(
+                            session_id=sid,
+                            text=task_item.text,
+                            instruction=task_item.instruction,
+                            cfg_scale=cfg_scale,
+                            seed=task_item.seed + sid
+                        )
+                    except Exception as e:
+                        print(f"[{worker_name}] Error creating session {sid}: {e}")
+                        job_queue.task_done()
+                        continue
+
+                    active_sessions[sid] = {
+                        "task": task_item,
+                        "arr_time": arr_time,
+                        "t_exec_start": t_exec_start,
+                        "words": words,
+                        "cb0": cb0,
+                        "total_frames": 0,
+                        "chunk_buffer": [],
+                        "max_steps": getattr(task_item, "max_steps", 750)
+                    }
+
+                if not active_sessions:
+                    if all_dispatched.is_set() and job_queue.empty():
+                        break
+                    time.sleep(0.005)
+                    continue
+
+                # B. Step 1 quantum (1 frame) across all active sessions in round-robin order
+                active_sids = list(active_sessions.keys())
+                for sid in active_sids:
+                    s = active_sessions.get(sid)
+                    if not s:
+                        continue
+
+                    task_item = s["task"]
+                    step_seed = task_item.seed + s["total_frames"]
+                    next_cb0, frame16 = gen.session_step(sid, step_seed)
+                    s["total_frames"] += 1
+                    s["chunk_buffer"].extend(frame16)
+
+                    # Immediate Frame 1 dispatch for ultra-low TTFA (< 500ms)
+                    if s["total_frames"] == 1:
                         vocoder_queue.put((
-                            task_item.id, words, arr_time, t_exec_start,
-                            list(chunk_buffer), True, False, total_frames, f"GPU {gpu_id} ({worker_name})"
+                            task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
+                            list(s["chunk_buffer"]), True, False, s["total_frames"], f"GPU {gpu_id} ({worker_name})"
                         ))
-                        chunk_buffer = []
-                    elif len(chunk_buffer) >= (chunk_size * 16):
+                        s["chunk_buffer"] = []
+                    elif len(s["chunk_buffer"]) >= (chunk_size * 16):
                         vocoder_queue.put((
-                            task_item.id, words, arr_time, t_exec_start,
-                            list(chunk_buffer), False, False, total_frames, f"GPU {gpu_id} ({worker_name})"
+                            task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
+                            list(s["chunk_buffer"]), False, False, s["total_frames"], f"GPU {gpu_id} ({worker_name})"
                         ))
-                        chunk_buffer = []
+                        s["chunk_buffer"] = []
 
-                    cb0 = next_cb0
+                    s["cb0"] = next_cb0
 
-                # End of stream flush
-                vocoder_queue.put((
-                    task_item.id, words, arr_time, t_exec_start,
-                    list(chunk_buffer), False, True, total_frames, f"GPU {gpu_id} ({worker_name})"
-                ))
-                job_queue.task_done()
+                    # C. Check if EOS or max_steps reached
+                    if next_cb0 < 0 or s["total_frames"] >= s["max_steps"]:
+                        # End of stream flush to vocoder
+                        vocoder_queue.put((
+                            task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
+                            list(s["chunk_buffer"]), False, True, s["total_frames"], f"GPU {gpu_id} ({worker_name})"
+                        ))
+                        # Free session slot immediately in local VRAM
+                        gen.session_free(sid)
+                        del active_sessions[sid]
+                        job_queue.task_done()
 
-        worker_a = threading.Thread(target=generator_loop, args=("Instance A", self.gen_a, 0))
-        worker_b = threading.Thread(target=generator_loop, args=("Instance B", self.gen_b, 1))
+        worker_a = threading.Thread(target=generator_multi_session_loop, args=("Instance A", self.gen_a, 0, 10))
+        worker_b = threading.Thread(target=generator_multi_session_loop, args=("Instance B", self.gen_b, 1, 10))
         worker_a.start()
         worker_b.start()
 
@@ -214,14 +257,13 @@ class DualInstanceCluster:
                     time.sleep(delay - elapsed)
             job_queue.put((task, time.time()))
 
+        all_dispatched.set()
+
         job_queue.join()
         vocoder_queue.join()
 
         # Shutdown workers
         workers_stopping = True
-        job_queue.put((None, None))
-        job_queue.put((None, None))
-        vocoder_queue.put(None)
         worker_a.join()
         worker_b.join()
         voc_thread.join()

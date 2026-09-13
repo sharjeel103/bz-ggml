@@ -59,6 +59,30 @@ class BreezeLib:
         ]
         self.lib.breeze_generator_step_frame.restype = ctypes.c_int
 
+        # Multi-Session Dynamic API
+        self.lib.breeze_generator_session_create.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_float, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)
+        ]
+        self.lib.breeze_generator_session_create.restype = ctypes.c_int
+
+        self.lib.breeze_generator_session_step.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)
+        ]
+        self.lib.breeze_generator_session_step.restype = ctypes.c_int
+
+        self.lib.breeze_generator_session_free.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.breeze_generator_session_free.restype = ctypes.c_int
+
+        self.lib.breeze_generator_session_count.argtypes = [ctypes.c_void_p]
+        self.lib.breeze_generator_session_count.restype = ctypes.c_int
+
+        self.lib.breeze_generator_sessions_step_round.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.c_uint32, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
+        ]
+        self.lib.breeze_generator_sessions_step_round.restype = ctypes.c_int
+
         # Vocoder API
         self.lib.breeze_vocoder_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
         self.lib.breeze_vocoder_init.restype = ctypes.c_void_p
@@ -97,6 +121,43 @@ class GeneratorHandle:
             self.handle, cb0, ctypes.c_uint32(seed), frame_buf
         )
         return next_cb0, list(frame_buf)
+
+    def session_create(self, session_id: int, text: str, instruction: str = "Speak clearly and naturally.", cfg_scale: float = 1.0, seed: int = 42) -> int:
+        cb0_buf = ctypes.c_int()
+        res = self.lib.lib.breeze_generator_session_create(
+            self.handle, session_id, text.encode("utf-8"), instruction.encode("utf-8"),
+            ctypes.c_float(cfg_scale), ctypes.c_uint32(seed), ctypes.byref(cb0_buf)
+        )
+        if res != 0:
+            raise RuntimeError(f"Session create failed on Generator (device {self.device}, session {session_id})")
+        return cb0_buf.value
+
+    def session_step(self, session_id: int, seed: int) -> Tuple[int, List[int]]:
+        frame_buf = (ctypes.c_int * 16)()
+        next_cb0 = self.lib.lib.breeze_generator_session_step(
+            self.handle, session_id, ctypes.c_uint32(seed), frame_buf
+        )
+        return next_cb0, list(frame_buf)
+
+    def session_free(self, session_id: int):
+        self.lib.lib.breeze_generator_session_free(self.handle, session_id)
+
+    def active_session_count(self) -> int:
+        return self.lib.lib.breeze_generator_session_count(self.handle)
+
+    def sessions_step_round(self, session_ids: List[int], seed: int = 42) -> Tuple[List[int], List[List[int]]]:
+        n = len(session_ids)
+        if n == 0:
+            return [], []
+        c_sids = (ctypes.c_int * n)(*session_ids)
+        c_frames = (ctypes.c_int * (n * 16))()
+        c_next_cb0 = (ctypes.c_int * n)()
+        self.lib.lib.breeze_generator_sessions_step_round(
+            self.handle, c_sids, n, ctypes.c_uint32(seed), c_frames, c_next_cb0
+        )
+        next_cb0s = list(c_next_cb0)
+        frames = [list(c_frames[i*16:(i+1)*16]) for i in range(n)]
+        return next_cb0s, frames
 
     def close(self):
         if self.handle:
