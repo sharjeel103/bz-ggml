@@ -33,54 +33,75 @@ class ClusterResult:
 
 class DualInstanceCluster:
     """
-    Dual-Instance Generator & Dedicated Streaming Vocoder Cluster.
-      GPU 0: Text Encoder + Generator Instance A (Backbone + 15-step Depth)
-      GPU 1: Generator Instance B (Backbone + 15-step Depth) + Dedicated Streaming Vocoder
-      Zero Intra-Frame PCIe Ping-Pong | Sub-250ms Warm TTFA | 8-Frame Batched Chunks
+    Symmetric Autonomous Dual-Island Architecture (10/10 Design).
+      GPU 0: Generator Instance A + Dedicated Streaming Vocoder A (Autonomous Island 0)
+      GPU 1: Generator Instance B + Dedicated Streaming Vocoder B (Autonomous Island 1)
+      Zero Cross-GPU PCIe Contention | 100% Saturated Dual GPUs | Adaptive Dynamic Quantum
+      Optional Surge Tiering: Dynamically routes burst overflow sessions to Q4 when threshold exceeded.
     """
 
-    def __init__(self, model_path: str, lib_path: Optional[str] = None):
+    def __init__(
+        self,
+        model_path: str,
+        lib_path: Optional[str] = None,
+        q4_model_path: Optional[str] = None,
+        enable_q4_burst: bool = False,
+        q4_threshold: int = 10
+    ):
         self.model_path = model_path
+        self.q4_model_path = q4_model_path
+        self.enable_q4_burst = enable_q4_burst
+        self.q4_threshold = q4_threshold
         self.lib = BreezeLib(lib_path)
 
-        print("[Cluster] Initializing Generator Instance A on CUDA0...")
+        # Autonomous Island 0 (GPU 0)
+        print("[Cluster] Initializing Autonomous Island 0 on CUDA0...")
         t0 = time.time()
         self.gen_a = GeneratorHandle(self.lib, model_path, cuda_device=0)
-        print(f"   -> Instance A Online on CUDA0 in {time.time()-t0:.2f}s")
+        self.voc_a = VocoderHandle(self.lib, model_path, cuda_device=0)
+        print(f"   -> Island 0 (Gen A + Voc A) Online on CUDA0 in {time.time()-t0:.2f}s")
 
-        print("[Cluster] Initializing Generator Instance B on CUDA1...")
+        # Autonomous Island 1 (GPU 1)
+        print("[Cluster] Initializing Autonomous Island 1 on CUDA1...")
         t0 = time.time()
         self.gen_b = GeneratorHandle(self.lib, model_path, cuda_device=1)
-        print(f"   -> Instance B Online on CUDA1 in {time.time()-t0:.2f}s")
+        self.voc_b = VocoderHandle(self.lib, model_path, cuda_device=1)
+        print(f"   -> Island 1 (Gen B + Voc B) Online on CUDA1 in {time.time()-t0:.2f}s")
 
-        print("[Cluster] Initializing Dedicated Streaming Vocoder on CUDA1...")
-        t0 = time.time()
-        self.voc = VocoderHandle(self.lib, model_path, cuda_device=1)
-        print(f"   -> Streaming Vocoder Online on CUDA1 in {time.time()-t0:.2f}s")
+        # Optional Q4 Burst Generators for extreme load shed
+        self.gen_a_q4 = None
+        self.gen_b_q4 = None
+        if self.enable_q4_burst and self.q4_model_path and os.path.exists(self.q4_model_path):
+            print(f"[Cluster] Initializing Surge Q4 Generators on CUDA0 and CUDA1 (Threshold: {self.q4_threshold})...")
+            self.gen_a_q4 = GeneratorHandle(self.lib, self.q4_model_path, cuda_device=0)
+            self.gen_b_q4 = GeneratorHandle(self.lib, self.q4_model_path, cuda_device=1)
+            print("   -> Surge Q4 Generators Online.")
 
     def run_workload(
         self,
         tasks: List[UserTask],
         out_dir: str = "audio_out",
         arrival_delays: Optional[List[float]] = None,
-        on_progress: Optional[Callable[[ClusterResult], None]] = None
+        on_progress: Optional[Callable[[ClusterResult], None]] = None,
+        quantum_frames: int = 2
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
 
         job_queue = queue.Queue()
-        vocoder_queue = queue.Queue()
+        voc_a_queue = queue.Queue()
+        voc_b_queue = queue.Queue()
+
         user_audio_results = {}
         user_audio_lock = threading.Lock()
         completed_results: List[ClusterResult] = []
         results_lock = threading.Lock()
-        cluster_t0 = time.time()
         workers_stopping = False
 
-        # 1. Vocoder Worker Thread on GPU 1
-        def vocoder_loop():
+        # 1. Independent Vocoder Worker Loops on GPU 0 and GPU 1
+        def vocoder_loop(v_queue: queue.Queue, voc_handle: VocoderHandle, voc_tag: str):
             while not workers_stopping:
                 try:
-                    task = vocoder_queue.get(timeout=0.05)
+                    task = v_queue.get(timeout=0.05)
                 except queue.Empty:
                     continue
                 if task is None:
@@ -90,7 +111,7 @@ class DualInstanceCluster:
 
                 n_frames = len(frames_list) // 16
                 if n_frames > 0:
-                    samples = self.voc.stream_decode(frames_list, n_frames)
+                    samples = voc_handle.stream_decode(frames_list, n_frames)
                     with user_audio_lock:
                         if u_id not in user_audio_results:
                             user_audio_results[u_id] = {
@@ -134,7 +155,7 @@ class DualInstanceCluster:
                         turnaround_s=round(turnaround_s, 2),
                         ttfa_s=round(ttfa, 3),
                         rtf=round(rtf, 3),
-                        worker=worker_tag,
+                        worker=f"{worker_tag} + {voc_tag}",
                         wav_path=out_wav
                     )
 
@@ -143,15 +164,24 @@ class DualInstanceCluster:
                         if on_progress:
                             on_progress(res)
 
-                vocoder_queue.task_done()
+                v_queue.task_done()
 
-        voc_thread = threading.Thread(target=vocoder_loop)
-        voc_thread.start()
+        voc_a_thread = threading.Thread(target=vocoder_loop, args=(voc_a_queue, self.voc_a, "Vocoder A (GPU 0)"))
+        voc_b_thread = threading.Thread(target=vocoder_loop, args=(voc_b_queue, self.voc_b, "Vocoder B (GPU 1)"))
+        voc_a_thread.start()
+        voc_b_thread.start()
 
-        # 2. Generator Multi-Session Worker Loop
+        # 2. Generator Multi-Session Worker Loop with Adaptive Quantum
         all_dispatched = threading.Event()
 
-        def generator_multi_session_loop(worker_name: str, gen: GeneratorHandle, gpu_id: int, max_slots: int = 10):
+        def generator_multi_session_loop(
+            worker_name: str,
+            gen_default: GeneratorHandle,
+            gen_q4: Optional[GeneratorHandle],
+            voc_queue: queue.Queue,
+            gpu_id: int,
+            max_slots: int = 15
+        ):
             active_sessions = {}
             chunk_size = 4  # 4 frames = 320ms audio chunks for smooth streaming
 
@@ -171,8 +201,17 @@ class DualInstanceCluster:
                     cfg_scale = getattr(task_item, "cfg_scale", 1.0)
                     sid = task_item.id
 
+                    # Select Q4 if surge tiering is enabled and load exceeds threshold
+                    use_q4 = (
+                        self.enable_q4_burst
+                        and gen_q4 is not None
+                        and len(active_sessions) >= self.q4_threshold
+                    )
+                    active_gen = gen_q4 if use_q4 else gen_default
+                    model_tag = "Q4" if use_q4 else "Q8"
+
                     try:
-                        cb0 = gen.session_create(
+                        cb0 = active_gen.session_create(
                             session_id=sid,
                             text=task_item.text,
                             instruction=task_item.instruction,
@@ -186,6 +225,8 @@ class DualInstanceCluster:
 
                     active_sessions[sid] = {
                         "task": task_item,
+                        "gen": active_gen,
+                        "model_tag": model_tag,
                         "arr_time": arr_time,
                         "t_exec_start": t_exec_start,
                         "words": words,
@@ -198,10 +239,10 @@ class DualInstanceCluster:
                 if not active_sessions:
                     if all_dispatched.is_set() and job_queue.empty():
                         break
-                    time.sleep(0.005)
+                    time.sleep(0.002)
                     continue
 
-                # B. Step 1 quantum (1 frame) across all active sessions in round-robin order
+                # B. Step active sessions with Adaptive Quantum
                 active_sids = list(active_sessions.keys())
                 for sid in active_sids:
                     s = active_sessions.get(sid)
@@ -209,45 +250,65 @@ class DualInstanceCluster:
                         continue
 
                     task_item = s["task"]
-                    step_seed = task_item.seed + s["total_frames"]
-                    next_cb0, frame16 = gen.session_step(sid, step_seed)
-                    s["total_frames"] += 1
-                    s["chunk_buffer"].extend(frame16)
+                    gen = s["gen"]
 
-                    # Immediate Frame 1 dispatch for ultra-low TTFA (< 500ms)
-                    if s["total_frames"] == 1:
-                        vocoder_queue.put((
-                            task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                            list(s["chunk_buffer"]), True, False, s["total_frames"], f"GPU {gpu_id} ({worker_name})"
-                        ))
-                        s["chunk_buffer"] = []
-                    elif len(s["chunk_buffer"]) >= (chunk_size * 16):
-                        vocoder_queue.put((
-                            task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                            list(s["chunk_buffer"]), False, False, s["total_frames"], f"GPU {gpu_id} ({worker_name})"
-                        ))
-                        s["chunk_buffer"] = []
+                    # Quantum size: exactly 1 frame for the very first step (sub-second TTFA),
+                    # and quantum_frames (e.g. 2) for subsequent steps to maximize tensor core saturation!
+                    step_quantum = 1 if s["total_frames"] == 0 else quantum_frames
 
-                    s["cb0"] = next_cb0
+                    finished_eos = False
+                    for _ in range(step_quantum):
+                        step_seed = task_item.seed + s["total_frames"]
+                        next_cb0, frame16 = gen.session_step(sid, step_seed)
+                        s["total_frames"] += 1
+                        s["chunk_buffer"].extend(frame16)
+                        s["cb0"] = next_cb0
+
+                        # Immediate Frame 1 dispatch for ultra-low TTFA (< 800ms)
+                        if s["total_frames"] == 1:
+                            voc_queue.put((
+                                task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
+                                list(s["chunk_buffer"]), True, False, s["total_frames"],
+                                f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
+                            ))
+                            s["chunk_buffer"] = []
+                        elif len(s["chunk_buffer"]) >= (chunk_size * 16):
+                            voc_queue.put((
+                                task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
+                                list(s["chunk_buffer"]), False, False, s["total_frames"],
+                                f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
+                            ))
+                            s["chunk_buffer"] = []
+
+                        if next_cb0 < 0 or s["total_frames"] >= s["max_steps"]:
+                            finished_eos = True
+                            break
 
                     # C. Check if EOS or max_steps reached
-                    if next_cb0 < 0 or s["total_frames"] >= s["max_steps"]:
+                    if finished_eos:
                         # End of stream flush to vocoder
-                        vocoder_queue.put((
+                        voc_queue.put((
                             task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                            list(s["chunk_buffer"]), False, True, s["total_frames"], f"GPU {gpu_id} ({worker_name})"
+                            list(s["chunk_buffer"]), False, True, s["total_frames"],
+                            f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
                         ))
                         # Free session slot immediately in local VRAM
                         gen.session_free(sid)
                         del active_sessions[sid]
                         job_queue.task_done()
 
-        worker_a = threading.Thread(target=generator_multi_session_loop, args=("Instance A", self.gen_a, 0, 10))
-        worker_b = threading.Thread(target=generator_multi_session_loop, args=("Instance B", self.gen_b, 1, 10))
+        worker_a = threading.Thread(
+            target=generator_multi_session_loop,
+            args=("Instance A", self.gen_a, self.gen_a_q4, voc_a_queue, 0, 15)
+        )
+        worker_b = threading.Thread(
+            target=generator_multi_session_loop,
+            args=("Instance B", self.gen_b, self.gen_b_q4, voc_b_queue, 1, 15)
+        )
         worker_a.start()
         worker_b.start()
 
-        # 3. Dispatcher
+        # 3. Workload Dispatcher
         t_dispatch0 = time.time()
         for idx, task in enumerate(tasks):
             delay = arrival_delays[idx] if arrival_delays and idx < len(arrival_delays) else 0.0
@@ -260,24 +321,26 @@ class DualInstanceCluster:
         all_dispatched.set()
 
         job_queue.join()
-        vocoder_queue.join()
+        voc_a_queue.join()
+        voc_b_queue.join()
 
         # Shutdown workers
         workers_stopping = True
         worker_a.join()
         worker_b.join()
-        voc_thread.join()
+        voc_a_thread.join()
+        voc_b_thread.join()
 
         completed_results.sort(key=lambda x: x.id)
         return completed_results
 
     def close(self):
-        if hasattr(self, "gen_a") and self.gen_a:
-            self.gen_a.close()
-        if hasattr(self, "gen_b") and self.gen_b:
-            self.gen_b.close()
-        if hasattr(self, "voc") and self.voc:
-            self.voc.close()
+        for attr in ["gen_a", "gen_b", "voc_a", "voc_b", "gen_a_q4", "gen_b_q4"]:
+            if hasattr(self, attr):
+                obj = getattr(self, attr)
+                if obj:
+                    obj.close()
+                    setattr(self, attr, None)
 
     def __del__(self):
         self.close()

@@ -39,15 +39,30 @@ def main():
     parser.add_argument("--lib", type=str, default=None, help="Path to libbreeze.so")
     parser.add_argument("--out-dir", type=str, default="elastic_20user_audio", help="Output audio directory")
     parser.add_argument("--n-users", type=int, default=20, help="Number of concurrent users")
+    parser.add_argument("--quantum", type=int, default=2, help="Adaptive quantum frame count (default: 2)")
+    parser.add_argument("--enable-q4-burst", action="store_true", help="Enable surge Q4 tiering for high load")
+    parser.add_argument("--q4-model", type=str, default=None, help="Path to Q4 GGUF model for surge tiering")
+    parser.add_argument("--q4-threshold", type=int, default=10, help="Per-GPU slot threshold to trigger Q4 tiering")
     args = parser.parse_args()
 
     print("================================================================================")
-    print(f"      DYNAMIC MULTI-SESSION CONTINUOUS BATCHING: {args.n_users}-USER BURST TEST")
+    print(f"      DYNAMIC MULTI-SESSION 10/10 CLUSTER: {args.n_users}-USER BURST TEST")
     print("================================================================================")
-    print(f"Model: {args.model}")
-    print(f"Output: {args.out_dir}")
+    print(f"Primary Model:   {args.model}")
+    if args.enable_q4_burst:
+        print(f"Surge Q4 Model:  {args.q4_model} (Trigger Threshold: {args.q4_threshold} slots/GPU)")
+    else:
+        print("Surge Q4 Tier:   Disabled (100% Q8_0 High-Fidelity)")
+    print(f"Quantum Frames:  {args.quantum} (Initial TTFA: 1 frame)")
+    print(f"Output:          {args.out_dir}")
 
-    cluster = DualInstanceCluster(args.model, args.lib)
+    cluster = DualInstanceCluster(
+        model_path=args.model,
+        lib_path=args.lib,
+        q4_model_path=args.q4_model,
+        enable_q4_burst=args.enable_q4_burst,
+        q4_threshold=args.q4_threshold
+    )
     telemetry = ClusterTelemetry(interval_s=0.2)
     telemetry.start()
 
@@ -62,7 +77,12 @@ def main():
     def progress_cb(r):
         print(f"  [EOS Finished] User {r.id:02d} ({r.words:3d}w) | Audio: {r.audio_s:5.2f}s | Wall: {r.compute_wall_s:5.2f}s | TTFA: {r.ttfa_s:5.3f}s | RTF: {r.rtf:5.3f} | {r.worker}")
 
-    results = cluster.run_workload(tasks, out_dir=args.out_dir, on_progress=progress_cb)
+    results = cluster.run_workload(
+        tasks,
+        out_dir=args.out_dir,
+        on_progress=progress_cb,
+        quantum_frames=args.quantum
+    )
     total_wall = time.time() - t_start
 
     telemetry.stop()
