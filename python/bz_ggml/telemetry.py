@@ -6,9 +6,12 @@ from typing import Dict, List, Any
 class TelemetryProfiler:
     """Continuous 200ms GPU profiler querying nvidia-smi."""
 
-    def __init__(self, log_csv_path: str = "gpu_telemetry.csv", sample_interval_ms: int = 200):
+    def __init__(self, log_csv_path: str = "gpu_telemetry.csv", sample_interval_ms: int = 200, interval_s: float = None):
         self.csv_path = log_csv_path
-        self.sample_interval_ms = sample_interval_ms
+        if interval_s is not None:
+            self.sample_interval_ms = int(interval_s * 1000)
+        else:
+            self.sample_interval_ms = sample_interval_ms
         self.proc = None
 
     def start(self):
@@ -55,20 +58,27 @@ class TelemetryProfiler:
                         except ValueError:
                             continue
 
-        return {
+        summary = {
             "gpu0": {
-                "mean_utilization_pct": round(sum(g0_utils)/len(g0_utils), 2) if g0_utils else 0.0,
+                "util_mean_pct": round(sum(g0_utils)/len(g0_utils), 2) if g0_utils else 0.0,
+                "util_max_pct": round(max(g0_utils), 2) if g0_utils else 0.0,
                 "mean_power_w": round(sum(g0_pwrs)/len(g0_pwrs), 2) if g0_pwrs else 0.0,
-                "peak_vram_mb": round(max(g0_mems), 1) if g0_mems else 0.0,
+                "mem_max_mib": round(max(g0_mems), 1) if g0_mems else 0.0,
                 "samples": len(g0_utils)
             },
             "gpu1": {
-                "mean_utilization_pct": round(sum(g1_utils)/len(g1_utils), 2) if g1_utils else 0.0,
+                "util_mean_pct": round(sum(g1_utils)/len(g1_utils), 2) if g1_utils else 0.0,
+                "util_max_pct": round(max(g1_utils), 2) if g1_utils else 0.0,
                 "mean_power_w": round(sum(g1_pwrs)/len(g1_pwrs), 2) if g1_pwrs else 0.0,
-                "peak_vram_mb": round(max(g1_mems), 1) if g1_mems else 0.0,
+                "mem_max_mib": round(max(g1_mems), 1) if g1_mems else 0.0,
                 "samples": len(g1_utils)
             }
         }
+        self.summary = summary
+        return summary
+
+    def get_summary(self) -> Dict[str, Any]:
+        return getattr(self, "summary", {})
 
 def calculate_jains_fairness(results: List[Dict[str, Any]]) -> float:
     rates = [(r["audio_s"] / r["turnaround_s"]) if r.get("turnaround_s", 0) > 0 else 0.0 for r in results]
