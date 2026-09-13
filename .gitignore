@@ -1,0 +1,47 @@
+# Build outputs
+build/
+bin/
+lib/
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.o
+*.obj
+
+# Models & Weights
+*.gguf
+*.bin
+*.pt
+*.safetensors
+models/
+
+# Generated Audio & Data
+*.wav
+*.mp3
+*.flac
+*.pcm
+*_audio/
+*.csv
+*.json
+!model_specs/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+.venv/
+env/
+dist/
+*.egg-info/
+
+# IDE / Jupyter
+.vscode/
+.idea/
+.ipynb_checkpoints/
+*.swp
+*~
+.DS_Store
