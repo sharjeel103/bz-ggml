@@ -176,7 +176,11 @@ def main():
     print("--------------------------------------------------------------------------------")
     print("GPU Hardware Telemetry:")
     for gpu_name, data in telem_stats.items():
-        print(f"  GPU {gpu_name}: Util Mean = {data['util_mean']:.1f}% | Util Max = {data['util_max']:.1f}% | VRAM Peak = {data['mem_peak']:.1f} MiB")
+        u_mean = data.get("util_mean_pct", data.get("util_mean", 0.0))
+        u_max = data.get("util_max_pct", data.get("util_max", 0.0))
+        pwr = data.get("mean_power_w", 0.0)
+        vram = data.get("mem_max_mib", data.get("mem_peak", 0.0))
+        print(f"  GPU {gpu_name}: Util Mean = {u_mean:.1f}% | Util Max = {u_max:.1f}% | Power Mean = {pwr:.1f}W | VRAM Peak = {vram:.1f} MiB")
     print("================================================================================")
 
 if __name__ == "__main__":
