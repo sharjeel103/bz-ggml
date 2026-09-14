@@ -84,7 +84,8 @@ class DualInstanceCluster:
         arrival_delays: Optional[List[float]] = None,
         on_progress: Optional[Callable[[ClusterResult], None]] = None,
         quantum_frames: int = 2,
-        max_slots_per_gpu: int = 8
+        max_slots_per_gpu: int = 8,
+        max_active_words_per_gpu: int = 15000
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
 
@@ -181,14 +182,16 @@ class DualInstanceCluster:
             gen_q4: Optional[GeneratorHandle],
             voc_queue: queue.Queue,
             gpu_id: int,
-            max_slots: int = 15
+            max_slots: int = 15,
+            max_active_words: int = 15000
         ):
             active_sessions = {}
             chunk_size = 4  # 4 frames = 320ms audio chunks for smooth streaming
             last_hb_time = time.time()
+            current_active_words = 0
 
             while not workers_stopping:
-                # A. Admit waiting tasks up to max_slots capacity
+                # A. Admit waiting tasks up to max_slots capacity and max_active_words budget
                 while len(active_sessions) < max_slots and not workers_stopping:
                     try:
                         task_item, arr_time = job_queue.get_nowait()
@@ -198,8 +201,15 @@ class DualInstanceCluster:
                     if task_item is None:
                         break
 
+                    task_words = len(task_item.text.split())
+
+                    # Check token / word capacity budget:
+                    if (current_active_words + task_words > max_active_words) and len(active_sessions) > 0:
+                        # Re-queue task and wait for an active session to free capacity
+                        job_queue.put((task_item, arr_time))
+                        break
+
                     t_exec_start = time.time()
-                    words = len(task_item.text.split())
                     cfg_scale = getattr(task_item, "cfg_scale", 1.0)
                     sid = task_item.id
 
@@ -225,13 +235,14 @@ class DualInstanceCluster:
                         job_queue.task_done()
                         continue
 
+                    current_active_words += task_words
                     active_sessions[sid] = {
                         "task": task_item,
                         "gen": active_gen,
                         "model_tag": model_tag,
                         "arr_time": arr_time,
                         "t_exec_start": t_exec_start,
-                        "words": words,
+                        "words": task_words,
                         "cb0": cb0,
                         "total_frames": 0,
                         "chunk_buffer": [],
@@ -295,6 +306,7 @@ class DualInstanceCluster:
                             f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
                         ))
                         # Free session slot immediately in local VRAM
+                        current_active_words -= s["words"]
                         gen.session_free(sid)
                         del active_sessions[sid]
                         job_queue.task_done()
@@ -304,15 +316,15 @@ class DualInstanceCluster:
                     frames_list = [s["total_frames"] for s in active_sessions.values()]
                     min_f = min(frames_list) if frames_list else 0
                     max_f = max(frames_list) if frames_list else 0
-                    print(f"  [Heartbeat GPU {gpu_id}] Active: {len(active_sessions):2d} streams | Frames: min {min_f:3d} / max {max_f:3d} | Audio: {sum(frames_list)*0.08:.1f}s", flush=True)
+                    print(f"  [Heartbeat GPU {gpu_id}] Active: {len(active_sessions):2d} streams ({current_active_words:,}/{max_active_words:,} words) | Frames: min {min_f:3d} / max {max_f:3d} | Audio: {sum(frames_list)*0.08:.1f}s", flush=True)
 
         worker_a = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance A", self.gen_a, self.gen_a_q4, voc_a_queue, 0, max_slots_per_gpu)
+            args=("Instance A", self.gen_a, self.gen_a_q4, voc_a_queue, 0, max_slots_per_gpu, max_active_words_per_gpu)
         )
         worker_b = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance B", self.gen_b, self.gen_b_q4, voc_b_queue, 1, max_slots_per_gpu)
+            args=("Instance B", self.gen_b, self.gen_b_q4, voc_b_queue, 1, max_slots_per_gpu, max_active_words_per_gpu)
         )
         worker_a.start()
         worker_b.start()

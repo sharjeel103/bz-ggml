@@ -71,49 +71,59 @@ def generate_800_word_prompt(theme_title: str, theme_intro: str, target_words: i
 def main():
     parser = argparse.ArgumentParser(description="40-User x 800-Word Maximum Stress Benchmark")
     parser.add_argument("--model", type=str, required=True, help="Path to Q8_0 GGUF model")
-    parser.add_argument("--q4-model", type=str, required=True, help="Path to Q4_K GGUF model")
+    parser.add_argument("--q4-model", type=str, default=None, help="Path to Q4_K GGUF model")
+    parser.add_argument("--disable-q4", action="store_true", help="Disable Q4 surge tiering (runs 100%% Pure Q8_0, frees 2.54 GB VRAM)")
     parser.add_argument("--lib", type=str, default=None, help="Path to libbreeze.so")
     parser.add_argument("--out-dir", type=str, default="audio_40users_800words", help="Output directory")
     parser.add_argument("--n-users", type=int, default=40, help="Number of concurrent users (default: 40)")
+    parser.add_argument("--words-per-task", type=int, default=800, help="Target words per task (default: 800)")
     parser.add_argument("--max-slots", type=int, default=20, help="Max slots per GPU (default: 20 -> 40 total)")
+    parser.add_argument("--max-active-words", type=int, default=15000, help="Max active words budget per GPU (default: 15000)")
     parser.add_argument("--q4-threshold", type=int, default=10, help="Slots threshold to trigger Q4 (default: 10)")
     parser.add_argument("--quantum", type=int, default=2, help="Quantum frames per step (default: 2)")
     parser.add_argument("--max-steps", type=int, default=750, help="Max acoustic steps per user (default: 750)")
     args = parser.parse_args()
 
+    use_q4 = not args.disable_q4 and bool(args.q4_model)
+
     print("================================================================================")
-    print("        40-USER x 800-WORD MAXIMUM STRESS CLUSTER BENCHMARK")
+    print(f"        40-USER x {args.words_per_task}-WORD MAXIMUM STRESS CLUSTER BENCHMARK")
     print("================================================================================")
-    print(f"Primary Model:   {args.model} (Q8_0)")
-    print(f"Surge Q4 Model:  {args.q4_model} (Q4_K, Trigger Threshold: {args.q4_threshold} slots/GPU)")
-    print(f"Concurrent Users:{args.n_users} users (All admitted at t=0, Zero Queue Waiting!)")
-    print(f"Slots per GPU:   {args.max_slots} (Total Cluster Slots: {args.max_slots * 2})")
-    print(f"Quantum Frames:  {args.quantum} (Adaptive: 1 init, {args.quantum} steady)")
-    print(f"Max Steps/User:  {args.max_steps} (~{args.max_steps*0.08:.1f}s speech per user)")
-    print(f"Output Directory:{args.out_dir}")
+    print(f"Primary Model:     {args.model} (Q8_0)")
+    if use_q4:
+        print(f"Surge Q4 Model:    {args.q4_model} (Q4_K, Trigger Threshold: {args.q4_threshold} slots/GPU)")
+    else:
+        print("Surge Q4 Model:    Disabled (Pure 100% Q8_0, 2.54 GB VRAM Freed!)")
+    print(f"Concurrent Users:  {args.n_users} users")
+    print(f"Words per Task:    {args.words_per_task} words")
+    print(f"Max Slots / GPU:   {args.max_slots} (Total Cluster Slots: {args.max_slots * 2})")
+    print(f"Word Budget / GPU: {args.max_active_words:,} words (Cluster Total: {args.max_active_words * 2:,} words)")
+    print(f"Quantum Frames:    {args.quantum} (Adaptive: 1 init, {args.quantum} steady)")
+    print(f"Max Steps / User:  {args.max_steps} (~{args.max_steps*0.08:.1f}s speech per user)")
+    print(f"Output Directory:  {args.out_dir}")
     print("================================================================================")
 
     # Initialize Cluster
     cluster = DualInstanceCluster(
         model_path=args.model,
         lib_path=args.lib,
-        q4_model_path=args.q4_model,
-        enable_q4_burst=True,
+        q4_model_path=args.q4_model if use_q4 else None,
+        enable_q4_burst=use_q4,
         q4_threshold=args.q4_threshold
     )
 
-    # Build 40 tasks of 800 words each
-    print(f"\n[Preparation] Generating {args.n_users} distinct 800-word text prompts...")
+    # Build tasks
+    print(f"\n[Preparation] Generating {args.n_users} distinct {args.words_per_task}-word text prompts...")
     tasks = []
     total_words = 0
     for i in range(args.n_users):
         theme_title, theme_intro = THEMES[i % len(THEMES)]
-        text_800 = generate_800_word_prompt(theme_title, theme_intro, target_words=800)
-        n_w = len(text_800.split())
+        text_w = generate_800_word_prompt(theme_title, theme_intro, target_words=args.words_per_task)
+        n_w = len(text_w.split())
         total_words += n_w
         tasks.append(UserTask(
             id=i + 1,
-            text=text_800,
+            text=text_w,
             instruction="Speak clearly, naturally, and authoritatively.",
             seed=1000 + i,
             max_steps=args.max_steps
@@ -126,12 +136,10 @@ def main():
     telemetry = ClusterTelemetry(interval_s=0.2)
     telemetry.start()
 
-    print(f"\n[Dispatch] Launching ALL {len(tasks)} user tasks into {args.max_slots*2} active slots at t = 0.00s...")
+    print(f"\n[Dispatch] Enqueueing {len(tasks)} user tasks into cluster at t = 0.00s...")
     t_start = time.time()
-    last_heartbeat = [time.time()]
 
     def progress_cb(r):
-        now = time.time()
         print(f"  [EOS Finished] User {r.id:02d} ({r.words:3d}w) | Audio: {r.audio_s:5.2f}s | Wall: {r.compute_wall_s:5.2f}s | TTFA: {r.ttfa_s:5.3f}s | RTF: {r.rtf:5.3f} | {r.worker}")
 
     results = cluster.run_workload(
@@ -139,7 +147,8 @@ def main():
         out_dir=args.out_dir,
         on_progress=progress_cb,
         quantum_frames=args.quantum,
-        max_slots_per_gpu=args.max_slots
+        max_slots_per_gpu=args.max_slots,
+        max_active_words_per_gpu=args.max_active_words
     )
     total_wall = time.time() - t_start
 
