@@ -1,6 +1,7 @@
 #include "breeze/gguf_loader.h"
 
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 
 namespace breeze {
