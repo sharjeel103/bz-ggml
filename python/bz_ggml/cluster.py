@@ -68,14 +68,15 @@ class DualInstanceCluster:
         self.voc_b = VocoderHandle(self.lib, model_path, cuda_device=1)
         print(f"   -> Island 1 (Gen B + Voc B) Online on CUDA1 in {time.time()-t0:.2f}s")
 
-        # Optional Q4 Burst Generators for extreme load shed
-        self.gen_a_q4 = None
-        self.gen_b_q4 = None
+        # Optional Modular INT4 Depth Decoder piece (~300 MiB)
+        self.has_q4_dd = False
         if self.enable_q4_burst and self.q4_model_path and os.path.exists(self.q4_model_path):
-            print(f"[Cluster] Initializing Surge Q4 Generators on CUDA0 and CUDA1 (Threshold: {self.q4_threshold})...")
-            self.gen_a_q4 = GeneratorHandle(self.lib, self.q4_model_path, cuda_device=0)
-            self.gen_b_q4 = GeneratorHandle(self.lib, self.q4_model_path, cuda_device=1)
-            print("   -> Surge Q4 Generators Online.")
+            print(f"[Cluster] Loading Modular INT4 Depth Decoder piece (~300 MB) on CUDA0 and CUDA1 (Threshold: {self.q4_threshold})...")
+            t0 = time.time()
+            self.gen_a.load_q4_depth(self.q4_model_path)
+            self.gen_b.load_q4_depth(self.q4_model_path)
+            self.has_q4_dd = True
+            print(f"   -> Modular INT4 Depth Decoder Online in {time.time()-t0:.2f}s (Saved 2.24 GB VRAM per GPU!)")
 
     def run_workload(
         self,
@@ -216,10 +217,10 @@ class DualInstanceCluster:
                     # Select Q4 if surge tiering is enabled and load exceeds threshold
                     use_q4 = (
                         self.enable_q4_burst
-                        and gen_q4 is not None
+                        and self.has_q4_dd
                         and len(active_sessions) >= self.q4_threshold
                     )
-                    active_gen = gen_q4 if use_q4 else gen_default
+                    active_gen = gen_default
                     model_tag = "Q4" if use_q4 else "Q8"
 
                     try:
@@ -228,7 +229,8 @@ class DualInstanceCluster:
                             text=task_item.text,
                             instruction=task_item.instruction,
                             cfg_scale=cfg_scale,
-                            seed=task_item.seed + sid
+                            seed=task_item.seed + sid,
+                            use_q4=use_q4
                         )
                     except Exception as e:
                         print(f"[{worker_name}] Error creating session {sid}: {e}")

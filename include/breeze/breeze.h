@@ -92,6 +92,12 @@ BREEZE_API int breeze_generator_session_step(breeze_generator * gen, int session
 // Free an individual session slot upon EOS, releasing its local KV cache
 BREEZE_API int breeze_generator_session_free(breeze_generator * gen, int session_id);
 
+// Load only the ~300 MB INT4 Depth Decoder piece from a Q4 GGUF file
+BREEZE_API int breeze_generator_load_q4_depth(breeze_generator * gen, const char * q4_gguf_path);
+
+// Set whether an active session uses the INT4 Depth Decoder piece (1 = yes, 0 = no)
+BREEZE_API int breeze_generator_session_set_q4(breeze_generator * gen, int session_id, int use_q4);
+
 // Query active session count
 BREEZE_API int breeze_generator_session_count(breeze_generator * gen);
 

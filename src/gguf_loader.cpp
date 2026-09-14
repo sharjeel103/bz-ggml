@@ -40,6 +40,77 @@ bool GGUFModel::load(const std::string & path, Backend & be) {
     return true;
 }
 
+bool GGUFModel::load_prefix(const std::string & path, Backend & be, const std::string & prefix) {
+    gguf_init_params gp{ /*no_alloc=*/true, /*ctx=*/nullptr };
+    gguf = gguf_init_from_file(path.c_str(), gp);
+    if (!gguf) return false;
+
+    const int64_t n = gguf_get_n_tensors(gguf);
+    std::vector<int64_t> matching_indices;
+    for (int64_t i = 0; i < n; i++) {
+        const char * name = gguf_get_tensor_name(gguf, i);
+        if (strncmp(name, prefix.c_str(), prefix.size()) == 0) {
+            matching_indices.push_back(i);
+        }
+    }
+
+    if (matching_indices.empty()) {
+        gguf_free(gguf);
+        gguf = nullptr;
+        return false;
+    }
+
+    // Allocate ggml_context sized strictly for the matching tensors
+    size_t mem_size = matching_indices.size() * ggml_tensor_overhead() + 1024 * 1024;
+    struct ggml_init_params params = { mem_size, nullptr, true };
+    meta = ggml_init(params);
+    if (!meta) {
+        gguf_free(gguf);
+        gguf = nullptr;
+        return false;
+    }
+
+    for (int64_t idx : matching_indices) {
+        const char * name = gguf_get_tensor_name(gguf, idx);
+        const int64_t * ne = gguf_get_tensor_ne(gguf, idx);
+        enum ggml_type type = gguf_get_tensor_type(gguf, idx);
+        ggml_tensor * t = ggml_new_tensor_4d(meta, type, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(t, name);
+    }
+
+    // Allocate backend buffer for ONLY the matching tensors
+    buffer = ggml_backend_alloc_ctx_tensors(meta, be.backend);
+    if (!buffer) {
+        ggml_free(meta);
+        gguf_free(gguf);
+        meta = nullptr;
+        gguf = nullptr;
+        return false;
+    }
+
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        free();
+        return false;
+    }
+
+    const size_t data_off = gguf_get_data_offset(gguf);
+    std::vector<uint8_t> buf;
+    for (int64_t idx : matching_indices) {
+        const char * name = gguf_get_tensor_name(gguf, idx);
+        ggml_tensor * t = ggml_get_tensor(meta, name);
+        const size_t off = data_off + gguf_get_tensor_offset(gguf, idx);
+        const size_t sz = ggml_nbytes(t);
+        buf.resize(sz);
+        if (breeze_fseek(f, (long long) off, SEEK_SET) != 0) { fclose(f); free(); return false; }
+        if (fread(buf.data(), 1, sz, f) != sz) { fclose(f); free(); return false; }
+        ggml_backend_tensor_set(t, buf.data(), 0, sz);
+        tensors[name] = t;
+    }
+    fclose(f);
+    return true;
+}
+
 void GGUFModel::free() {
     if (buffer) ggml_backend_buffer_free(buffer);
     if (meta) ggml_free(meta);
@@ -47,6 +118,7 @@ void GGUFModel::free() {
     buffer = nullptr;
     meta = nullptr;
     gguf = nullptr;
+    tensors.clear();
 }
 
 ggml_tensor * GGUFModel::find(const std::string & name) const {

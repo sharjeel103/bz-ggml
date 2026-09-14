@@ -74,6 +74,12 @@ class BreezeLib:
         self.lib.breeze_generator_session_free.argtypes = [ctypes.c_void_p, ctypes.c_int]
         self.lib.breeze_generator_session_free.restype = ctypes.c_int
 
+        self.lib.breeze_generator_load_q4_depth.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self.lib.breeze_generator_load_q4_depth.restype = ctypes.c_int
+
+        self.lib.breeze_generator_session_set_q4.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self.lib.breeze_generator_session_set_q4.restype = ctypes.c_int
+
         self.lib.breeze_generator_session_count.argtypes = [ctypes.c_void_p]
         self.lib.breeze_generator_session_count.restype = ctypes.c_int
 
@@ -105,6 +111,20 @@ class GeneratorHandle:
         if not self.handle:
             raise RuntimeError(f"Failed to initialize Generator on CUDA device {cuda_device}")
 
+    def load_q4_depth(self, q4_model_path: str) -> bool:
+        res = self.lib.lib.breeze_generator_load_q4_depth(
+            self.handle, q4_model_path.encode("utf-8")
+        )
+        if res != 0:
+            raise RuntimeError(f"Failed to load modular Q4 depth decoder on Generator (device {self.device})")
+        return True
+
+    def session_set_q4(self, session_id: int, use_q4: bool = True) -> bool:
+        res = self.lib.lib.breeze_generator_session_set_q4(
+            self.handle, session_id, 1 if use_q4 else 0
+        )
+        return res == 0
+
     def prefill(self, text: str, instruction: str = "Speak clearly and naturally.", seed: int = 42) -> int:
         cb0_buf = ctypes.c_int()
         res = self.lib.lib.breeze_generator_prefill(
@@ -122,7 +142,10 @@ class GeneratorHandle:
         )
         return next_cb0, list(frame_buf)
 
-    def session_create(self, session_id: int, text: str, instruction: str = "Speak clearly and naturally.", cfg_scale: float = 1.0, seed: int = 42) -> int:
+    def session_create(
+        self, session_id: int, text: str, instruction: str = "Speak clearly and naturally.", 
+        cfg_scale: float = 1.0, seed: int = 42, use_q4: bool = False
+    ) -> int:
         cb0_buf = ctypes.c_int()
         res = self.lib.lib.breeze_generator_session_create(
             self.handle, session_id, text.encode("utf-8"), instruction.encode("utf-8"),
@@ -130,6 +153,8 @@ class GeneratorHandle:
         )
         if res != 0:
             raise RuntimeError(f"Session create failed on Generator (device {self.device}, session {session_id})")
+        if use_q4:
+            self.session_set_q4(session_id, True)
         return cb0_buf.value
 
     def session_step(self, session_id: int, seed: int) -> Tuple[int, List[int]]:

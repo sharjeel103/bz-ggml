@@ -18,6 +18,7 @@ struct GGUFModel {
     std::unordered_map<std::string, ggml_tensor *> tensors;
 
     bool load(const std::string & path, Backend & be);
+    bool load_prefix(const std::string & path, Backend & be, const std::string & prefix);
     void free();
 
     ggml_tensor * get(const std::string & name) const;

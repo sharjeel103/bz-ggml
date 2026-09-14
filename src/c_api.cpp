@@ -127,6 +127,7 @@ struct BreezeSession {
     breeze::SampleParams bp;
     std::vector<int> suppress;
     bool active = false;
+    bool use_q4 = false;
     int steps_taken = 0;
     int max_tokens = 2048;
     bool st_c_init = false;
@@ -138,6 +139,7 @@ struct BreezeSession {
         st_c_init = false;
         st_u_init = false;
         active = false;
+        use_q4 = false;
     }
 };
 
@@ -158,6 +160,15 @@ struct breeze_generator {
     int device = 0;
     bool depth_single_init = false;
     bool depth_dual_init = false;
+
+    // Modular INT4 Depth Decoder piece (~300 MiB)
+    breeze::GGUFModel q4_dd;
+    breeze::BreezeModel model_q4;
+    breeze::DepthRunner depth_single_q4;
+    breeze::DepthRunner depth_dual_q4;
+    bool has_q4_dd = false;
+    bool depth_single_q4_init = false;
+    bool depth_dual_q4_init = false;
 
     std::unordered_map<int, std::unique_ptr<BreezeSession>> sessions;
 
@@ -210,6 +221,9 @@ void breeze_generator_free(breeze_generator * gen) {
     if (gen->st_init) gen->st.free();
     if (gen->depth_single_init) gen->depth_single.free();
     if (gen->depth_dual_init) gen->depth_dual.free();
+    if (gen->depth_single_q4_init) gen->depth_single_q4.free();
+    if (gen->depth_dual_q4_init) gen->depth_dual_q4.free();
+    if (gen->has_q4_dd) gen->q4_dd.free();
     gen->model.free();
     delete gen;
 }
@@ -372,12 +386,17 @@ int breeze_generator_session_step(breeze_generator * gen, int session_id,
 
         // Step 1: 15 depth passes (single or batched dual)
         std::vector<int> depth_codes;
+        const bool use_q4 = (sess->use_q4 && gen->has_q4_dd);
+        breeze::DepthRunner & dr_dual = use_q4 ? gen->depth_dual_q4 : gen->depth_dual;
+        breeze::DepthRunner & dr_single = use_q4 ? gen->depth_single_q4 : gen->depth_single;
+        breeze::BreezeModel & active_model = use_q4 ? gen->model_q4 : gen->model;
+
         if (sess->use_cfg) {
             std::vector<std::vector<float>> hiddens = { sess->last_hidden, sess->last_hidden_u };
-            depth_codes = gen->depth_dual.run(gen->model, hiddens, cb0, sess->cfg_scale, depth_rng);
+            depth_codes = dr_dual.run(active_model, hiddens, cb0, sess->cfg_scale, depth_rng);
         } else {
             std::vector<std::vector<float>> hiddens = { sess->last_hidden };
-            depth_codes = gen->depth_single.run(gen->model, hiddens, cb0, 1.0f, depth_rng);
+            depth_codes = dr_single.run(active_model, hiddens, cb0, 1.0f, depth_rng);
         }
 
         // Step 2: Assemble full 16-codebook frame
@@ -425,6 +444,49 @@ int breeze_generator_session_free(breeze_generator * gen, int session_id) {
         return 0;
     }
     return -1;
+}
+
+int breeze_generator_load_q4_depth(breeze_generator * gen, const char * q4_gguf_path) {
+    if (!gen || !q4_gguf_path) return -1;
+    try {
+        if (gen->has_q4_dd) {
+            if (gen->depth_single_q4_init) gen->depth_single_q4.free();
+            if (gen->depth_dual_q4_init) gen->depth_dual_q4.free();
+            gen->q4_dd.free();
+            gen->has_q4_dd = false;
+            gen->depth_single_q4_init = false;
+            gen->depth_dual_q4_init = false;
+        }
+
+        if (!gen->q4_dd.load_prefix(q4_gguf_path, gen->model.backend, "dd.")) {
+            g_error = "failed to load modular Q4 depth decoder piece";
+            return -1;
+        }
+
+        gen->model_q4.backend = gen->model.backend;
+        gen->model_q4.cfg = gen->model.cfg;
+        gen->model_q4.tok = gen->model.tok;
+        gen->model_q4.base_model = &gen->model;
+        gen->model_q4.dd_override = &gen->q4_dd;
+
+        gen->depth_single_q4.init(gen->model_q4, 1);
+        gen->depth_single_q4_init = true;
+        gen->depth_dual_q4.init(gen->model_q4, 2);
+        gen->depth_dual_q4_init = true;
+        gen->has_q4_dd = true;
+        return 0;
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+int breeze_generator_session_set_q4(breeze_generator * gen, int session_id, int use_q4) {
+    if (!gen) return -1;
+    auto it = gen->sessions.find(session_id);
+    if (it == gen->sessions.end() || !it->second) return -1;
+    it->second->use_q4 = (use_q4 != 0 && gen->has_q4_dd);
+    return 0;
 }
 
 int breeze_generator_session_count(breeze_generator * gen) {
