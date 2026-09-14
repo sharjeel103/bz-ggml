@@ -89,7 +89,7 @@ class DualInstanceCluster:
         arrival_delays: Optional[List[float]] = None,
         on_progress: Optional[Callable[[ClusterResult], None]] = None,
         quantum_frames: int = 2,
-        max_slots_per_gpu: int = 8,
+        max_slots_per_gpu: Optional[int] = None,
         max_active_words_per_gpu: int = 15000
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
@@ -186,7 +186,7 @@ class DualInstanceCluster:
             gen_default: GeneratorHandle,
             voc_queue: queue.Queue,
             gpu_id: int,
-            max_slots: int = 15,
+            max_slots: Optional[int] = None,
             max_active_words: int = 15000
         ):
             active_sessions = {}
@@ -195,8 +195,11 @@ class DualInstanceCluster:
             current_active_words = 0
 
             while not workers_stopping:
-                # A. Admit waiting tasks up to max_slots capacity and max_active_words budget
-                while len(active_sessions) < max_slots and not workers_stopping:
+                # A. Admit waiting tasks governed strictly by max_active_words token budget
+                while not workers_stopping:
+                    if max_slots is not None and len(active_sessions) >= max_slots:
+                        break
+
                     try:
                         task_item, arr_time = job_queue.get_nowait()
                     except queue.Empty:
