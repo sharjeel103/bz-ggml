@@ -74,3 +74,9 @@ if(BREEZE_BUILD_CLI AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/apps/cli/main.cpp")
     add_executable(breeze-cli apps/cli/main.cpp)
     target_link_libraries(breeze-cli PRIVATE breeze_core)
 endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/apps/convert/main.cpp")
+    add_executable(breeze-convert apps/convert/main.cpp)
+    target_link_libraries(breeze-convert PRIVATE breeze_core)
+endif()
+

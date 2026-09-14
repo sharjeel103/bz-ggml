@@ -17,6 +17,10 @@ class UserTask:
     cfg_scale: float = 1.0
     seed: int = 42
     max_steps: int = 750
+    ref_text: Optional[str] = None
+    ref_codes: Optional[List[int]] = None
+    ref_frames: int = 0
+
 
 @dataclass
 class ClusterResult:
@@ -223,10 +227,13 @@ class DualInstanceCluster:
                     model_tag = "Q4" if use_q4 else "Q8"
 
                     try:
-                        cb0 = active_gen.session_create(
+                        cb0 = active_gen.session_create_ext(
                             session_id=sid,
                             text=task_item.text,
                             instruction=task_item.instruction,
+                            ref_text=task_item.ref_text,
+                            ref_codes=task_item.ref_codes,
+                            ref_frames=task_item.ref_frames,
                             cfg_scale=cfg_scale,
                             seed=task_item.seed + sid,
                             use_q4=use_q4

@@ -85,6 +85,13 @@ BREEZE_API int breeze_generator_session_create(breeze_generator * gen, int sessi
                                                const char * text, const char * instruction, 
                                                float cfg_scale, unsigned int seed, int * out_cb0);
 
+// Create and prefill an independent session slot with optional zero-shot reference voice codes and transcript
+BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int session_id, 
+                                                   const char * text, const char * instruction,
+                                                   const char * ref_text, const int * ref_codes, int ref_frames,
+                                                   float cfg_scale, unsigned int seed, int * out_cb0);
+
+
 // Step 1 frame for a specific active session. Returns next cb0 (or -1 if EOS reached)
 BREEZE_API int breeze_generator_session_step(breeze_generator * gen, int session_id, 
                                              unsigned int seed, int * out_frame_16);

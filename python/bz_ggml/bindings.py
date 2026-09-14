@@ -66,6 +66,14 @@ class BreezeLib:
         ]
         self.lib.breeze_generator_session_create.restype = ctypes.c_int
 
+        self.lib.breeze_generator_session_create_ext.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.c_float, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)
+        ]
+        self.lib.breeze_generator_session_create_ext.restype = ctypes.c_int
+
+
         self.lib.breeze_generator_session_step.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)
         ]
@@ -146,13 +154,30 @@ class GeneratorHandle:
         self, session_id: int, text: str, instruction: str = "Speak clearly and naturally.", 
         cfg_scale: float = 1.0, seed: int = 42, use_q4: bool = False
     ) -> int:
+        return self.session_create_ext(
+            session_id=session_id, text=text, instruction=instruction,
+            ref_text=None, ref_codes=None, ref_frames=0,
+            cfg_scale=cfg_scale, seed=seed, use_q4=use_q4
+        )
+
+    def session_create_ext(
+        self, session_id: int, text: str, instruction: str = "Speak clearly and naturally.", 
+        ref_text: Optional[str] = None, ref_codes: Optional[List[int]] = None, ref_frames: int = 0,
+        cfg_scale: float = 1.0, seed: int = 42, use_q4: bool = False
+    ) -> int:
         cb0_buf = ctypes.c_int()
-        res = self.lib.lib.breeze_generator_session_create(
+        c_ref_text = ref_text.encode("utf-8") if (ref_text and len(ref_text) > 0) else None
+        if ref_codes and ref_frames > 0:
+            c_ref_codes = (ctypes.c_int * len(ref_codes))(*ref_codes)
+        else:
+            c_ref_codes = None
+        res = self.lib.lib.breeze_generator_session_create_ext(
             self.handle, session_id, text.encode("utf-8"), instruction.encode("utf-8"),
+            c_ref_text, c_ref_codes, ref_frames,
             ctypes.c_float(cfg_scale), ctypes.c_uint32(seed), ctypes.byref(cb0_buf)
         )
         if res != 0:
-            raise RuntimeError(f"Session create failed on Generator (device {self.device}, session {session_id})")
+            raise RuntimeError(f"Session create ext failed on Generator (device {self.device}, session {session_id})")
         if use_q4:
             self.session_set_q4(session_id, True)
         return cb0_buf.value
@@ -216,3 +241,24 @@ class VocoderHandle:
 
     def __del__(self):
         self.close()
+
+
+def load_breeze_voice(path: str) -> dict:
+    """Loads a pre-encoded .breeze voice file into memory for instant zero-shot cloning."""
+    import struct
+    with open(path, "rb") as f:
+        magic = f.read(4)
+        if magic != b"BRZV":
+            raise ValueError(f"Invalid voice file magic: {magic} in {path}")
+        version, sample_rate, n_codebooks, frames, text_len = struct.unpack("<5I", f.read(20))
+        text = f.read(text_len).decode("utf-8")
+        codes = list(struct.unpack(f"<{frames * n_codebooks}i", f.read()))
+        return {
+            "name": os.path.basename(path).replace(".breeze", ""),
+            "text": text,
+            "codes": codes,
+            "frames": frames,
+            "sample_rate": sample_rate,
+            "n_codebooks": n_codebooks
+        }
+

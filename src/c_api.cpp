@@ -300,9 +300,10 @@ int breeze_generator_step_frame(breeze_generator * gen, int cb0,
 }
 
 // --- Multi-Session Dynamic Batching & Interleaved Round-Robin Implementation ---
-int breeze_generator_session_create(breeze_generator * gen, int session_id, 
-                                    const char * text, const char * instruction, 
-                                    float cfg_scale, unsigned int seed, int * out_cb0) {
+BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int session_id, 
+                                                   const char * text, const char * instruction,
+                                                   const char * ref_text, const int * ref_codes, int ref_frames,
+                                                   float cfg_scale, unsigned int seed, int * out_cb0) {
     if (!gen || !text || !out_cb0) return -1;
     try {
         // Free existing slot if session_id is being reused
@@ -330,12 +331,35 @@ int breeze_generator_session_create(breeze_generator * gen, int session_id,
 
         const std::string spk = "[S0]";
         std::string ins = instruction ? instruction : "Speak clearly and naturally.";
+        bool has_ref = (ref_codes != nullptr && ref_frames > 0 && ref_text != nullptr && strlen(ref_text) > 0);
+
+        auto add_text_seg = [&](const std::string & str, std::vector<float> & out_emb, int & total) {
+            std::vector<int> toks = gen->model.tok.encode(str, true);
+            std::vector<float> e = breeze::text_encoder_forward(gen->model, toks);
+            out_emb.insert(out_emb.end(), e.begin(), e.end());
+            total += (int) toks.size();
+        };
+
+        auto add_audio_seg = [&](const int * codes, int n_frames, std::vector<float> & out_emb, int & total) {
+            std::vector<int> vcodes(codes, codes + (size_t) n_frames * gen->model.cfg.num_codebooks);
+            std::vector<float> e = breeze::audio_embed_forward(gen->model, vcodes, n_frames);
+            out_emb.insert(out_emb.end(), e.begin(), e.end());
+            total += n_frames;
+            std::vector<int> eos_frame(gen->model.cfg.num_codebooks, gen->model.cfg.codebook_eos_token_id);
+            std::vector<float> ee = breeze::audio_embed_forward(gen->model, eos_frame, 1);
+            out_emb.insert(out_emb.end(), ee.begin(), ee.end());
+            total += 1;
+        };
         
         // 1. Conditional prefill
+        int total_c = 0;
+        std::vector<float> emb_c;
+        if (has_ref) {
+            add_text_seg(spk + ref_text, emb_c, total_c);
+            add_audio_seg(ref_codes, ref_frames, emb_c, total_c);
+        }
         std::string tail_c = spk + "<ins_bos>" + ins + "<ins_eos>" + text;
-        std::vector<int> tokens_c = gen->model.tok.encode(tail_c, true);
-        std::vector<float> emb_c = breeze::text_encoder_forward(gen->model, tokens_c);
-        int total_c = (int) tokens_c.size();
+        add_text_seg(tail_c, emb_c, total_c);
 
         sess->st_c.init(gen->model, total_c + sess->max_tokens + 8);
         sess->st_c_init = true;
@@ -345,10 +369,14 @@ int breeze_generator_session_create(breeze_generator * gen, int session_id,
         // 2. Unconditional prefill (if CFG > 1.0)
         breeze::StepOut o_u;
         if (sess->use_cfg) {
+            int total_u = 0;
+            std::vector<float> emb_u;
+            if (has_ref) {
+                add_text_seg(spk + ref_text, emb_u, total_u);
+                add_audio_seg(ref_codes, ref_frames, emb_u, total_u);
+            }
             std::string tail_u = spk + text;
-            std::vector<int> tokens_u = gen->model.tok.encode(tail_u, true);
-            std::vector<float> emb_u = breeze::text_encoder_forward(gen->model, tokens_u);
-            int total_u = (int) tokens_u.size();
+            add_text_seg(tail_u, emb_u, total_u);
 
             sess->st_u.init(gen->model, total_u + sess->max_tokens + 8);
             sess->st_u_init = true;
@@ -371,6 +399,12 @@ int breeze_generator_session_create(breeze_generator * gen, int session_id,
         g_error = e.what();
         return -1;
     }
+}
+
+int breeze_generator_session_create(breeze_generator * gen, int session_id, 
+                                    const char * text, const char * instruction, 
+                                    float cfg_scale, unsigned int seed, int * out_cb0) {
+    return breeze_generator_session_create_ext(gen, session_id, text, instruction, nullptr, nullptr, 0, cfg_scale, seed, out_cb0);
 }
 
 int breeze_generator_session_step(breeze_generator * gen, int session_id, 
