@@ -208,10 +208,13 @@ class DualInstanceCluster:
                     if task_item is None:
                         break
 
-                    task_words = len(task_item.text.split())
+                    text_words = len(task_item.text.split())
+                    ref_tokens = getattr(task_item, "ref_frames", 0)
+                    ins_words = len(task_item.instruction.split()) if getattr(task_item, "instruction", None) else 0
+                    task_tokens = text_words + ref_tokens + ins_words
 
-                    # Check token / word capacity budget:
-                    if (current_active_words + task_words > max_active_words) and len(active_sessions) > 0:
+                    # Check token / word capacity budget (strictly accounts for text + reference audio + instruction):
+                    if (current_active_words + task_tokens > max_active_words) and len(active_sessions) > 0:
                         # Re-queue task and wait for an active session to free capacity
                         job_queue.put((task_item, arr_time))
                         break
@@ -246,14 +249,15 @@ class DualInstanceCluster:
                         job_queue.task_done()
                         continue
 
-                    current_active_words += task_words
+                    current_active_words += task_tokens
                     active_sessions[sid] = {
                         "task": task_item,
                         "gen": active_gen,
                         "model_tag": model_tag,
                         "arr_time": arr_time,
                         "t_exec_start": t_exec_start,
-                        "words": task_words,
+                        "words": text_words,
+                        "tokens": task_tokens,
                         "cb0": cb0,
                         "total_frames": 0,
                         "chunk_buffer": [],
@@ -317,7 +321,7 @@ class DualInstanceCluster:
                             f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
                         ))
                         # Free session slot immediately in local VRAM
-                        current_active_words -= s["words"]
+                        current_active_words -= s.get("tokens", s["words"])
                         gen.session_free(sid)
                         del active_sessions[sid]
                         job_queue.task_done()
@@ -327,7 +331,7 @@ class DualInstanceCluster:
                     frames_list = [s["total_frames"] for s in active_sessions.values()]
                     min_f = min(frames_list) if frames_list else 0
                     max_f = max(frames_list) if frames_list else 0
-                    print(f"  [Heartbeat GPU {gpu_id}] Active: {len(active_sessions):2d} streams ({current_active_words:,}/{max_active_words:,} words) | Frames: min {min_f:3d} / max {max_f:3d} | Audio: {sum(frames_list)*0.08:.1f}s", flush=True)
+                    print(f"  [Heartbeat GPU {gpu_id}] Active: {len(active_sessions):2d} streams ({current_active_words:,}/{max_active_words:,} tokens) | Frames: min {min_f:3d} / max {max_f:3d} | Audio: {sum(frames_list)*0.08:.1f}s", flush=True)
 
         worker_a = threading.Thread(
             target=generator_multi_session_loop,
