@@ -167,12 +167,13 @@ class GeneratorHandle:
     ) -> int:
         cb0_buf = ctypes.c_int()
         c_ref_text = ref_text.encode("utf-8") if (ref_text and len(ref_text) > 0) else None
+        c_ins = instruction.encode("utf-8") if (instruction and len(instruction) > 0) else None
         if ref_codes and ref_frames > 0:
             c_ref_codes = (ctypes.c_int * len(ref_codes))(*ref_codes)
         else:
             c_ref_codes = None
         res = self.lib.lib.breeze_generator_session_create_ext(
-            self.handle, session_id, text.encode("utf-8"), instruction.encode("utf-8"),
+            self.handle, session_id, text.encode("utf-8"), c_ins,
             c_ref_text, c_ref_codes, ref_frames,
             ctypes.c_float(cfg_scale), ctypes.c_uint32(seed), ctypes.byref(cb0_buf)
         )
