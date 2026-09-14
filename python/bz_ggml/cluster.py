@@ -185,6 +185,7 @@ class DualInstanceCluster:
         ):
             active_sessions = {}
             chunk_size = 4  # 4 frames = 320ms audio chunks for smooth streaming
+            last_hb_time = time.time()
 
             while not workers_stopping:
                 # A. Admit waiting tasks up to max_slots capacity
@@ -297,6 +298,13 @@ class DualInstanceCluster:
                         gen.session_free(sid)
                         del active_sessions[sid]
                         job_queue.task_done()
+
+                if time.time() - last_hb_time > 10.0 and active_sessions:
+                    last_hb_time = time.time()
+                    frames_list = [s["total_frames"] for s in active_sessions.values()]
+                    min_f = min(frames_list) if frames_list else 0
+                    max_f = max(frames_list) if frames_list else 0
+                    print(f"  [Heartbeat GPU {gpu_id}] Active: {len(active_sessions):2d} streams | Frames: min {min_f:3d} / max {max_f:3d} | Audio: {sum(frames_list)*0.08:.1f}s", flush=True)
 
         worker_a = threading.Thread(
             target=generator_multi_session_loop,
