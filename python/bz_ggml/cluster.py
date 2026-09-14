@@ -180,7 +180,6 @@ class DualInstanceCluster:
         def generator_multi_session_loop(
             worker_name: str,
             gen_default: GeneratorHandle,
-            gen_q4: Optional[GeneratorHandle],
             voc_queue: queue.Queue,
             gpu_id: int,
             max_slots: int = 15,
@@ -322,11 +321,11 @@ class DualInstanceCluster:
 
         worker_a = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance A", self.gen_a, self.gen_a_q4, voc_a_queue, 0, max_slots_per_gpu, max_active_words_per_gpu)
+            args=("Instance A", self.gen_a, voc_a_queue, 0, max_slots_per_gpu, max_active_words_per_gpu)
         )
         worker_b = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance B", self.gen_b, self.gen_b_q4, voc_b_queue, 1, max_slots_per_gpu, max_active_words_per_gpu)
+            args=("Instance B", self.gen_b, voc_b_queue, 1, max_slots_per_gpu, max_active_words_per_gpu)
         )
         worker_a.start()
         worker_b.start()
@@ -358,7 +357,7 @@ class DualInstanceCluster:
         return completed_results
 
     def close(self):
-        for attr in ["gen_a", "gen_b", "voc_a", "voc_b", "gen_a_q4", "gen_b_q4"]:
+        for attr in ["gen_a", "gen_b", "voc_a", "voc_b"]:
             if hasattr(self, attr):
                 obj = getattr(self, attr)
                 if obj:
