@@ -193,6 +193,7 @@ class DualInstanceCluster:
             chunk_size = 4  # 4 frames = 320ms audio chunks for smooth streaming
             last_hb_time = time.time()
             current_active_words = 0
+            pending_item = None
 
             while not workers_stopping:
                 # A. Admit waiting tasks governed strictly by max_active_words token budget
@@ -200,27 +201,32 @@ class DualInstanceCluster:
                     if max_slots is not None and len(active_sessions) >= max_slots:
                         break
 
-                    try:
-                        task_item, arr_time = job_queue.get_nowait()
-                    except queue.Empty:
-                        break
+                    if pending_item is not None:
+                        task_item, arr_time = pending_item
+                    else:
+                        try:
+                            task_item, arr_time = job_queue.get_nowait()
+                        except queue.Empty:
+                            break
 
-                    if task_item is None:
-                        break
+                        if task_item is None:
+                            break
 
                     text_words = len(task_item.text.split())
                     ref_tokens = getattr(task_item, "ref_frames", 0)
                     ins_words = len(task_item.instruction.split()) if getattr(task_item, "instruction", None) else 0
-                    task_tokens = text_words + ref_tokens + ins_words
+                    cfg_scale = getattr(task_item, "cfg_scale", 1.0)
+                    multiplier = 2 if cfg_scale > 1.0 else 1
+                    task_tokens = multiplier * (text_words + ref_tokens + ins_words)
 
                     # Check token / word capacity budget (strictly accounts for text + reference audio + instruction):
                     if (current_active_words + task_tokens > max_active_words) and len(active_sessions) > 0:
-                        # Re-queue task and wait for an active session to free capacity
-                        job_queue.put((task_item, arr_time))
+                        # Hold task locally without re-queuing into job_queue
+                        pending_item = (task_item, arr_time)
                         break
 
+                    pending_item = None
                     t_exec_start = time.time()
-                    cfg_scale = getattr(task_item, "cfg_scale", 1.0)
                     sid = task_item.id
 
                     # Select Q4 if surge tiering is enabled and load exceeds threshold
@@ -349,9 +355,7 @@ class DualInstanceCluster:
         for idx, task in enumerate(tasks):
             delay = arrival_delays[idx] if arrival_delays and idx < len(arrival_delays) else 0.0
             if delay > 0:
-                elapsed = time.time() - t_dispatch0
-                if delay > elapsed:
-                    time.sleep(delay - elapsed)
+                time.sleep(delay)
             job_queue.put((task, time.time()))
 
         all_dispatched.set()
