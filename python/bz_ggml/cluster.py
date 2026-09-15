@@ -40,21 +40,25 @@ class ClusterResult:
 
 def estimate_speech_profile(text: str, instruction: Optional[str] = None, ref_frames: int = 0) -> Dict[str, int]:
     """
-    Computes speech bounds, cadence, and token requirements purely based on word count.
+    Computes exact speech bounds, cadence, and token requirements based on speech acoustics:
+      - Acoustic frame rate: 12.5 fps (each frame is 80ms of audio).
+      - Fast speaking rate (200 WPM): ~3.75 frames per word.
+      - Conversational average (140 WPM): ~5.35 frames per word.
+      - Deliberate speaking rate (110 WPM + pauses): ~6.80 frames per word.
     """
     words = max(1, len(text.split()))
     ins_words = len(instruction.split()) if instruction else 0
 
-    # Input prefix BPE tokens: ~1.35 tokens per word + ref frames + overhead
-    prefix_tokens = int(math.ceil(words * 1.35)) + int(math.ceil(ins_words * 1.35)) + ref_frames + 10
+    # Input prefix BPE tokens: ~1.30 tokens per word + ref frames + formatting overhead
+    prefix_tokens = int(math.ceil(words * 1.30)) + int(math.ceil(ins_words * 1.30)) + ref_frames + 20
 
     # Output audio frame bounds (12.5 fps = 80ms/frame):
-    # - Earliest possible speech completion: ~1.10 frames per word
-    # - Expected speech duration: ~1.50 frames per word + 20
-    # - Safe maximum output frames: ~1.80 frames per word + 30
-    earliest_eos = max(10, int(math.floor(words * 1.10)))
-    expected_eos = int(math.ceil(words * 1.50)) + 20
-    conservative_max = int(math.ceil(words * 1.80)) + 30
+    # - Earliest possible speech completion (fast speech ~200 WPM): ~3.75 frames/word
+    # - Expected speech duration (conversational ~140 WPM): ~5.35 frames/word + 12 frames
+    # - Conservative maximum output frames (slow speech ~110 WPM + pauses): ~6.80 frames/word + 25 frames
+    earliest_eos = max(16, int(math.floor(words * 3.75)))
+    expected_eos = int(math.ceil(words * 5.35)) + 12
+    conservative_max = int(math.ceil(words * 6.80)) + 25
 
     total_needed = prefix_tokens + conservative_max
 
@@ -166,27 +170,29 @@ class DualInstanceCluster:
         lib_path: Optional[str] = None,
         q4_model_path: Optional[str] = None,
         enable_q4_burst: bool = False,
-        q4_threshold: int = 10
+        q4_threshold: int = 10,
+        enable_vocoder: bool = False
     ):
         self.model_path = model_path
         self.q4_model_path = q4_model_path
         self.enable_q4_burst = enable_q4_burst
         self.q4_threshold = q4_threshold
+        self.enable_vocoder = enable_vocoder
         self.lib = BreezeLib(lib_path)
 
         # Autonomous Island 0 (GPU 0)
         print("[Cluster] Initializing Autonomous Island 0 on CUDA0...")
         t0 = time.time()
         self.gen_a = GeneratorHandle(self.lib, model_path, cuda_device=0)
-        self.voc_a = VocoderHandle(self.lib, model_path, cuda_device=0)
-        print(f"   -> Island 0 (Gen A + Voc A) Online on CUDA0 in {time.time()-t0:.2f}s")
+        self.voc_a = VocoderHandle(self.lib, model_path, cuda_device=0) if self.enable_vocoder else None
+        print(f"   -> Island 0 Generator Online on CUDA0 in {time.time()-t0:.2f}s")
 
         # Autonomous Island 1 (GPU 1)
         print("[Cluster] Initializing Autonomous Island 1 on CUDA1...")
         t0 = time.time()
         self.gen_b = GeneratorHandle(self.lib, model_path, cuda_device=1)
-        self.voc_b = VocoderHandle(self.lib, model_path, cuda_device=1)
-        print(f"   -> Island 1 (Gen B + Voc B) Online on CUDA1 in {time.time()-t0:.2f}s")
+        self.voc_b = VocoderHandle(self.lib, model_path, cuda_device=1) if self.enable_vocoder else None
+        print(f"   -> Island 1 Generator Online on CUDA1 in {time.time()-t0:.2f}s")
 
         # Optional Modular INT4 Depth Decoder piece (~300 MiB)
         self.has_q4_dd = False
@@ -291,10 +297,17 @@ class DualInstanceCluster:
 
                 v_queue.task_done()
 
-        voc_a_thread = threading.Thread(target=vocoder_loop, args=(voc_a_queue, self.voc_a, "Vocoder A (GPU 0)"))
-        voc_b_thread = threading.Thread(target=vocoder_loop, args=(voc_b_queue, self.voc_b, "Vocoder B (GPU 1)"))
-        voc_a_thread.start()
-        voc_b_thread.start()
+        voc_a_thread = None
+        voc_b_thread = None
+        if not return_tokens:
+            if self.voc_a is None:
+                self.voc_a = VocoderHandle(self.lib, self.model_path, cuda_device=0)
+            if self.voc_b is None:
+                self.voc_b = VocoderHandle(self.lib, self.model_path, cuda_device=1)
+            voc_a_thread = threading.Thread(target=vocoder_loop, args=(voc_a_queue, self.voc_a, "Vocoder A (GPU 0)"))
+            voc_b_thread = threading.Thread(target=vocoder_loop, args=(voc_b_queue, self.voc_b, "Vocoder B (GPU 1)"))
+            voc_a_thread.start()
+            voc_b_thread.start()
 
         # 2. Generator Multi-Session Worker Loop with Adaptive Quantum
         all_dispatched = threading.Event()
@@ -557,13 +570,12 @@ class DualInstanceCluster:
         worker_a.join()
         worker_b.join()
         if not return_tokens:
-            voc_a_thread.join()
-            voc_b_thread.join()
-        else:
             voc_a_queue.put(None)
             voc_b_queue.put(None)
-            voc_a_thread.join()
-            voc_b_thread.join()
+            if voc_a_thread:
+                voc_a_thread.join()
+            if voc_b_thread:
+                voc_b_thread.join()
 
         completed_results.sort(key=lambda x: x.id)
         return completed_results
