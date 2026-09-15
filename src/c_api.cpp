@@ -640,9 +640,17 @@ int breeze_generator_sessions_step_batched(breeze_generator * gen,
             codes_q4 = gen->depth_batched_q4.run_batched(gen->model_q4, items_q4);
         }
 
-        // Helper lambda to finish each session: assemble frame, run backbone, sample next cb0
-        int completed_in_round = 0;
-        auto finish_session = [&](int i, int sid, const std::vector<int> & codes) {
+        // 3. Assemble 16-codebook frames and prepare Batched Backbone items
+        struct SessionBackboneMapping {
+            int out_idx;
+            int sid;
+            int bb_idx_c;
+            int bb_idx_u;
+        };
+        std::vector<SessionBackboneMapping> bb_map;
+        std::vector<breeze::BackboneBatchItem> bb_items;
+
+        auto prepare_session = [&](int i, int sid, const std::vector<int> & codes) {
             BreezeSession * sess = gen->sessions[sid].get();
             int * frame_ptr = out_frames_16 + i * 16;
             frame_ptr[0] = sess->last_cb0;
@@ -652,10 +660,44 @@ int breeze_generator_sessions_step_batched(breeze_generator * gen,
 
             std::vector<int> frame(frame_ptr, frame_ptr + 16);
             std::vector<float> ae = breeze::audio_embed_forward(gen->model, frame, 1);
-            breeze::StepOut o_c = breeze::backbone_run(gen->model, sess->st_c, ae, 1);
-            breeze::StepOut o_u;
+
+            SessionBackboneMapping mapping;
+            mapping.out_idx = i;
+            mapping.sid = sid;
+
+            // Conditional branch
+            mapping.bb_idx_c = (int) bb_items.size();
+            bb_items.push_back({ &sess->st_c, ae });
+
+            // Unconditional branch (if CFG > 1.0)
             if (sess->use_cfg) {
-                o_u = breeze::backbone_run(gen->model, sess->st_u, ae, 1);
+                mapping.bb_idx_u = (int) bb_items.size();
+                bb_items.push_back({ &sess->st_u, ae });
+            } else {
+                mapping.bb_idx_u = -1;
+            }
+
+            bb_map.push_back(mapping);
+        };
+
+        for (size_t k = 0; k < items_q8.size(); k++) {
+            prepare_session(map_q8_to_i[k], items_q8[k].session_id, codes_q8[k]);
+        }
+        for (size_t k = 0; k < items_q4.size(); k++) {
+            prepare_session(map_q4_to_i[k], items_q4[k].session_id, codes_q4[k]);
+        }
+
+        // 4. Run Batched Backbone GEMM across ALL sessions simultaneously!
+        std::vector<breeze::StepOut> bb_outs = breeze::backbone_run_batched(gen->model, bb_items);
+
+        // 5. Unpack Backbone outputs, sample next cb0, check EOS
+        int completed_in_round = 0;
+        for (const auto & m : bb_map) {
+            BreezeSession * sess = gen->sessions[m.sid].get();
+            const breeze::StepOut & o_c = bb_outs[m.bb_idx_c];
+            breeze::StepOut o_u;
+            if (sess->use_cfg && m.bb_idx_u >= 0) {
+                o_u = bb_outs[m.bb_idx_u];
             }
 
             std::vector<float> comb = combine_logits(o_c.logits, o_u.logits, sess->use_cfg, sess->cfg_scale);
@@ -664,25 +706,19 @@ int breeze_generator_sessions_step_batched(breeze_generator * gen,
 
             if (next_cb0 == gen->model.cfg.backbone_eos_token_id || sess->steps_taken >= sess->max_tokens) {
                 sess->active = false;
-                out_next_cb0[i] = -1;
+                out_next_cb0[m.out_idx] = -1;
             } else {
                 sess->hist.push_back(next_cb0);
                 sess->last_cb0 = next_cb0;
                 sess->last_hidden = o_c.hidden;
                 if (sess->use_cfg) sess->last_hidden_u = o_u.hidden;
-                out_next_cb0[i] = next_cb0;
+                out_next_cb0[m.out_idx] = next_cb0;
                 completed_in_round++;
             }
-        };
-
-        for (size_t k = 0; k < items_q8.size(); k++) {
-            finish_session(map_q8_to_i[k], items_q8[k].session_id, codes_q8[k]);
-        }
-        for (size_t k = 0; k < items_q4.size(); k++) {
-            finish_session(map_q4_to_i[k], items_q4[k].session_id, codes_q4[k]);
         }
 
         return completed_in_round;
+
     } catch (const std::exception & e) {
         g_error = e.what();
         return -1;

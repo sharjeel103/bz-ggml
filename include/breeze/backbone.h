@@ -25,4 +25,13 @@ std::vector<float> audio_embed_forward(BreezeModel & m, const std::vector<int> &
 // run a chunk of inputs_embeds through the backbone, appending to the kv cache
 StepOut backbone_run(BreezeModel & m, BackboneState & st, const std::vector<float> & embeds, int n_tokens);
 
+// Multi-session batched execution: runs 1 frame step across N parallel streams with Batched GEMM
+struct BackboneBatchItem {
+    BackboneState * st = nullptr;
+    std::vector<float> embed; // [hidden_size]
+};
+
+std::vector<StepOut> backbone_run_batched(BreezeModel & m, const std::vector<BackboneBatchItem> & items);
+
 }
+
