@@ -640,7 +640,41 @@ int breeze_generator_sessions_step_batched(breeze_generator * gen,
             codes_q4 = gen->depth_batched_q4.run_batched(gen->model_q4, items_q4);
         }
 
-        // 3. Assemble 16-codebook frames and prepare Batched Backbone items
+        // 3. Assemble 16-codebook frames and run Batched Audio Embedding (1 GPU Call!)
+        const int num_active_sessions = (int) (items_q8.size() + items_q4.size());
+        std::vector<int> all_frames(num_active_sessions * 16);
+
+        struct ActiveSessionMeta {
+            int out_idx;
+            int sid;
+            BreezeSession * sess;
+        };
+        std::vector<ActiveSessionMeta> active_metas;
+        active_metas.reserve(num_active_sessions);
+
+        auto collect_frame = [&](int i, int sid, const std::vector<int> & codes) {
+            BreezeSession * sess = gen->sessions[sid].get();
+            int * frame_ptr = out_frames_16 + i * 16;
+            frame_ptr[0] = sess->last_cb0;
+            for (size_t k = 0; k < codes.size() && k < 15; k++) {
+                frame_ptr[k + 1] = codes[k];
+            }
+            int ord = (int) active_metas.size();
+            std::memcpy(all_frames.data() + ord * 16, frame_ptr, 16 * sizeof(int));
+            active_metas.push_back({ i, sid, sess });
+        };
+
+        for (size_t k = 0; k < items_q8.size(); k++) {
+            collect_frame(map_q8_to_i[k], items_q8[k].session_id, codes_q8[k]);
+        }
+        for (size_t k = 0; k < items_q4.size(); k++) {
+            collect_frame(map_q4_to_i[k], items_q4[k].session_id, codes_q4[k]);
+        }
+
+        // Single batched GPU lookup for all sessions simultaneously!
+        std::vector<float> all_ae = breeze::audio_embed_forward(gen->model, all_frames, num_active_sessions);
+        const int hidden_size = gen->model.cfg.hidden_size;
+
         struct SessionBackboneMapping {
             int out_idx;
             int sid;
@@ -648,43 +682,32 @@ int breeze_generator_sessions_step_batched(breeze_generator * gen,
             int bb_idx_u;
         };
         std::vector<SessionBackboneMapping> bb_map;
+        bb_map.reserve(num_active_sessions);
         std::vector<breeze::BackboneBatchItem> bb_items;
+        bb_items.reserve(num_active_sessions * 2);
 
-        auto prepare_session = [&](int i, int sid, const std::vector<int> & codes) {
-            BreezeSession * sess = gen->sessions[sid].get();
-            int * frame_ptr = out_frames_16 + i * 16;
-            frame_ptr[0] = sess->last_cb0;
-            for (size_t k = 0; k < codes.size() && k < 15; k++) {
-                frame_ptr[k + 1] = codes[k];
-            }
-
-            std::vector<int> frame(frame_ptr, frame_ptr + 16);
-            std::vector<float> ae = breeze::audio_embed_forward(gen->model, frame, 1);
+        for (int m = 0; m < num_active_sessions; m++) {
+            const auto & meta = active_metas[m];
+            const float * ae_ptr = all_ae.data() + (size_t) m * hidden_size;
+            std::vector<float> ae(ae_ptr, ae_ptr + hidden_size);
 
             SessionBackboneMapping mapping;
-            mapping.out_idx = i;
-            mapping.sid = sid;
+            mapping.out_idx = meta.out_idx;
+            mapping.sid = meta.sid;
 
             // Conditional branch
             mapping.bb_idx_c = (int) bb_items.size();
-            bb_items.push_back({ &sess->st_c, ae });
+            bb_items.push_back({ &meta.sess->st_c, ae });
 
             // Unconditional branch (if CFG > 1.0)
-            if (sess->use_cfg) {
+            if (meta.sess->use_cfg) {
                 mapping.bb_idx_u = (int) bb_items.size();
-                bb_items.push_back({ &sess->st_u, ae });
+                bb_items.push_back({ &meta.sess->st_u, ae });
             } else {
                 mapping.bb_idx_u = -1;
             }
 
             bb_map.push_back(mapping);
-        };
-
-        for (size_t k = 0; k < items_q8.size(); k++) {
-            prepare_session(map_q8_to_i[k], items_q8[k].session_id, codes_q8[k]);
-        }
-        for (size_t k = 0; k < items_q4.size(); k++) {
-            prepare_session(map_q4_to_i[k], items_q4[k].session_id, codes_q4[k]);
         }
 
         // 4. Run Batched Backbone GEMM across ALL sessions simultaneously!
