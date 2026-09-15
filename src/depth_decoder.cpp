@@ -192,8 +192,8 @@ std::vector<std::vector<int>> DepthRunner::run_batched(BreezeModel & m, const st
 
     const int total_b = (int) b_info.size();
     if (total_b > n_branch) {
-        throw std::runtime_error("DepthRunner::run_batched: total_branches (" + std::to_string(total_b) +
-                                 ") exceeds capacity (" + std::to_string(n_branch) + ")");
+        kv.free();
+        init(m, std::max(total_b, n_branch * 2));
     }
 
     std::vector<std::vector<int>> results(items.size());
