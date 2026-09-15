@@ -98,7 +98,14 @@ class BreezeLib:
         ]
         self.lib.breeze_generator_sessions_step_round.restype = ctypes.c_int
 
+        self.lib.breeze_generator_sessions_step_batched.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
+        ]
+        self.lib.breeze_generator_sessions_step_batched.restype = ctypes.c_int
+
         # Vocoder API
+
         self.lib.breeze_vocoder_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
         self.lib.breeze_vocoder_init.restype = ctypes.c_void_p
 
@@ -213,7 +220,26 @@ class GeneratorHandle:
         frames = [list(c_frames[i*16:(i+1)*16]) for i in range(n)]
         return next_cb0s, frames
 
+    def sessions_step_batched(self, session_ids: List[int], seeds: Optional[List[int]] = None) -> Tuple[List[int], List[List[int]]]:
+        n = len(session_ids)
+        if n == 0:
+            return [], []
+        c_sids = (ctypes.c_int * n)(*session_ids)
+        c_frames = (ctypes.c_int * (n * 16))()
+        c_next_cb0 = (ctypes.c_int * n)()
+        if seeds is not None and len(seeds) == n:
+            c_seeds = (ctypes.c_uint32 * n)(*seeds)
+        else:
+            c_seeds = None
+        self.lib.lib.breeze_generator_sessions_step_batched(
+            self.handle, c_sids, n, c_seeds, c_frames, c_next_cb0
+        )
+        next_cb0s = list(c_next_cb0)
+        frames = [list(c_frames[i*16:(i+1)*16]) for i in range(n)]
+        return next_cb0s, frames
+
     def close(self):
+
         if self.handle:
             self.lib.lib.breeze_generator_free(self.handle)
             self.handle = None

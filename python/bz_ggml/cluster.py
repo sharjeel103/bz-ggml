@@ -284,61 +284,69 @@ class DualInstanceCluster:
                     time.sleep(0.002)
                     continue
 
-                # B. Step active sessions with Adaptive Quantum
-                active_sids = list(active_sessions.keys())
-                for sid in active_sids:
+                # B. Step all active sessions concurrently using Batched GEMM (Layer-Outer Loop)
+                active_sids = [sid for sid in active_sessions.keys()]
+                if not active_sids:
+                    continue
+
+                step_seeds = [
+                    active_sessions[sid]["task"].seed + active_sessions[sid]["total_frames"]
+                    for sid in active_sids
+                ]
+
+                next_cb0s, frames16 = gen_default.sessions_step_batched(active_sids, step_seeds)
+
+                finished_sids = []
+                for i, sid in enumerate(active_sids):
                     s = active_sessions.get(sid)
                     if not s:
                         continue
 
                     task_item = s["task"]
-                    gen = s["gen"]
+                    next_cb0 = next_cb0s[i]
+                    frame16 = frames16[i]
 
-                    # Quantum size: exactly 1 frame for the very first step (sub-second TTFA),
-                    # and quantum_frames (e.g. 2) for subsequent steps to maximize tensor core saturation!
-                    step_quantum = 1 if s["total_frames"] == 0 else quantum_frames
+                    s["total_frames"] += 1
+                    s["chunk_buffer"].extend(frame16)
+                    s["cb0"] = next_cb0
 
-                    finished_eos = False
-                    for _ in range(step_quantum):
-                        step_seed = task_item.seed + s["total_frames"]
-                        next_cb0, frame16 = gen.session_step(sid, step_seed)
-                        s["total_frames"] += 1
-                        s["chunk_buffer"].extend(frame16)
-                        s["cb0"] = next_cb0
-
-                        # Immediate Frame 1 dispatch for ultra-low TTFA (< 800ms)
-                        if s["total_frames"] == 1:
-                            voc_queue.put((
-                                task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                                list(s["chunk_buffer"]), True, False, s["total_frames"],
-                                f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
-                            ))
-                            s["chunk_buffer"] = []
-                        elif len(s["chunk_buffer"]) >= (chunk_size * 16):
-                            voc_queue.put((
-                                task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                                list(s["chunk_buffer"]), False, False, s["total_frames"],
-                                f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
-                            ))
-                            s["chunk_buffer"] = []
-
-                        if next_cb0 < 0 or s["total_frames"] >= s["max_steps"]:
-                            finished_eos = True
-                            break
-
-                    # C. Check if EOS or max_steps reached
-                    if finished_eos:
-                        # End of stream flush to vocoder
+                    # Immediate Frame 1 dispatch for ultra-low TTFA (< 800ms)
+                    if s["total_frames"] == 1:
                         voc_queue.put((
                             task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                            list(s["chunk_buffer"]), False, True, s["total_frames"],
+                            list(s["chunk_buffer"]), True, False, s["total_frames"],
                             f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
                         ))
-                        # Free session slot immediately in local VRAM
-                        current_active_words -= s.get("tokens", s["words"])
-                        gen.session_free(sid)
-                        del active_sessions[sid]
-                        job_queue.task_done()
+                        s["chunk_buffer"] = []
+                    elif len(s["chunk_buffer"]) >= (chunk_size * 16):
+                        voc_queue.put((
+                            task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
+                            list(s["chunk_buffer"]), False, False, s["total_frames"],
+                            f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
+                        ))
+                        s["chunk_buffer"] = []
+
+                    if next_cb0 < 0 or s["total_frames"] >= s["max_steps"]:
+                        finished_sids.append(sid)
+
+                # C. Check if EOS or max_steps reached
+                for sid in finished_sids:
+                    s = active_sessions.get(sid)
+                    if not s:
+                        continue
+                    task_item = s["task"]
+                    # End of stream flush to vocoder
+                    voc_queue.put((
+                        task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
+                        list(s["chunk_buffer"]), False, True, s["total_frames"],
+                        f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
+                    ))
+                    # Free session slot immediately in local VRAM
+                    current_active_words -= s.get("tokens", s["words"])
+                    gen_default.session_free(sid)
+                    del active_sessions[sid]
+                    job_queue.task_done()
+
 
                 if time.time() - last_hb_time > 10.0 and active_sessions:
                     last_hb_time = time.time()

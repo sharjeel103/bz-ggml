@@ -157,18 +157,22 @@ struct breeze_generator {
     breeze::BreezeModel model;
     breeze::DepthRunner depth_single;
     breeze::DepthRunner depth_dual;
+    breeze::DepthRunner depth_batched;
     int device = 0;
     bool depth_single_init = false;
     bool depth_dual_init = false;
+    bool depth_batched_init = false;
 
     // Modular INT4 Depth Decoder piece (~300 MiB)
     breeze::GGUFModel q4_dd;
     breeze::BreezeModel model_q4;
     breeze::DepthRunner depth_single_q4;
     breeze::DepthRunner depth_dual_q4;
+    breeze::DepthRunner depth_batched_q4;
     bool has_q4_dd = false;
     bool depth_single_q4_init = false;
     bool depth_dual_q4_init = false;
+    bool depth_batched_q4_init = false;
 
     std::unordered_map<int, std::unique_ptr<BreezeSession>> sessions;
 
@@ -204,6 +208,8 @@ breeze_generator * breeze_generator_init(const char * gguf_path, int cuda_device
         gen->depth_single_init = true;
         gen->depth_dual.init(gen->model, 2);
         gen->depth_dual_init = true;
+        gen->depth_batched.init(gen->model, 64);
+        gen->depth_batched_init = true;
         return gen;
     } catch (const std::exception & e) {
         g_error = e.what();
@@ -221,12 +227,15 @@ void breeze_generator_free(breeze_generator * gen) {
     if (gen->st_init) gen->st.free();
     if (gen->depth_single_init) gen->depth_single.free();
     if (gen->depth_dual_init) gen->depth_dual.free();
+    if (gen->depth_batched_init) gen->depth_batched.free();
     if (gen->depth_single_q4_init) gen->depth_single_q4.free();
     if (gen->depth_dual_q4_init) gen->depth_dual_q4.free();
+    if (gen->depth_batched_q4_init) gen->depth_batched_q4.free();
     if (gen->has_q4_dd) gen->q4_dd.free();
     gen->model.free();
     delete gen;
 }
+
 
 int breeze_generator_prefill(breeze_generator * gen, const char * text, 
                              const char * instruction, unsigned int seed, int * out_cb0) {
@@ -513,10 +522,12 @@ int breeze_generator_load_q4_depth(breeze_generator * gen, const char * q4_gguf_
         if (gen->has_q4_dd) {
             if (gen->depth_single_q4_init) gen->depth_single_q4.free();
             if (gen->depth_dual_q4_init) gen->depth_dual_q4.free();
+            if (gen->depth_batched_q4_init) gen->depth_batched_q4.free();
             gen->q4_dd.free();
             gen->has_q4_dd = false;
             gen->depth_single_q4_init = false;
             gen->depth_dual_q4_init = false;
+            gen->depth_batched_q4_init = false;
         }
 
         if (!gen->q4_dd.load_prefix(q4_gguf_path, gen->model.backend, "dd.")) {
@@ -534,8 +545,11 @@ int breeze_generator_load_q4_depth(breeze_generator * gen, const char * q4_gguf_
         gen->depth_single_q4_init = true;
         gen->depth_dual_q4.init(gen->model_q4, 2);
         gen->depth_dual_q4_init = true;
+        gen->depth_batched_q4.init(gen->model_q4, 64);
+        gen->depth_batched_q4_init = true;
         gen->has_q4_dd = true;
         return 0;
+
     } catch (const std::exception & e) {
         g_error = e.what();
         return -1;
@@ -570,6 +584,111 @@ int breeze_generator_sessions_step_round(breeze_generator * gen,
     }
     return completed_in_round;
 }
+
+int breeze_generator_sessions_step_batched(breeze_generator * gen, 
+                                          const int * session_ids, int num_sessions, 
+                                          const unsigned int * seeds,
+                                          int * out_frames_16, int * out_next_cb0) {
+    if (!gen || !session_ids || num_sessions <= 0 || !out_frames_16 || !out_next_cb0) return 0;
+    try {
+        // 1. Separate sessions into Q8 and Q4 groups
+        std::vector<breeze::DepthRunner::BatchItem> items_q8;
+        std::vector<breeze::DepthRunner::BatchItem> items_q4;
+        std::vector<int> map_q8_to_i;
+        std::vector<int> map_q4_to_i;
+
+        for (int i = 0; i < num_sessions; i++) {
+            out_next_cb0[i] = -1;
+            int sid = session_ids[i];
+            auto it = gen->sessions.find(sid);
+            if (it == gen->sessions.end() || !it->second || !it->second->active) {
+                continue;
+            }
+            BreezeSession * sess = it->second.get();
+
+            breeze::DepthRunner::BatchItem item;
+            item.session_id = sid;
+            item.cb0 = sess->last_cb0;
+            item.cfg_scale = sess->cfg_scale;
+            item.use_cfg = sess->use_cfg;
+            item.hidden_c = sess->last_hidden;
+            if (sess->use_cfg) item.hidden_u = sess->last_hidden_u;
+            item.rng = &sess->rng;
+            if (seeds) {
+                sess->rng.seed(seeds[i]);
+            }
+            item.sp = nullptr;
+
+            if (sess->use_q4 && gen->has_q4_dd) {
+                items_q4.push_back(std::move(item));
+                map_q4_to_i.push_back(i);
+            } else {
+                items_q8.push_back(std::move(item));
+                map_q8_to_i.push_back(i);
+            }
+        }
+
+        if (items_q8.empty() && items_q4.empty()) return 0;
+
+        // 2. Run Batched Depth Decoder for each group
+        std::vector<std::vector<int>> codes_q8;
+        if (!items_q8.empty()) {
+            codes_q8 = gen->depth_batched.run_batched(gen->model, items_q8);
+        }
+        std::vector<std::vector<int>> codes_q4;
+        if (!items_q4.empty()) {
+            codes_q4 = gen->depth_batched_q4.run_batched(gen->model_q4, items_q4);
+        }
+
+        // Helper lambda to finish each session: assemble frame, run backbone, sample next cb0
+        int completed_in_round = 0;
+        auto finish_session = [&](int i, int sid, const std::vector<int> & codes) {
+            BreezeSession * sess = gen->sessions[sid].get();
+            int * frame_ptr = out_frames_16 + i * 16;
+            frame_ptr[0] = sess->last_cb0;
+            for (size_t k = 0; k < codes.size() && k < 15; k++) {
+                frame_ptr[k + 1] = codes[k];
+            }
+
+            std::vector<int> frame(frame_ptr, frame_ptr + 16);
+            std::vector<float> ae = breeze::audio_embed_forward(gen->model, frame, 1);
+            breeze::StepOut o_c = breeze::backbone_run(gen->model, sess->st_c, ae, 1);
+            breeze::StepOut o_u;
+            if (sess->use_cfg) {
+                o_u = breeze::backbone_run(gen->model, sess->st_u, ae, 1);
+            }
+
+            std::vector<float> comb = combine_logits(o_c.logits, o_u.logits, sess->use_cfg, sess->cfg_scale);
+            int next_cb0 = breeze::sample_token(comb, sess->bp, sess->rng, &sess->hist, &sess->suppress);
+            sess->steps_taken++;
+
+            if (next_cb0 == gen->model.cfg.backbone_eos_token_id || sess->steps_taken >= sess->max_tokens) {
+                sess->active = false;
+                out_next_cb0[i] = -1;
+            } else {
+                sess->hist.push_back(next_cb0);
+                sess->last_cb0 = next_cb0;
+                sess->last_hidden = o_c.hidden;
+                if (sess->use_cfg) sess->last_hidden_u = o_u.hidden;
+                out_next_cb0[i] = next_cb0;
+                completed_in_round++;
+            }
+        };
+
+        for (size_t k = 0; k < items_q8.size(); k++) {
+            finish_session(map_q8_to_i[k], items_q8[k].session_id, codes_q8[k]);
+        }
+        for (size_t k = 0; k < items_q4.size(); k++) {
+            finish_session(map_q4_to_i[k], items_q4[k].session_id, codes_q4[k]);
+        }
+
+        return completed_in_round;
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
 
 breeze_vocoder * breeze_vocoder_init(const char * gguf_path, int cuda_device) {
     breeze_vocoder * voc = new breeze_vocoder();

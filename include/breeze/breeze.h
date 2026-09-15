@@ -115,7 +115,15 @@ BREEZE_API int breeze_generator_sessions_step_round(breeze_generator * gen,
                                                     unsigned int seed,
                                                     int * out_frames_16, int * out_next_cb0);
 
+// Step 1 round across an array of active sessions using Batched GEMM (Layer-Outer Loop)
+// Evaluates all 15 depth steps simultaneously for all sessions in single cuBLAS GEMM passes
+BREEZE_API int breeze_generator_sessions_step_batched(breeze_generator * gen, 
+                                                      const int * session_ids, int num_sessions, 
+                                                      const unsigned int * seeds,
+                                                      int * out_frames_16, int * out_next_cb0);
+
 #ifdef __cplusplus
+
 }
 #endif
 

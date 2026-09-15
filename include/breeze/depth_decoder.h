@@ -24,6 +24,21 @@ struct DepthRunner {
                          int cb0, float cfg_scale, std::mt19937 & rng,
                          const SampleParams * sp = nullptr,
                          const int * force = nullptr, int n_force = 0);
+
+    // Multi-session batched execution: runs all 15 depth steps simultaneously in batched GEMM
+    struct BatchItem {
+        int session_id = 0;
+        int cb0 = 0;
+        float cfg_scale = 1.0f;
+        bool use_cfg = false;
+        std::vector<float> hidden_c;
+        std::vector<float> hidden_u;
+        std::mt19937 * rng = nullptr;
+        const SampleParams * sp = nullptr;
+    };
+
+    std::vector<std::vector<int>> run_batched(BreezeModel & m, const std::vector<BatchItem> & items);
 };
 
 }
+
