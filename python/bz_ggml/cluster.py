@@ -391,10 +391,10 @@ class DualInstanceCluster:
                             use_q4=use_q4
                         )
                     except Exception as e:
-                        print(f"[{worker_name}] Error creating session {sid}: {e}")
+                        print(f"[{worker_name}] Transient memory pressure on session {sid} ({e}); holding task for next cycle...")
                         slot_pool.release(slot_id)
-                        job_queue.task_done()
-                        continue
+                        pending_item = (task_item, arr_time)
+                        break
 
                     active_sessions[sid] = {
                         "task": task_item,
