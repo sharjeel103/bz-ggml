@@ -216,7 +216,7 @@ class DualInstanceCluster:
         max_slots_per_gpu: Optional[int] = 64,
         vocoder_chunk_size: int = 16,
         return_tokens: bool = False,
-        max_active_tokens_per_gpu: int = 30000
+        max_active_tokens_per_gpu: int = 50000
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
 
@@ -323,7 +323,7 @@ class DualInstanceCluster:
             voc_queue: queue.Queue,
             gpu_id: int,
             max_slots: Optional[int] = 64,
-            max_active_tokens: int = 30000,
+            max_active_tokens: int = 50000,
             chunk_size: int = 16,
             return_tokens_mode: bool = False
         ):
