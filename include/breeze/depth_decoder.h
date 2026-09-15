@@ -38,6 +38,10 @@ struct DepthRunner {
     };
 
     std::vector<std::vector<int>> run_batched(BreezeModel & m, const std::vector<BatchItem> & items);
+
+    // Unified 15-step on-GPU unrolled graph: executes all 15 codebook decodes in a single GPU pass
+    // using On-GPU Argmax and in-VRAM embedding lookups, completely eliminating PCIe round-trips.
+    std::vector<std::vector<int>> run_batched_unified_gpu(BreezeModel & m, const std::vector<BatchItem> & items);
 };
 
 }

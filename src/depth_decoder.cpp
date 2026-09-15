@@ -246,5 +246,123 @@ std::vector<std::vector<int>> DepthRunner::run_batched(BreezeModel & m, const st
     return results;
 }
 
+std::vector<std::vector<int>> DepthRunner::run_batched_unified_gpu(BreezeModel & m, const std::vector<BatchItem> & items) {
+    if (items.empty()) return {};
+
+    // If any item uses CFG, gracefully fallback to run_batched to preserve complex multi-branch interpolation
+    for (const auto & it : items) {
+        if (it.use_cfg) {
+            return run_batched(m, items);
+        }
+    }
+
+    const int nc = m.cfg.num_codebooks;
+    const int vs = m.cfg.audio_vocab_size;
+    const DepthConfig & c = m.cfg.dd;
+    const int nb = (int) items.size();
+
+    if (nb > n_branch) {
+        kv.free();
+        init(m, std::max(nb, n_branch * 2));
+    }
+    kv.reset();
+
+    // Allocate single unified forward graph for all 15 depth steps (~2,500 nodes)
+    Graph g(16384);
+
+    // Initial inputs: cb0 and hiddens for step 1
+    std::vector<int32_t> cb0_idx(nb);
+    std::vector<float> flat_hiddens;
+    flat_hiddens.reserve((size_t) nb * m.cfg.hidden_size);
+
+    for (int i = 0; i < nb; i++) {
+        cb0_idx[i] = items[i].cb0;
+        flat_hiddens.insert(flat_hiddens.end(), items[i].hidden_c.begin(), items[i].hidden_c.end());
+    }
+
+    ggml_tensor * aud_cb0 = g.input_i32(cb0_idx, nb);
+    ggml_tensor * embed = ggml_get_rows(g.ctx, m.w("audio_embd.weight"), aud_cb0); // [2048, nb]
+    ggml_tensor * h0 = g.input_f32(flat_hiddens, m.cfg.hidden_size, nb);
+    embed = ggml_concat(g.ctx, h0, embed, 1); // [2048, 2*nb]
+
+    ggml_tensor * x = linear(g.ctx, m.w("dd.in_proj.weight"), embed); // [1024, 2*nb]
+
+    std::vector<int32_t> pos_i1(2 * nb);
+    for (int i = 0; i < 2 * nb; i++) pos_i1[i] = i / nb;
+    ggml_tensor * pos1 = g.input_i32(pos_i1, 2 * nb);
+    ggml_tensor * ff = g.input_f32(freq_factors, (int) freq_factors.size());
+    std::vector<float> mask_v1 = build_branch_causal_mask(2 * nb, 2 * nb, 0, nb);
+    ggml_tensor * mask1 = g.input_f32(mask_v1, 2 * nb, 2 * nb);
+
+    for (int il = 0; il < c.n_layer; il++) {
+        x = dd_layer(g.ctx, m, g, kv, x, il, pos1, ff, mask1, 0, 2 * nb);
+    }
+    x = rms_norm(g.ctx, x, m.w("dd.output_norm.weight"), c.rms_eps);
+
+    ggml_tensor * last = ggml_cont(g.ctx, ggml_view_2d(g.ctx, x, c.hidden, nb, x->nb[1],
+                                                       (size_t) nb * x->nb[1]));
+    ggml_tensor * head = m.w("dd.codebooks_head.weight");
+    ggml_tensor * hw0 = ggml_view_2d(g.ctx, head, head->ne[0], head->ne[1], head->nb[1], 0);
+    ggml_tensor * logits1 = ggml_mul_mat(g.ctx, hw0, last); // [vocab, nb]
+
+    // Step 1: On-GPU Argmax (Zero PCIe Copy!)
+    ggml_tensor * sampled1 = ggml_argmax(g.ctx, logits1); // [nb], GGML_TYPE_I32
+    ggml_tensor * all_codes = ggml_reshape_2d(g.ctx, sampled1, nb, 1); // [nb, 1]
+
+    ggml_tensor * prev_sampled = sampled1;
+
+    // Steps 2 to 15: Chained continuously on the GPU with zero CPU round-trips
+    for (int j = 2; j < nc; j++) {
+        const int prev_cb = j - 1; // codebook from previous step
+        const int cur_head = j - 1; // head for current step
+        const int start = j;
+        const int total = (start + 1) * nb;
+
+        // In-VRAM lookup: view audio_embd.weight for codebook prev_cb
+        size_t emb_offset = (size_t) (prev_cb * vs) * m.w("audio_embd.weight")->nb[1];
+        ggml_tensor * emb_table = ggml_view_2d(g.ctx, m.w("audio_embd.weight"), m.cfg.hidden_size, vs,
+                                               m.w("audio_embd.weight")->nb[1], emb_offset);
+        ggml_tensor * aud_j = ggml_get_rows(g.ctx, emb_table, prev_sampled); // [2048, nb]
+        ggml_tensor * x_j = linear(g.ctx, m.w("dd.in_proj.weight"), aud_j); // [1024, nb]
+
+        std::vector<int32_t> pos_ij(nb, j);
+        ggml_tensor * pos_j = g.input_i32(pos_ij, nb);
+        std::vector<float> mask_vj = build_branch_causal_mask(nb, total, start, nb);
+        ggml_tensor * mask_j = g.input_f32(mask_vj, total, nb);
+
+        for (int il = 0; il < c.n_layer; il++) {
+            x_j = dd_layer(g.ctx, m, g, kv, x_j, il, pos_j, ff, mask_j, start * nb, nb);
+        }
+        x_j = rms_norm(g.ctx, x_j, m.w("dd.output_norm.weight"), c.rms_eps);
+
+        ggml_tensor * hw_j = ggml_view_2d(g.ctx, head, head->ne[0], head->ne[1], head->nb[1],
+                                          (size_t) cur_head * head->nb[2]);
+        ggml_tensor * logits_j = ggml_mul_mat(g.ctx, hw_j, x_j); // [vocab, nb]
+
+        // On-GPU Argmax
+        ggml_tensor * sampled_j = ggml_argmax(g.ctx, logits_j); // [nb]
+        ggml_tensor * s_2d = ggml_reshape_2d(g.ctx, sampled_j, nb, 1);
+        all_codes = ggml_concat(g.ctx, all_codes, s_2d, 1); // shape becomes [nb, j]
+
+        prev_sampled = sampled_j;
+    }
+
+    // Single uninterrupted GPU execution for all 15 codebooks!
+    g.compute(m.backend, all_codes);
+
+    // Read back the final 15 codebooks in one single contiguous 2.4 KB transfer
+    std::vector<int32_t> flat_codes((size_t) nb * (nc - 1));
+    ggml_backend_tensor_get(all_codes, flat_codes.data(), 0, flat_codes.size() * sizeof(int32_t));
+
+    std::vector<std::vector<int>> results(nb, std::vector<int>(nc - 1));
+    for (int k = 0; k < nc - 1; k++) {
+        for (int i = 0; i < nb; i++) {
+            results[i][k] = flat_codes[(size_t) k * nb + i];
+        }
+    }
+
+    return results;
+}
+
 }
 

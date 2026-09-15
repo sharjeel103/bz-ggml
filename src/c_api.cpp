@@ -630,14 +630,14 @@ int breeze_generator_sessions_step_batched(breeze_generator * gen,
 
         if (items_q8.empty() && items_q4.empty()) return 0;
 
-        // 2. Run Batched Depth Decoder for each group
+        // 2. Run Batched Depth Decoder (Unified On-GPU Unrolled Graph)
         std::vector<std::vector<int>> codes_q8;
         if (!items_q8.empty()) {
-            codes_q8 = gen->depth_batched.run_batched(gen->model, items_q8);
+            codes_q8 = gen->depth_batched.run_batched_unified_gpu(gen->model, items_q8);
         }
         std::vector<std::vector<int>> codes_q4;
         if (!items_q4.empty()) {
-            codes_q4 = gen->depth_batched_q4.run_batched(gen->model_q4, items_q4);
+            codes_q4 = gen->depth_batched_q4.run_batched_unified_gpu(gen->model_q4, items_q4);
         }
 
         // 3. Assemble 16-codebook frames and run Batched Audio Embedding (1 GPU Call!)
@@ -815,14 +815,14 @@ BREEZE_API int breeze_generator_sessions_step_burst(breeze_generator * gen,
 
             if (items_q8.empty() && items_q4.empty()) break;
 
-            // 2. Run Batched Depth Decoder
+            // 2. Run Batched Depth Decoder (Unified On-GPU Unrolled Graph - Zero PCIe Round-Trips!)
             std::vector<std::vector<int>> codes_q8;
             if (!items_q8.empty()) {
-                codes_q8 = gen->depth_batched.run_batched(gen->model, items_q8);
+                codes_q8 = gen->depth_batched.run_batched_unified_gpu(gen->model, items_q8);
             }
             std::vector<std::vector<int>> codes_q4;
             if (!items_q4.empty()) {
-                codes_q4 = gen->depth_batched_q4.run_batched(gen->model_q4, items_q4);
+                codes_q4 = gen->depth_batched_q4.run_batched_unified_gpu(gen->model_q4, items_q4);
             }
 
             // 3. Assemble 16-codebook frames into out_frames_burst
