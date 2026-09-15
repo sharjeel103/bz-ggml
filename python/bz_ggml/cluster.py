@@ -91,6 +91,7 @@ class DualInstanceCluster:
         on_progress: Optional[Callable[[ClusterResult], None]] = None,
         quantum_frames: int = 2,
         max_slots_per_gpu: Optional[int] = None,
+        vocoder_chunk_size: int = 16,
         max_active_words_per_gpu: int = 25000
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
@@ -127,7 +128,7 @@ class DualInstanceCluster:
                                 "first_audio_time": None
                             }
                         user_audio_results[u_id]["samples"].extend(samples)
-                        if is_first and user_audio_results[u_id]["first_audio_time"] is None:
+                        if user_audio_results[u_id]["first_audio_time"] is None:
                             user_audio_results[u_id]["first_audio_time"] = time.time()
 
                 if is_eos:
@@ -188,10 +189,10 @@ class DualInstanceCluster:
             voc_queue: queue.Queue,
             gpu_id: int,
             max_slots: Optional[int] = None,
-            max_active_words: int = 25000
+            max_active_words: int = 25000,
+            chunk_size: int = 16
         ):
             active_sessions = {}
-            chunk_size = 4  # 4 frames = 320ms audio chunks for smooth streaming
             last_hb_time = time.time()
             current_active_words = 0
             pending_item = None
@@ -310,15 +311,10 @@ class DualInstanceCluster:
                     s["chunk_buffer"].extend(frame16)
                     s["cb0"] = next_cb0
 
-                    # Immediate Frame 1 dispatch for ultra-low TTFA (< 800ms)
-                    if s["total_frames"] == 1:
-                        voc_queue.put((
-                            task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                            list(s["chunk_buffer"]), True, False, s["total_frames"],
-                            f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
-                        ))
-                        s["chunk_buffer"] = []
-                    elif len(s["chunk_buffer"]) >= (chunk_size * 16):
+                    # Adaptive Coalesced Audio Pipelining:
+                    # - If chunk_size > 0: Pipelined Streaming Mode (dispatch every chunk_size frames)
+                    # - If chunk_size <= 0: Utterance Coalescing Mode (hold in buffer until EOS)
+                    if chunk_size > 0 and len(s["chunk_buffer"]) >= (chunk_size * 16):
                         voc_queue.put((
                             task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
                             list(s["chunk_buffer"]), False, False, s["total_frames"],
@@ -357,11 +353,11 @@ class DualInstanceCluster:
 
         worker_a = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance A", self.gen_a, voc_a_queue, 0, max_slots_per_gpu, max_active_words_per_gpu)
+            args=("Instance A", self.gen_a, voc_a_queue, 0, max_slots_per_gpu, max_active_words_per_gpu, vocoder_chunk_size)
         )
         worker_b = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance B", self.gen_b, voc_b_queue, 1, max_slots_per_gpu, max_active_words_per_gpu)
+            args=("Instance B", self.gen_b, voc_b_queue, 1, max_slots_per_gpu, max_active_words_per_gpu, vocoder_chunk_size)
         )
         worker_a.start()
         worker_b.start()
