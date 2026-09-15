@@ -1,3 +1,4 @@
+import math
 import os
 import queue
 import threading
@@ -16,7 +17,7 @@ class UserTask:
     instruction: str = "Speak clearly and naturally."
     cfg_scale: float = 1.0
     seed: int = 42
-    max_steps: int = 750
+    max_steps: int = 1000
     ref_text: Optional[str] = None
     ref_codes: Optional[List[int]] = None
     ref_frames: int = 0
@@ -90,7 +91,7 @@ class DualInstanceCluster:
         on_progress: Optional[Callable[[ClusterResult], None]] = None,
         quantum_frames: int = 2,
         max_slots_per_gpu: Optional[int] = None,
-        max_active_words_per_gpu: int = 15000
+        max_active_words_per_gpu: int = 25000
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
 
@@ -187,7 +188,7 @@ class DualInstanceCluster:
             voc_queue: queue.Queue,
             gpu_id: int,
             max_slots: Optional[int] = None,
-            max_active_words: int = 15000
+            max_active_words: int = 25000
         ):
             active_sessions = {}
             chunk_size = 4  # 4 frames = 320ms audio chunks for smooth streaming
@@ -217,9 +218,15 @@ class DualInstanceCluster:
                     ins_words = len(task_item.instruction.split()) if getattr(task_item, "instruction", None) else 0
                     cfg_scale = getattr(task_item, "cfg_scale", 1.0)
                     multiplier = 2 if cfg_scale > 1.0 else 1
-                    task_tokens = multiplier * (text_words + ref_tokens + ins_words)
 
-                    # Check token / word capacity budget (strictly accounts for text + reference audio + instruction):
+                    # Exact empirical sweet-spot calculation matching C++:
+                    input_pred_tokens = int(math.ceil(text_words * 1.35)) + ref_tokens + int(math.ceil(ins_words * 1.35)) + 10
+                    output_cap_frames = min(1000, int(math.ceil(text_words * 2.2)) + 60)
+                    if hasattr(task_item, "max_steps") and task_item.max_steps > 0:
+                        output_cap_frames = min(output_cap_frames, task_item.max_steps)
+                    task_tokens = multiplier * (input_pred_tokens + output_cap_frames)
+
+                    # Check token capacity budget (25,000 active tokens limit per GPU):
                     if (current_active_words + task_tokens > max_active_words) and len(active_sessions) > 0:
                         # Hold task locally without re-queuing into job_queue
                         pending_item = (task_item, arr_time)
@@ -239,7 +246,7 @@ class DualInstanceCluster:
                     model_tag = "Q4" if use_q4 else "Q8"
 
                     try:
-                        cb0 = active_gen.session_create_ext(
+                        cb0, allocated_tokens = active_gen.session_create_ext(
                             session_id=sid,
                             text=task_item.text,
                             instruction=task_item.instruction,
@@ -248,6 +255,7 @@ class DualInstanceCluster:
                             ref_frames=task_item.ref_frames,
                             cfg_scale=cfg_scale,
                             seed=task_item.seed + sid,
+                            max_new_tokens=output_cap_frames,
                             use_q4=use_q4
                         )
                     except Exception as e:
@@ -255,7 +263,7 @@ class DualInstanceCluster:
                         job_queue.task_done()
                         continue
 
-                    current_active_words += task_tokens
+                    current_active_words += allocated_tokens
                     active_sessions[sid] = {
                         "task": task_item,
                         "gen": active_gen,
@@ -263,11 +271,11 @@ class DualInstanceCluster:
                         "arr_time": arr_time,
                         "t_exec_start": t_exec_start,
                         "words": text_words,
-                        "tokens": task_tokens,
+                        "tokens": allocated_tokens,
                         "cb0": cb0,
                         "total_frames": 0,
                         "chunk_buffer": [],
-                        "max_steps": getattr(task_item, "max_steps", 750)
+                        "max_steps": getattr(task_item, "max_steps", 1000)
                     }
 
                 if not active_sessions:

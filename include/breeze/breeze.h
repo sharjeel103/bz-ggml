@@ -89,7 +89,8 @@ BREEZE_API int breeze_generator_session_create(breeze_generator * gen, int sessi
 BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int session_id, 
                                                    const char * text, const char * instruction,
                                                    const char * ref_text, const int * ref_codes, int ref_frames,
-                                                   float cfg_scale, unsigned int seed, int * out_cb0);
+                                                   float cfg_scale, unsigned int seed, int max_new_tokens,
+                                                   int * out_cb0, int * out_allocated_tokens);
 
 
 // Step 1 frame for a specific active session. Returns next cb0 (or -1 if EOS reached)

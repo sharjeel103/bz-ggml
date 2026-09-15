@@ -69,7 +69,8 @@ class BreezeLib:
         self.lib.breeze_generator_session_create_ext.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
             ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
-            ctypes.c_float, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)
+            ctypes.c_float, ctypes.c_uint32, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
         ]
         self.lib.breeze_generator_session_create_ext.restype = ctypes.c_int
 
@@ -152,20 +153,21 @@ class GeneratorHandle:
 
     def session_create(
         self, session_id: int, text: str, instruction: str = "Speak clearly and naturally.", 
-        cfg_scale: float = 1.0, seed: int = 42, use_q4: bool = False
-    ) -> int:
+        cfg_scale: float = 1.0, seed: int = 42, max_new_tokens: int = 0, use_q4: bool = False
+    ) -> Tuple[int, int]:
         return self.session_create_ext(
             session_id=session_id, text=text, instruction=instruction,
             ref_text=None, ref_codes=None, ref_frames=0,
-            cfg_scale=cfg_scale, seed=seed, use_q4=use_q4
+            cfg_scale=cfg_scale, seed=seed, max_new_tokens=max_new_tokens, use_q4=use_q4
         )
 
     def session_create_ext(
         self, session_id: int, text: str, instruction: str = "Speak clearly and naturally.", 
         ref_text: Optional[str] = None, ref_codes: Optional[List[int]] = None, ref_frames: int = 0,
-        cfg_scale: float = 1.0, seed: int = 42, use_q4: bool = False
-    ) -> int:
+        cfg_scale: float = 1.0, seed: int = 42, max_new_tokens: int = 0, use_q4: bool = False
+    ) -> Tuple[int, int]:
         cb0_buf = ctypes.c_int()
+        alloc_buf = ctypes.c_int()
         c_ref_text = ref_text.encode("utf-8") if (ref_text and len(ref_text) > 0) else None
         c_ins = instruction.encode("utf-8") if (instruction and len(instruction) > 0) else None
         if ref_codes and ref_frames > 0:
@@ -175,13 +177,14 @@ class GeneratorHandle:
         res = self.lib.lib.breeze_generator_session_create_ext(
             self.handle, session_id, text.encode("utf-8"), c_ins,
             c_ref_text, c_ref_codes, ref_frames,
-            ctypes.c_float(cfg_scale), ctypes.c_uint32(seed), ctypes.byref(cb0_buf)
+            ctypes.c_float(cfg_scale), ctypes.c_uint32(seed), ctypes.c_int(max_new_tokens),
+            ctypes.byref(cb0_buf), ctypes.byref(alloc_buf)
         )
         if res != 0:
             raise RuntimeError(f"Session create ext failed on Generator (device {self.device}, session {session_id})")
         if use_q4:
             self.session_set_q4(session_id, True)
-        return cb0_buf.value
+        return cb0_buf.value, alloc_buf.value
 
     def session_step(self, session_id: int, seed: int) -> Tuple[int, List[int]]:
         frame_buf = (ctypes.c_int * 16)()

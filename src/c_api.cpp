@@ -303,7 +303,8 @@ int breeze_generator_step_frame(breeze_generator * gen, int cb0,
 BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int session_id, 
                                                    const char * text, const char * instruction,
                                                    const char * ref_text, const int * ref_codes, int ref_frames,
-                                                   float cfg_scale, unsigned int seed, int * out_cb0) {
+                                                   float cfg_scale, unsigned int seed, int max_new_tokens,
+                                                   int * out_cb0, int * out_allocated_tokens) {
     if (!gen || !text || !out_cb0) return -1;
     try {
         // Free existing slot if session_id is being reused
@@ -327,7 +328,18 @@ BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int s
             sess->suppress.push_back(t);
         }
         sess->hist.clear();
-        sess->max_tokens = gen->model.cfg.max_new_tokens > 0 ? gen->model.cfg.max_new_tokens : 2048;
+
+        // 1. Dynamic sweet-spot estimation if not explicitly provided
+        int est_out_frames = max_new_tokens;
+        if (est_out_frames <= 0) {
+            int words = 0;
+            bool in_w = false;
+            for (const char * p = text; *p; ++p) {
+                if (std::isspace((unsigned char)*p)) in_w = false;
+                else if (!in_w) { in_w = true; words++; }
+            }
+            est_out_frames = std::min(1000, (int)std::ceil(words * 2.2f) + 60);
+        }
 
         const std::string spk = "[S0]";
         std::string ins = instruction ? instruction : "Speak clearly and naturally.";
@@ -351,7 +363,7 @@ BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int s
             total += 1;
         };
         
-        // 1. Conditional prefill
+        // 2. Conditional prefill
         int total_c = 0;
         std::vector<float> emb_c;
         if (has_ref) {
@@ -361,13 +373,22 @@ BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int s
         std::string tail_c = spk + "<ins_bos>" + ins + "<ins_eos>" + text;
         add_text_seg(tail_c, emb_c, total_c);
 
-        sess->st_c.init(gen->model, total_c + sess->max_tokens + 8);
+        // Clamp to strictly guarantee total sequence <= 2040 (2048 backbone context limit)
+        int max_available = 2040 - total_c;
+        if (est_out_frames > max_available) {
+            est_out_frames = std::max(64, max_available);
+        }
+        sess->max_tokens = est_out_frames;
+
+        const int alloc_c = total_c + sess->max_tokens + 8;
+        sess->st_c.init(gen->model, alloc_c);
         sess->st_c_init = true;
         breeze::StepOut o_c = breeze::backbone_run(gen->model, sess->st_c, emb_c, total_c);
         sess->last_hidden = o_c.hidden;
 
-        // 2. Unconditional prefill (if CFG > 1.0)
+        // 3. Unconditional prefill (if CFG > 1.0)
         breeze::StepOut o_u;
+        int alloc_u = 0;
         if (sess->use_cfg) {
             int total_u = 0;
             std::vector<float> emb_u;
@@ -378,13 +399,19 @@ BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int s
             std::string tail_u = spk + text;
             add_text_seg(tail_u, emb_u, total_u);
 
-            sess->st_u.init(gen->model, total_u + sess->max_tokens + 8);
+            alloc_u = total_u + sess->max_tokens + 8;
+            sess->st_u.init(gen->model, alloc_u);
             sess->st_u_init = true;
             o_u = breeze::backbone_run(gen->model, sess->st_u, emb_u, total_u);
             sess->last_hidden_u = o_u.hidden;
         }
 
-        // 3. Sample initial cb0
+        // Return exact allocated token capacity to caller if requested
+        if (out_allocated_tokens) {
+            *out_allocated_tokens = sess->use_cfg ? (alloc_c + alloc_u) : alloc_c;
+        }
+
+        // 4. Sample initial cb0
         std::vector<float> comb = combine_logits(o_c.logits, o_u.logits, sess->use_cfg, sess->cfg_scale);
         int cb0 = breeze::sample_token(comb, sess->bp, sess->rng, &sess->hist, &sess->suppress);
         sess->hist.push_back(cb0);
@@ -404,7 +431,7 @@ BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int s
 int breeze_generator_session_create(breeze_generator * gen, int session_id, 
                                     const char * text, const char * instruction, 
                                     float cfg_scale, unsigned int seed, int * out_cb0) {
-    return breeze_generator_session_create_ext(gen, session_id, text, instruction, nullptr, nullptr, 0, cfg_scale, seed, out_cb0);
+    return breeze_generator_session_create_ext(gen, session_id, text, instruction, nullptr, nullptr, 0, cfg_scale, seed, 0, out_cb0, nullptr);
 }
 
 int breeze_generator_session_step(breeze_generator * gen, int session_id, 
