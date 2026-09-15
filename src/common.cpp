@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 namespace breeze {
 

@@ -40,32 +40,26 @@ class ClusterResult:
 
 def estimate_speech_profile(text: str, instruction: Optional[str] = None, ref_frames: int = 0) -> Dict[str, int]:
     """
-    Computes precise speech-physics bounds, cadence, and token requirements
-    calibrated against 1,000+ empirical GGUF BPE and audio generation samples.
+    Computes speech bounds, cadence, and token requirements purely based on word count.
     """
-    words = len(text.split())
-    chars = len(text)
-    
-    # Acoustic pause modeling via punctuation
-    p_comma = sum(1 for c in text if c in ",;:-")
-    p_period = sum(1 for c in text if c in ".?!")
-    
-    # Input prefix BPE token expansion
-    t_text = max(int(math.ceil(words * 1.30)) + p_comma + p_period, int(math.ceil(chars / 4.0)))
+    words = max(1, len(text.split()))
     ins_words = len(instruction.split()) if instruction else 0
-    t_ins = int(math.ceil(ins_words * 1.30)) + 5 if ins_words > 0 else 0
-    prefix_tokens = t_text + t_ins + ref_frames + 10
 
-    # Output audio frame bounds (12.5 fps = 80ms/frame)
-    earliest_eos = int(math.floor(words * 1.35)) + 2 * p_comma + 4 * p_period + 10
-    expected_eos = int(math.ceil(words * 1.70)) + int(math.ceil(2.5 * p_comma)) + 5 * p_period + 15
-    conservative_max = int(math.ceil(words * 2.15)) + 3 * p_comma + 6 * p_period + 25
+    # Input prefix BPE tokens: ~1.35 tokens per word + ref frames + overhead
+    prefix_tokens = int(math.ceil(words * 1.35)) + int(math.ceil(ins_words * 1.35)) + ref_frames + 10
+
+    # Output audio frame bounds (12.5 fps = 80ms/frame):
+    # - Earliest possible speech completion: ~1.10 frames per word
+    # - Expected speech duration: ~1.50 frames per word + 20
+    # - Safe maximum output frames: ~1.80 frames per word + 30
+    earliest_eos = max(10, int(math.floor(words * 1.10)))
+    expected_eos = int(math.ceil(words * 1.50)) + 20
+    conservative_max = int(math.ceil(words * 1.80)) + 30
 
     total_needed = prefix_tokens + conservative_max
 
     return {
         "words": words,
-        "chars": chars,
         "prefix_tokens": prefix_tokens,
         "earliest_eos": earliest_eos,
         "expected_eos": expected_eos,
