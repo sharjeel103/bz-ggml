@@ -122,6 +122,15 @@ BREEZE_API int breeze_generator_sessions_step_batched(breeze_generator * gen,
                                                       const unsigned int * seeds,
                                                       int * out_frames_16, int * out_next_cb0);
 
+// Step K burst rounds across an array of active sessions in continuous C++ execution (zero host sync)
+// Layout of out_frames_burst: [burst_steps, num_sessions, 16]
+// Layout of out_next_cb0: [num_sessions]
+BREEZE_API int breeze_generator_sessions_step_burst(breeze_generator * gen,
+                                                    const int * session_ids, int num_sessions,
+                                                    int burst_steps,
+                                                    const unsigned int * seeds,
+                                                    int * out_frames_burst, int * out_next_cb0);
+
 #ifdef __cplusplus
 
 }

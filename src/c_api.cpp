@@ -748,6 +748,193 @@ int breeze_generator_sessions_step_batched(breeze_generator * gen,
     }
 }
 
+BREEZE_API int breeze_generator_sessions_step_burst(breeze_generator * gen, 
+                                                    const int * session_ids, int num_sessions, 
+                                                    int burst_steps,
+                                                    const unsigned int * seeds,
+                                                    int * out_frames_burst, int * out_next_cb0) {
+    if (!gen || !session_ids || num_sessions <= 0 || burst_steps <= 0 || !out_frames_burst || !out_next_cb0) return 0;
+    try {
+        std::memset(out_frames_burst, 0, (size_t) burst_steps * num_sessions * 16 * sizeof(int));
+        for (int i = 0; i < num_sessions; i++) {
+            out_next_cb0[i] = -1;
+        }
+
+        int total_steps_executed = 0;
+
+        for (int step = 0; step < burst_steps; step++) {
+            // Check if any sessions remain active in this burst
+            bool any_active = false;
+            for (int i = 0; i < num_sessions; i++) {
+                int sid = session_ids[i];
+                auto it = gen->sessions.find(sid);
+                if (it != gen->sessions.end() && it->second && it->second->active) {
+                    any_active = true;
+                    break;
+                }
+            }
+            if (!any_active) {
+                break;
+            }
+
+            // 1. Separate active sessions into Q8 and Q4 groups
+            std::vector<breeze::DepthRunner::BatchItem> items_q8;
+            std::vector<breeze::DepthRunner::BatchItem> items_q4;
+            std::vector<int> map_q8_to_i;
+            std::vector<int> map_q4_to_i;
+
+            for (int i = 0; i < num_sessions; i++) {
+                int sid = session_ids[i];
+                auto it = gen->sessions.find(sid);
+                if (it == gen->sessions.end() || !it->second || !it->second->active) {
+                    continue;
+                }
+                BreezeSession * sess = it->second.get();
+
+                breeze::DepthRunner::BatchItem item;
+                item.session_id = sid;
+                item.cb0 = sess->last_cb0;
+                item.cfg_scale = sess->cfg_scale;
+                item.use_cfg = sess->use_cfg;
+                item.hidden_c = sess->last_hidden;
+                if (sess->use_cfg) item.hidden_u = sess->last_hidden_u;
+                item.rng = &sess->rng;
+                if (seeds) {
+                    sess->rng.seed(seeds[i] + step);
+                }
+                item.sp = nullptr;
+
+                if (sess->use_q4 && gen->has_q4_dd) {
+                    items_q4.push_back(std::move(item));
+                    map_q4_to_i.push_back(i);
+                } else {
+                    items_q8.push_back(std::move(item));
+                    map_q8_to_i.push_back(i);
+                }
+            }
+
+            if (items_q8.empty() && items_q4.empty()) break;
+
+            // 2. Run Batched Depth Decoder
+            std::vector<std::vector<int>> codes_q8;
+            if (!items_q8.empty()) {
+                codes_q8 = gen->depth_batched.run_batched(gen->model, items_q8);
+            }
+            std::vector<std::vector<int>> codes_q4;
+            if (!items_q4.empty()) {
+                codes_q4 = gen->depth_batched_q4.run_batched(gen->model_q4, items_q4);
+            }
+
+            // 3. Assemble 16-codebook frames into out_frames_burst
+            const int num_active_sessions = (int) (items_q8.size() + items_q4.size());
+            std::vector<int> all_frames(num_active_sessions * 16);
+
+            struct ActiveSessionMeta {
+                int out_idx;
+                int sid;
+                BreezeSession * sess;
+            };
+            std::vector<ActiveSessionMeta> active_metas;
+            active_metas.reserve(num_active_sessions);
+
+            auto collect_frame = [&](int i, int sid, const std::vector<int> & codes) {
+                BreezeSession * sess = gen->sessions[sid].get();
+                int * frame_ptr = out_frames_burst + ((size_t) step * num_sessions + i) * 16;
+                frame_ptr[0] = sess->last_cb0;
+                for (size_t k = 0; k < codes.size() && k < 15; k++) {
+                    frame_ptr[k + 1] = codes[k];
+                }
+                int ord = (int) active_metas.size();
+                std::memcpy(all_frames.data() + ord * 16, frame_ptr, 16 * sizeof(int));
+                active_metas.push_back({ i, sid, sess });
+            };
+
+            for (size_t k = 0; k < items_q8.size(); k++) {
+                collect_frame(map_q8_to_i[k], items_q8[k].session_id, codes_q8[k]);
+            }
+            for (size_t k = 0; k < items_q4.size(); k++) {
+                collect_frame(map_q4_to_i[k], items_q4[k].session_id, codes_q4[k]);
+            }
+
+            // 4. Batched Audio Embedding
+            std::vector<float> all_ae = breeze::audio_embed_forward(gen->model, all_frames, num_active_sessions);
+            const int hidden_size = gen->model.cfg.hidden_size;
+
+            struct SessionBackboneMapping {
+                int out_idx;
+                int sid;
+                int bb_idx_c;
+                int bb_idx_u;
+            };
+            std::vector<SessionBackboneMapping> bb_map;
+            bb_map.reserve(num_active_sessions);
+            std::vector<breeze::BackboneBatchItem> bb_items;
+            bb_items.reserve(num_active_sessions * 2);
+
+            for (int m = 0; m < num_active_sessions; m++) {
+                const auto & meta = active_metas[m];
+                const float * ae_ptr = all_ae.data() + (size_t) m * hidden_size;
+                std::vector<float> ae(ae_ptr, ae_ptr + hidden_size);
+
+                SessionBackboneMapping mapping;
+                mapping.out_idx = meta.out_idx;
+                mapping.sid = meta.sid;
+
+                mapping.bb_idx_c = (int) bb_items.size();
+                bb_items.push_back({ &meta.sess->st_c, ae });
+
+                if (meta.sess->use_cfg) {
+                    mapping.bb_idx_u = (int) bb_items.size();
+                    bb_items.push_back({ &meta.sess->st_u, ae });
+                } else {
+                    mapping.bb_idx_u = -1;
+                }
+                bb_map.push_back(mapping);
+            }
+
+            // 5. Batched Backbone GEMM
+            std::vector<breeze::StepOut> bb_outs = breeze::backbone_run_batched(gen->model, bb_items);
+
+            // 6. Sample token and apply safety clamp
+            for (const auto & m : bb_map) {
+                BreezeSession * sess = gen->sessions[m.sid].get();
+                const breeze::StepOut & o_c = bb_outs[m.bb_idx_c];
+                breeze::StepOut o_u;
+                if (sess->use_cfg && m.bb_idx_u >= 0) {
+                    o_u = bb_outs[m.bb_idx_u];
+                }
+
+                std::vector<float> comb = combine_logits(o_c.logits, o_u.logits, sess->use_cfg, sess->cfg_scale);
+                int next_cb0 = breeze::sample_token(comb, sess->bp, sess->rng, &sess->hist, &sess->suppress);
+                sess->steps_taken++;
+
+                if (next_cb0 == gen->model.cfg.backbone_eos_token_id || sess->steps_taken >= sess->max_tokens) {
+                    sess->active = false;
+                    // Safety clamping guard: prevent negative indexing and buffer overrun
+                    sess->last_cb0 = gen->model.cfg.codebook_eos_token_id;
+                    sess->st_c.pos = std::min(sess->st_c.pos, sess->max_tokens - 1);
+                    if (sess->use_cfg) sess->st_u.pos = std::min(sess->st_u.pos, sess->max_tokens - 1);
+                    out_next_cb0[m.out_idx] = -1;
+                } else {
+                    sess->hist.push_back(next_cb0);
+                    sess->last_cb0 = next_cb0;
+                    sess->last_hidden = o_c.hidden;
+                    if (sess->use_cfg) sess->last_hidden_u = o_u.hidden;
+                    out_next_cb0[m.out_idx] = next_cb0;
+                }
+            }
+
+            total_steps_executed++;
+        }
+
+        return total_steps_executed;
+
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
 
 breeze_vocoder * breeze_vocoder_init(const char * gguf_path, int cuda_device) {
     breeze_vocoder * voc = new breeze_vocoder();

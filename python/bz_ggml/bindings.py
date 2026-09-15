@@ -104,6 +104,13 @@ class BreezeLib:
         ]
         self.lib.breeze_generator_sessions_step_batched.restype = ctypes.c_int
 
+        self.lib.breeze_generator_sessions_step_burst.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
+        ]
+        self.lib.breeze_generator_sessions_step_burst.restype = ctypes.c_int
+
         # Vocoder API
 
         self.lib.breeze_vocoder_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
@@ -237,6 +244,35 @@ class GeneratorHandle:
         next_cb0s = list(c_next_cb0)
         frames = [list(c_frames[i*16:(i+1)*16]) for i in range(n)]
         return next_cb0s, frames
+
+    def sessions_step_burst(
+        self, session_ids: List[int], burst_steps: int, seeds: Optional[List[int]] = None
+    ) -> Tuple[List[int], List[List[List[int]]]]:
+        n = len(session_ids)
+        if n == 0 or burst_steps <= 0:
+            return [], []
+        c_sids = (ctypes.c_int * n)(*session_ids)
+        total_output_ints = burst_steps * n * 16
+        c_frames = (ctypes.c_int * total_output_ints)()
+        c_next_cb0 = (ctypes.c_int * n)()
+        if seeds is not None and len(seeds) == n:
+            c_seeds = (ctypes.c_uint32 * n)(*seeds)
+        else:
+            c_seeds = None
+        
+        self.lib.lib.breeze_generator_sessions_step_burst(
+            self.handle, c_sids, n, burst_steps, c_seeds, c_frames, c_next_cb0
+        )
+        next_cb0s = list(c_next_cb0)
+        # Reshape: for each session i in range(n): list of burst_steps frames (each 16 ints)
+        session_frames = []
+        for i in range(n):
+            s_frames = []
+            for step in range(burst_steps):
+                offset = (step * n + i) * 16
+                s_frames.append(list(c_frames[offset : offset + 16]))
+            session_frames.append(s_frames)
+        return next_cb0s, session_frames
 
     def close(self):
 
