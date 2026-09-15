@@ -755,7 +755,7 @@ BREEZE_API int breeze_generator_sessions_step_burst(breeze_generator * gen,
                                                     int * out_frames_burst, int * out_next_cb0) {
     if (!gen || !session_ids || num_sessions <= 0 || burst_steps <= 0 || !out_frames_burst || !out_next_cb0) return 0;
     try {
-        std::memset(out_frames_burst, 0, (size_t) burst_steps * num_sessions * 16 * sizeof(int));
+        std::fill_n(out_frames_burst, (size_t) burst_steps * num_sessions * 16, -1);
         for (int i = 0; i < num_sessions; i++) {
             out_next_cb0[i] = -1;
         }
@@ -911,7 +911,7 @@ BREEZE_API int breeze_generator_sessions_step_burst(breeze_generator * gen,
                 if (next_cb0 == gen->model.cfg.backbone_eos_token_id || sess->steps_taken >= sess->max_tokens) {
                     sess->active = false;
                     // Safety clamping guard: prevent negative indexing and buffer overrun
-                    sess->last_cb0 = gen->model.cfg.codebook_eos_token_id;
+                    sess->last_cb0 = -1;
                     sess->st_c.pos = std::min(sess->st_c.pos, sess->max_tokens - 1);
                     if (sess->use_cfg) sess->st_u.pos = std::min(sess->st_u.pos, sess->max_tokens - 1);
                     out_next_cb0[m.out_idx] = -1;
