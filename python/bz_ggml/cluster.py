@@ -79,7 +79,7 @@ class TieredSlotPool:
       Tier 2: Standard (up to 1,000 tokens / 1-min audio, 93.75 MB/slot - 50% pool)
       Tier 3: Long (up to 1,800 tokens / 2-min audio, 168.75 MB/slot)
     """
-    def __init__(self, short_slots: int = 20, standard_slots: int = 40, long_slots: int = 20):
+    def __init__(self, short_slots: int = 32, standard_slots: int = 48, long_slots: int = 16):
         self.tiers = {
             "short": {"capacity": 600, "total": short_slots, "free": list(range(1, short_slots + 1))},
             "standard": {"capacity": 1000, "total": standard_slots, "free": list(range(short_slots + 1, short_slots + standard_slots + 1))},
@@ -120,6 +120,9 @@ class TieredSlotPool:
             total_slots = sum(t["total"] for t in self.tiers.values())
             free_slots = sum(len(t["free"]) for t in self.tiers.values())
             return total_slots - free_slots
+
+    def total_slots(self) -> int:
+        return sum(t["total"] for t in self.tiers.values())
 
 
 def select_burst_steps(active_sessions: dict, max_burst: int = 16) -> int:
@@ -210,10 +213,10 @@ class DualInstanceCluster:
         arrival_delays: Optional[List[float]] = None,
         on_progress: Optional[Callable[[ClusterResult], None]] = None,
         quantum_frames: int = 2,
-        max_slots_per_gpu: Optional[int] = None,
+        max_slots_per_gpu: Optional[int] = 64,
         vocoder_chunk_size: int = 16,
         return_tokens: bool = False,
-        max_active_words_per_gpu: int = 80000
+        max_active_tokens_per_gpu: int = 30000
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
 
@@ -319,20 +322,21 @@ class DualInstanceCluster:
             gen_default: GeneratorHandle,
             voc_queue: queue.Queue,
             gpu_id: int,
-            max_slots: Optional[int] = None,
-            max_active_words: int = 25000,
+            max_slots: Optional[int] = 64,
+            max_active_tokens: int = 30000,
             chunk_size: int = 16,
             return_tokens_mode: bool = False
         ):
             active_sessions = {}
+            current_active_tokens = 0
             last_hb_time = time.time()
             pending_item = None
 
-            # Initialize 80-Slot Tiered Memory Pool for this GPU Island
-            slot_pool = TieredSlotPool(short_slots=20, standard_slots=40, long_slots=20)
+            # Initialize 96-Slot Tiered Memory Pool for this GPU Island (Supporting up to 64 active slots)
+            slot_pool = TieredSlotPool(short_slots=32, standard_slots=48, long_slots=16)
 
             while not workers_stopping:
-                # A. Admit waiting tasks governed by TieredSlotPool and max_slots
+                # A. Admit waiting tasks governed by TieredSlotPool, max_slots, and max_active_tokens budget
                 while not workers_stopping:
                     if max_slots is not None and len(active_sessions) >= max_slots:
                         break
@@ -354,7 +358,14 @@ class DualInstanceCluster:
                         getattr(task_item, "ref_frames", 0)
                     )
 
-                    slot_res = slot_pool.acquire(profile["total_needed"])
+                    needed_tokens = profile["total_needed"]
+
+                    # Active Token Budget Guard: prevent aggregate VRAM from exceeding max_active_tokens
+                    if (current_active_tokens + needed_tokens > max_active_tokens) and len(active_sessions) > 0:
+                        pending_item = (task_item, arr_time)
+                        break
+
+                    slot_res = slot_pool.acquire(needed_tokens)
                     if slot_res is None:
                         # Pool full in all matching tiers; hold task locally
                         pending_item = (task_item, arr_time)
@@ -397,6 +408,8 @@ class DualInstanceCluster:
                         slot_pool.release(slot_id)
                         pending_item = (task_item, arr_time)
                         break
+
+                    current_active_tokens += allocated_tokens
 
                     active_sessions[sid] = {
                         "task": task_item,
@@ -544,6 +557,7 @@ class DualInstanceCluster:
                         })
 
                     # Free session slot immediately in local VRAM and return slot to pool
+                    current_active_tokens -= s["tokens"]
                     slot_pool.release(s["slot_id"])
                     gen_default.session_free(sid)
                     del active_sessions[sid]
@@ -555,15 +569,15 @@ class DualInstanceCluster:
                     frames_list = [s["total_frames"] for s in active_sessions.values()]
                     min_f = min(frames_list) if frames_list else 0
                     max_f = max(frames_list) if frames_list else 0
-                    print(f"  [Heartbeat GPU {gpu_id}] Active: {len(active_sessions):2d} streams (Pool: {slot_pool.active_count()}/80 slots) | Frames: min {min_f:3d} / max {max_f:3d} | Audio: {sum(frames_list)*0.08:.1f}s", flush=True)
+                    print(f"  [Heartbeat GPU {gpu_id}] Active: {len(active_sessions):2d} streams (Pool: {slot_pool.active_count()}/{slot_pool.total_slots()} slots | Tokens: {current_active_tokens}/{max_active_tokens}) | Frames: min {min_f:3d} / max {max_f:3d} | Audio: {sum(frames_list)*0.08:.1f}s", flush=True)
 
         worker_a = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance A", self.gen_a, voc_a_queue, 0, max_slots_per_gpu, max_active_words_per_gpu, vocoder_chunk_size, return_tokens)
+            args=("Instance A", self.gen_a, voc_a_queue, 0, max_slots_per_gpu, max_active_tokens_per_gpu, vocoder_chunk_size, return_tokens)
         )
         worker_b = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance B", self.gen_b, voc_b_queue, 1, max_slots_per_gpu, max_active_words_per_gpu, vocoder_chunk_size, return_tokens)
+            args=("Instance B", self.gen_b, voc_b_queue, 1, max_slots_per_gpu, max_active_tokens_per_gpu, vocoder_chunk_size, return_tokens)
         )
         worker_a.start()
         worker_b.start()
