@@ -347,7 +347,7 @@ BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int s
                 if (std::isspace((unsigned char)*p)) in_w = false;
                 else if (!in_w) { in_w = true; words++; }
             }
-            est_out_frames = std::min(1000, (int)std::ceil(words * 2.2f) + 60);
+            est_out_frames = std::min(1000, (int)std::ceil(words * 1.5f) + 30);
         }
 
         const std::string spk = "[S0]";

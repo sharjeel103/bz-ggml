@@ -94,7 +94,7 @@ class DualInstanceCluster:
         max_slots_per_gpu: Optional[int] = None,
         vocoder_chunk_size: int = 16,
         return_tokens: bool = False,
-        max_active_words_per_gpu: int = 25000
+        max_active_words_per_gpu: int = 80000
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
 
@@ -225,12 +225,12 @@ class DualInstanceCluster:
 
                     # Exact empirical sweet-spot calculation matching C++:
                     input_pred_tokens = int(math.ceil(text_words * 1.35)) + ref_tokens + int(math.ceil(ins_words * 1.35)) + 10
-                    output_cap_frames = min(1000, int(math.ceil(text_words * 2.2)) + 60)
+                    output_cap_frames = min(1000, int(math.ceil(text_words * 1.5)) + 30)
                     if hasattr(task_item, "max_steps") and task_item.max_steps > 0:
                         output_cap_frames = min(output_cap_frames, task_item.max_steps)
                     task_tokens = multiplier * (input_pred_tokens + output_cap_frames)
 
-                    # Check token capacity budget (25,000 active tokens limit per GPU):
+                    # Check token capacity budget (80,000 active tokens limit per GPU):
                     if (current_active_words + task_tokens > max_active_words) and len(active_sessions) > 0:
                         # Hold task locally without re-queuing into job_queue
                         pending_item = (task_item, arr_time)
