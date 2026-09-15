@@ -38,13 +38,14 @@ class ClusterResult:
     tokens: Optional[List[int]] = None
 
 
-def estimate_speech_profile(text: str, instruction: Optional[str] = None, ref_frames: int = 0) -> Dict[str, int]:
+def estimate_speech_profile(text: str, instruction: Optional[str] = None, ref_frames: int = 0, cfg_scale: float = 1.0) -> Dict[str, int]:
     """
     Computes exact speech bounds, cadence, and token requirements based on speech acoustics:
       - Acoustic frame rate: 12.5 fps (each frame is 80ms of audio).
       - Fast speaking rate (200 WPM): ~3.75 frames per word.
       - Conversational average (140 WPM): ~5.35 frames per word.
       - Deliberate speaking rate (110 WPM + pauses): ~6.80 frames per word.
+      - CFG multiplier: when cfg_scale > 1.0, backbone allocates both conditional and unconditional branches.
     """
     words = max(1, len(text.split()))
     ins_words = len(instruction.split()) if instruction else 0
@@ -60,7 +61,8 @@ def estimate_speech_profile(text: str, instruction: Optional[str] = None, ref_fr
     expected_eos = int(math.ceil(words * 5.35)) + 12
     conservative_max = int(math.ceil(words * 6.80)) + 25
 
-    total_needed = prefix_tokens + conservative_max
+    multiplier = 2 if cfg_scale > 1.0 else 1
+    total_needed = (prefix_tokens + conservative_max) * multiplier
 
     return {
         "words": words,
@@ -79,7 +81,7 @@ class TieredSlotPool:
       Tier 2: Standard (up to 1,000 tokens / 1-min audio, 93.75 MB/slot - 50% pool)
       Tier 3: Long (up to 1,800 tokens / 2-min audio, 168.75 MB/slot)
     """
-    def __init__(self, short_slots: int = 32, standard_slots: int = 48, long_slots: int = 16):
+    def __init__(self, short_slots: int = 16, standard_slots: int = 24, long_slots: int = 56):
         self.tiers = {
             "short": {"capacity": 600, "total": short_slots, "free": list(range(1, short_slots + 1))},
             "standard": {"capacity": 1000, "total": standard_slots, "free": list(range(short_slots + 1, short_slots + standard_slots + 1))},
@@ -333,7 +335,7 @@ class DualInstanceCluster:
             pending_item = None
 
             # Initialize 96-Slot Tiered Memory Pool for this GPU Island (Supporting up to 64 active slots)
-            slot_pool = TieredSlotPool(short_slots=32, standard_slots=48, long_slots=16)
+            slot_pool = TieredSlotPool(short_slots=16, standard_slots=24, long_slots=56)
 
             while not workers_stopping:
                 # A. Admit waiting tasks governed by TieredSlotPool, max_slots, and max_active_tokens budget
@@ -352,10 +354,12 @@ class DualInstanceCluster:
                         if task_item is None:
                             break
 
+                    cfg_scale = getattr(task_item, "cfg_scale", 1.0)
                     profile = estimate_speech_profile(
                         task_item.text,
                         getattr(task_item, "instruction", None),
-                        getattr(task_item, "ref_frames", 0)
+                        getattr(task_item, "ref_frames", 0),
+                        cfg_scale=cfg_scale
                     )
 
                     needed_tokens = profile["total_needed"]
@@ -365,14 +369,15 @@ class DualInstanceCluster:
                         pending_item = (task_item, arr_time)
                         break
 
-                    slot_res = slot_pool.acquire(needed_tokens)
+                    # Slot pool capacity check uses single-branch sequence capacity
+                    single_branch_tokens = profile["prefix_tokens"] + profile["conservative_max"]
+                    slot_res = slot_pool.acquire(single_branch_tokens)
                     if slot_res is None:
                         # Pool full in all matching tiers; hold task locally
                         pending_item = (task_item, arr_time)
                         break
 
                     slot_id, slot_tier, slot_capacity = slot_res
-                    cfg_scale = getattr(task_item, "cfg_scale", 1.0)
                     output_cap_frames = min(slot_capacity - profile["prefix_tokens"], profile["conservative_max"])
                     if hasattr(task_item, "max_steps") and task_item.max_steps > 0:
                         output_cap_frames = min(output_cap_frames, task_item.max_steps)
