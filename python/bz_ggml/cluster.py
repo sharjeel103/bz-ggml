@@ -275,6 +275,7 @@ class DualInstanceCluster:
 
         # 1. Independent Vocoder Worker Loops on GPU 0 and GPU 1 (Dynamic Stream-Aware Batched)
         def vocoder_loop(v_queue: queue.Queue, voc_handle: VocoderHandle, voc_tag: str):
+            nonlocal workers_stopping
             while not workers_stopping:
                 try:
                     task = v_queue.get(timeout=0.05)
