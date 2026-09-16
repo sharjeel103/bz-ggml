@@ -21,6 +21,7 @@ class UserTask:
     ref_text: Optional[str] = None
     ref_codes: Optional[List[int]] = None
     ref_frames: int = 0
+    client_has_vocoder: bool = False  # Per-request flag: True -> stream tokens (3.2kbps), False -> server-side vocoder (24kHz audio)
 
 
 @dataclass
@@ -168,6 +169,26 @@ class DualInstanceCluster:
       Optional Surge Tiering: Dynamically routes burst overflow sessions to Q4 when threshold exceeded.
     """
 
+    @staticmethod
+    def calculate_token_budget(
+        base_max_tokens: int = 50000,
+        enable_q4_burst: bool = False,
+        vocoder_mode: str = "dynamic"
+    ) -> int:
+        """
+        Calculates exact active token capacity based on component VRAM footprint:
+          - Baseline (Tokens-Only, No Q4): 50,000 active tokens (14.20 GiB safe ceiling).
+          - Modular INT4 Depth Piece (310 MiB): -1,400 tokens (4.367 tokens/MiB).
+          - Server Vocoder Decoder + Scratchpad (820 MiB): -3,600 tokens (when 'on' or 'dynamic').
+          - Combined Full Hybrid Suite: -5,000 tokens -> 45,000 active tokens per GPU.
+        """
+        budget = base_max_tokens
+        if enable_q4_burst:
+            budget -= 1400
+        if vocoder_mode in ("on", "dynamic"):
+            budget -= 3600
+        return budget
+
     def __init__(
         self,
         model_path: str,
@@ -175,24 +196,36 @@ class DualInstanceCluster:
         q4_model_path: Optional[str] = None,
         enable_q4_burst: bool = False,
         q4_threshold: int = 10,
-        enable_vocoder: bool = False
+        enable_vocoder: Optional[bool] = None,
+        vocoder_mode: str = "dynamic",
+        base_max_tokens: int = 50000
     ):
         self.model_path = model_path
         self.q4_model_path = q4_model_path
         self.enable_q4_burst = enable_q4_burst
         self.q4_threshold = q4_threshold
-        self.enable_vocoder = enable_vocoder
+        if enable_vocoder is not None:
+            self.vocoder_mode = "on" if enable_vocoder else "off"
+        else:
+            self.vocoder_mode = vocoder_mode.lower()
+        self.enable_vocoder = self.vocoder_mode in ("on", "dynamic")
+        self.base_max_tokens = base_max_tokens
+        self.active_token_budget = self.calculate_token_budget(
+            base_max_tokens=self.base_max_tokens,
+            enable_q4_burst=self.enable_q4_burst,
+            vocoder_mode=self.vocoder_mode
+        )
         self.lib = BreezeLib(lib_path)
 
         # Autonomous Island 0 (GPU 0)
-        print("[Cluster] Initializing Autonomous Island 0 on CUDA0...")
+        print(f"[Cluster] Initializing Autonomous Island 0 on CUDA0 (Vocoder Mode: {self.vocoder_mode})...")
         t0 = time.time()
         self.gen_a = GeneratorHandle(self.lib, model_path, cuda_device=0)
         self.voc_a = VocoderHandle(self.lib, model_path, cuda_device=0) if self.enable_vocoder else None
         print(f"   -> Island 0 Generator Online on CUDA0 in {time.time()-t0:.2f}s")
 
         # Autonomous Island 1 (GPU 1)
-        print("[Cluster] Initializing Autonomous Island 1 on CUDA1...")
+        print(f"[Cluster] Initializing Autonomous Island 1 on CUDA1 (Vocoder Mode: {self.vocoder_mode})...")
         t0 = time.time()
         self.gen_b = GeneratorHandle(self.lib, model_path, cuda_device=1)
         self.voc_b = VocoderHandle(self.lib, model_path, cuda_device=1) if self.enable_vocoder else None
@@ -208,19 +241,27 @@ class DualInstanceCluster:
             self.has_q4_dd = True
             print(f"   -> Modular INT4 Depth Decoder Online in {time.time()-t0:.2f}s (Saved 2.24 GB VRAM per GPU!)")
 
+        print(f"[Cluster Config] Active Token Ceiling: {self.active_token_budget} tokens/GPU (Base: {self.base_max_tokens} | Q4: {self.enable_q4_burst} | Vocoder: {self.vocoder_mode})")
+
     def run_workload(
         self,
         tasks: List[UserTask],
         out_dir: str = "audio_out",
         arrival_delays: Optional[List[float]] = None,
         on_progress: Optional[Callable[[ClusterResult], None]] = None,
-        quantum_frames: int = 2,
+        quantum_frames: int = 16,
         max_slots_per_gpu: Optional[int] = 64,
-        vocoder_chunk_size: int = 16,
+        vocoder_chunk_size: int = 32,
         return_tokens: bool = False,
-        max_active_tokens_per_gpu: int = 50000
+        max_active_tokens_per_gpu: Optional[int] = None
     ) -> List[ClusterResult]:
         os.makedirs(out_dir, exist_ok=True)
+
+        effective_max_tokens = (
+            max_active_tokens_per_gpu
+            if max_active_tokens_per_gpu is not None
+            else self.active_token_budget
+        )
 
         job_queue = queue.Queue()
         voc_a_queue = queue.Queue()
@@ -301,9 +342,12 @@ class DualInstanceCluster:
 
                 v_queue.task_done()
 
+        # Smart Hybrid Vocoder: Only spin up vocoder threads if at least one request requires server-side synthesis
+        needs_server_vocoder = (not return_tokens) and any(not getattr(t, "client_has_vocoder", False) for t in tasks)
+
         voc_a_thread = None
         voc_b_thread = None
-        if not return_tokens:
+        if needs_server_vocoder:
             if self.voc_a is None:
                 self.voc_a = VocoderHandle(self.lib, self.model_path, cuda_device=0)
             if self.voc_b is None:
@@ -326,7 +370,7 @@ class DualInstanceCluster:
             gpu_id: int,
             max_slots: Optional[int] = 64,
             max_active_tokens: int = 50000,
-            chunk_size: int = 16,
+            chunk_size: int = 32,
             return_tokens_mode: bool = False
         ):
             active_sessions = {}
@@ -415,6 +459,7 @@ class DualInstanceCluster:
                         break
 
                     current_active_tokens += allocated_tokens
+                    client_has_voc = return_tokens_mode or getattr(task_item, "client_has_vocoder", False)
 
                     active_sessions[sid] = {
                         "task": task_item,
@@ -434,7 +479,8 @@ class DualInstanceCluster:
                         "chunk_buffer": [],
                         "all_tokens": [],
                         "first_step_time": None,
-                        "max_steps": output_cap_frames
+                        "max_steps": output_cap_frames,
+                        "client_has_vocoder": client_has_voc
                     }
 
                 if not active_sessions:
@@ -485,15 +531,16 @@ class DualInstanceCluster:
                         s["all_tokens"].extend(frame16)
                         valid_frames_count += 1
 
-                        if not return_tokens_mode:
+                        if not s["client_has_vocoder"]:
                             s["chunk_buffer"].extend(frame16)
-                            if chunk_size > 0 and len(s["chunk_buffer"]) >= (chunk_size * 16):
+                            while chunk_size > 0 and len(s["chunk_buffer"]) >= (chunk_size * 16):
+                                dispatch_tokens = s["chunk_buffer"][:chunk_size * 16]
+                                s["chunk_buffer"] = s["chunk_buffer"][chunk_size * 16:]
                                 voc_queue.put((
                                     task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                                    list(s["chunk_buffer"]), False, False, s["total_frames"],
+                                    dispatch_tokens, False, False, s["total_frames"],
                                     f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
                                 ))
-                                s["chunk_buffer"] = []
 
                         if s["total_frames"] >= s["max_steps"]:
                             stream_hit_eos = True
@@ -518,7 +565,7 @@ class DualInstanceCluster:
                     task_item = s["task"]
                     t_end = time.time()
 
-                    if return_tokens_mode:
+                    if s["client_has_vocoder"]:
                         audio_s = s["total_frames"] * 0.08
                         wall_s = t_end - s["t_exec_start"]
                         turnaround_s = t_end - s["arr_time"]
@@ -535,7 +582,7 @@ class DualInstanceCluster:
                             turnaround_s=round(turnaround_s, 2),
                             ttfa_s=round(ttfa, 3),
                             rtf=round(rtf, 3),
-                            worker=f"GPU {gpu_id} ({worker_name} [{s['model_tag']}]) [Token Mode]",
+                            worker=f"GPU {gpu_id} ({worker_name} [{s['model_tag']}]) [Client Token Mode]",
                             wav_path="",
                             tokens=list(s["all_tokens"])
                         )
@@ -544,10 +591,12 @@ class DualInstanceCluster:
                             if on_progress:
                                 on_progress(res)
                     else:
-                        # End of stream flush to vocoder
+                        # Terminal partial flush: dispatch remaining frames in chunk_buffer
+                        leftover_tokens = list(s["chunk_buffer"])
+                        s["chunk_buffer"] = []
                         voc_queue.put((
                             task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                            list(s["chunk_buffer"]), False, True, s["total_frames"],
+                            leftover_tokens, False, True, s["total_frames"],
                             f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
                         ))
 
@@ -578,11 +627,11 @@ class DualInstanceCluster:
 
         worker_a = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance A", self.gen_a, voc_a_queue, 0, max_slots_per_gpu, max_active_tokens_per_gpu, vocoder_chunk_size, return_tokens)
+            args=("Instance A", self.gen_a, voc_a_queue, 0, max_slots_per_gpu, effective_max_tokens, vocoder_chunk_size, return_tokens)
         )
         worker_b = threading.Thread(
             target=generator_multi_session_loop,
-            args=("Instance B", self.gen_b, voc_b_queue, 1, max_slots_per_gpu, max_active_tokens_per_gpu, vocoder_chunk_size, return_tokens)
+            args=("Instance B", self.gen_b, voc_b_queue, 1, max_slots_per_gpu, effective_max_tokens, vocoder_chunk_size, return_tokens)
         )
         worker_a.start()
         worker_b.start()
@@ -598,7 +647,7 @@ class DualInstanceCluster:
         all_dispatched.set()
 
         job_queue.join()
-        if not return_tokens:
+        if needs_server_vocoder:
             voc_a_queue.join()
             voc_b_queue.join()
 
@@ -606,7 +655,7 @@ class DualInstanceCluster:
         workers_stopping = True
         worker_a.join()
         worker_b.join()
-        if not return_tokens:
+        if needs_server_vocoder:
             voc_a_queue.put(None)
             voc_b_queue.put(None)
             if voc_a_thread:
@@ -627,6 +676,9 @@ class DualInstanceCluster:
         sync_reduction_pct = (total_syncs_avoided / total_steps_executed * 100.0) if total_steps_executed > 0 else 0.0
         est_host_time_saved_s = total_syncs_avoided * 0.00045 # ~0.45ms per avoided host sync
 
+        total_audio_reqs = sum(1 for r in completed_results if r.wav_path)
+        total_token_reqs = sum(1 for r in completed_results if not r.wav_path)
+
         print("\n================================================================================")
         print("                  BURST ENGINE TELEMETRY & PREDICTION METRICS                   ")
         print("================================================================================")
@@ -636,6 +688,11 @@ class DualInstanceCluster:
             pct = (cnt / total_bursts * 100.0) if total_bursts > 0 else 0.0
             print(f"  - Burst K = {k_val:2d}:                    {cnt:5d} calls ({pct:5.1f}%)")
         print(f"Average Burst Quantum (K_avg):   {avg_burst:.2f} steps / call")
+        print("--------------------------------------------------------------------------------")
+        print("Smart Hybrid Vocoder & Request Routing:")
+        print(f"  - Server-Side Vocoder Synthesized: {total_audio_reqs:4d} requests (24 kHz Audio, Chunk = {vocoder_chunk_size} frames)")
+        print(f"  - Client Hydrated Bypass (Tokens): {total_token_reqs:4d} requests (3.2 kbps tokens streamed)")
+        print(f"  - Vocoder Chunk Threshold:         {vocoder_chunk_size} frames ({vocoder_chunk_size * 0.08:.2f}s audio = {vocoder_chunk_size * 16} tokens)")
         print("--------------------------------------------------------------------------------")
         print("Pristine Audio & Garbage Frame Accounting:")
         print(f"  - Total Valid Speech Frames:   {total_valid} frames ({total_valid * 0.08:.2f}s genuine audio)")
@@ -654,6 +711,9 @@ class DualInstanceCluster:
             "total_bursts": total_bursts,
             "total_steps_executed": total_steps_executed,
             "avg_burst": round(avg_burst, 2),
+            "total_audio_reqs": total_audio_reqs,
+            "total_token_reqs": total_token_reqs,
+            "vocoder_chunk_size": vocoder_chunk_size,
             "total_valid_frames": total_valid,
             "total_valid_audio_s": round(total_valid * 0.08, 2),
             "total_trimmed_frames": total_trimmed,
