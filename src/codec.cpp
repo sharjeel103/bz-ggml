@@ -21,6 +21,41 @@ std::vector<float> MimiCodec::decode(const std::vector<int> & codes, int T, int 
     return tensor_to_f32(audio);
 }
 
+std::vector<std::vector<float>> MimiCodec::decode_batch(
+    const std::vector<std::vector<int>> & batch_codes,
+    const std::vector<int> & batch_T,
+    int n_cb)
+{
+    if (n_cb <= 0) n_cb = m->cfg.num_codebooks;
+    int B = (int)batch_codes.size();
+    if (B <= 0) return {};
+    if (B == 1) {
+        return { decode(batch_codes[0], batch_T[0], n_cb) };
+    }
+
+    size_t graph_size = std::max((size_t)65536, (size_t)B * 2048);
+    Graph g(graph_size);
+
+    std::vector<ggml_tensor *> audio_nodes(B);
+    for (int b = 0; b < B; b++) {
+        ggml_tensor * x = vocoder_decode(g.ctx, *m, g, batch_codes[b], n_cb, batch_T[b]);
+        ggml_tensor * audio = ggml_cont(g.ctx, ggml_reshape_1d(g.ctx, x, x->ne[0]));
+        ggml_set_output(audio);
+        audio_nodes[b] = audio;
+        if (b < B - 1) {
+            g.write(audio);
+        }
+    }
+
+    g.compute(m->backend, audio_nodes.back());
+
+    std::vector<std::vector<float>> results(B);
+    for (int b = 0; b < B; b++) {
+        results[b] = tensor_to_f32(audio_nodes[b]);
+    }
+    return results;
+}
+
 static int nearest(const std::vector<float> & book, const float * v, int dim, int n) {
     int best = 0;
     float best_d = FLT_MAX;

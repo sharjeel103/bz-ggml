@@ -100,7 +100,10 @@ ggml_tensor * Graph::input_f32(const std::vector<float> & data, int ne0, int ne1
 
 void Graph::compute(Backend & be, ggml_tensor * out) {
     ggml_set_output(out);
-    for (ggml_tensor * r : extra_roots) ggml_build_forward_expand(gf, r);
+    for (ggml_tensor * r : extra_roots) {
+        ggml_set_output(r);
+        ggml_build_forward_expand(gf, r);
+    }
     ggml_build_forward_expand(gf, out);
     if (!ggml_gallocr_alloc_graph(be.alloc, gf)) {
         fprintf(stderr, "[BZ ERROR] ggml_gallocr_alloc_graph failed! Scratchpad memory exhausted.\n");

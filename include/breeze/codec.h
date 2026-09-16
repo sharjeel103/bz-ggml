@@ -14,6 +14,11 @@ struct MimiCodec {
     // codes frame-major [f * n_cb + cb]; n_cb 0 means the full set. fewer codebooks drops detail,
     // 1 leaves only the semantic stage
     std::vector<float> decode(const std::vector<int> & codes, int n_frames, int n_cb = 0);
+    // Batched vocoder decoding: computes B streams in a single unified graph
+    std::vector<std::vector<float>> decode_batch(
+        const std::vector<std::vector<int>> & batch_codes,
+        const std::vector<int> & batch_T,
+        int n_cb = 0);
     // audio waveform in, returns codes frame-major, sets n_frames
     std::vector<int> encode(const std::vector<float> & audio, int & n_frames);
 };

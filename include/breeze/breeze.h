@@ -79,6 +79,13 @@ BREEZE_API void breeze_vocoder_free(breeze_vocoder * voc);
 BREEZE_API int breeze_vocoder_stream_decode(breeze_vocoder * voc, const int * frames, 
                                             int n_frames, float * out_pcm);
 
+// Batched stream decode: decodes B streams in a single unified GPU graph execution
+BREEZE_API int breeze_vocoder_stream_decode_batch(breeze_vocoder * voc, int batch_size,
+                                                 const int * flat_tokens, const int * token_offsets,
+                                                 const int * n_frames_per_stream,
+                                                 float * flat_pcm, const int * pcm_offsets,
+                                                 int * out_n_samples);
+
 // --- Multi-Session Continuous Batching / Dynamic Interleaved Scheduling C API ---
 // Create and prefill an independent session slot inside the generator's local GPU memory
 BREEZE_API int breeze_generator_session_create(breeze_generator * gen, int session_id, 

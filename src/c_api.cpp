@@ -976,4 +976,43 @@ int breeze_vocoder_stream_decode(breeze_vocoder * voc, const int * frames,
     }
 }
 
+int breeze_vocoder_stream_decode_batch(breeze_vocoder * voc, int batch_size,
+                                      const int * flat_tokens, const int * token_offsets,
+                                      const int * n_frames_per_stream,
+                                      float * flat_pcm, const int * pcm_offsets,
+                                      int * out_n_samples) {
+    if (!voc || batch_size <= 0 || !flat_tokens || !n_frames_per_stream || !flat_pcm) return 0;
+    try {
+        const int nc = voc->model.cfg.num_codebooks;
+        std::vector<std::vector<int>> batch_codes(batch_size);
+        std::vector<int> batch_T(batch_size);
+
+        int running_tok = 0;
+        for (int b = 0; b < batch_size; b++) {
+            int nf = n_frames_per_stream[b];
+            int offset = token_offsets ? token_offsets[b] : running_tok;
+            batch_codes[b].assign(flat_tokens + offset, flat_tokens + offset + nf * nc);
+            batch_T[b] = nf;
+            running_tok += nf * nc;
+        }
+
+        std::vector<std::vector<float>> audios = voc->codec.decode_batch(batch_codes, batch_T);
+
+        int running_pcm = 0;
+        for (int b = 0; b < batch_size; b++) {
+            int p_off = pcm_offsets ? pcm_offsets[b] : running_pcm;
+            int n_samp = (int) audios[b].size();
+            std::memcpy(flat_pcm + p_off, audios[b].data(), n_samp * sizeof(float));
+            if (out_n_samples) {
+                out_n_samples[b] = n_samp;
+            }
+            running_pcm += n_samp;
+        }
+        return batch_size;
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return 0;
+    }
+}
+
 } // extern "C"

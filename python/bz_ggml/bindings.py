@@ -125,6 +125,15 @@ class BreezeLib:
         ]
         self.lib.breeze_vocoder_stream_decode.restype = ctypes.c_int
 
+        self.lib.breeze_vocoder_stream_decode_batch.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int)
+        ]
+        self.lib.breeze_vocoder_stream_decode_batch.restype = ctypes.c_int
+
 
 class GeneratorHandle:
     def __init__(self, lib: BreezeLib, model_path: str, cuda_device: int = 0):
@@ -299,6 +308,46 @@ class VocoderHandle:
             self.handle, c_frames, n_frames, pcm_buf
         )
         return list(pcm_buf)[:n_samples]
+
+    def stream_decode_batch(self, batch_tokens: List[List[int]], batch_n_frames: List[int]) -> List[List[float]]:
+        B = len(batch_tokens)
+        if B == 0:
+            return []
+        if B == 1:
+            return [self.stream_decode(batch_tokens[0], batch_n_frames[0])]
+
+        flat_tokens = []
+        tok_offsets = []
+        pcm_offsets = []
+        total_samples = 0
+
+        for b in range(B):
+            tok_offsets.append(len(flat_tokens))
+            flat_tokens.extend(batch_tokens[b])
+            pcm_offsets.append(total_samples)
+            total_samples += batch_n_frames[b] * 1920
+
+        c_flat_tokens = (ctypes.c_int * len(flat_tokens))(*flat_tokens)
+        c_tok_offsets = (ctypes.c_int * B)(*tok_offsets)
+        c_n_frames = (ctypes.c_int * B)(*batch_n_frames)
+        c_flat_pcm = (ctypes.c_float * total_samples)()
+        c_pcm_offsets = (ctypes.c_int * B)(*pcm_offsets)
+        c_out_samples = (ctypes.c_int * B)()
+
+        ok = self.lib.lib.breeze_vocoder_stream_decode_batch(
+            self.handle, B, c_flat_tokens, c_tok_offsets, c_n_frames,
+            c_flat_pcm, c_pcm_offsets, c_out_samples
+        )
+        if ok <= 0:
+            raise RuntimeError(f"breeze_vocoder_stream_decode_batch failed for batch of {B} streams")
+
+        results = []
+        pcm_arr = list(c_flat_pcm)
+        for b in range(B):
+            start = pcm_offsets[b]
+            cnt = c_out_samples[b]
+            results.append(pcm_arr[start:start + cnt])
+        return results
 
     def close(self):
         if self.handle:
