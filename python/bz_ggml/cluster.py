@@ -282,8 +282,10 @@ class DualInstanceCluster:
                 except queue.Empty:
                     continue
                 if task is None:
+                    v_queue.task_done()
                     break
 
+                dequeued_count = 1
                 # Coalesce: gather task and any pending queued tasks into a unified batch
                 batch_items = list(task) if isinstance(task, list) else [task]
                 while True:
@@ -291,7 +293,9 @@ class DualInstanceCluster:
                         extra = v_queue.get_nowait()
                         if extra is None:
                             workers_stopping = True
+                            v_queue.task_done()
                             break
+                        dequeued_count += 1
                         if isinstance(extra, list):
                             batch_items.extend(extra)
                         else:
@@ -299,73 +303,75 @@ class DualInstanceCluster:
                     except queue.Empty:
                         break
 
-                # Separate items with audio tokens to compute on GPU
-                compute_items = [it for it in batch_items if len(it[4]) > 0]
-                if compute_items:
-                    batch_tokens = [it[4] for it in compute_items]
-                    batch_n_frames = [len(it[4]) // 16 for it in compute_items]
+                try:
+                    # Separate items with audio tokens to compute on GPU
+                    compute_items = [it for it in batch_items if len(it[4]) > 0]
+                    if compute_items:
+                        batch_tokens = [it[4] for it in compute_items]
+                        batch_n_frames = [len(it[4]) // 16 for it in compute_items]
 
-                    # SINGLE UNIFIED GPU DISPATCH FOR ALL READY STREAMS IN THE BATCH
-                    batch_samples = voc_handle.stream_decode_batch(batch_tokens, batch_n_frames)
+                        # SINGLE UNIFIED GPU DISPATCH FOR ALL READY STREAMS IN THE BATCH
+                        batch_samples = voc_handle.stream_decode_batch(batch_tokens, batch_n_frames)
 
-                    for it, samples in zip(compute_items, batch_samples):
-                        u_id = it[0]
-                        with user_audio_lock:
-                            if u_id not in user_audio_results:
-                                user_audio_results[u_id] = {
-                                    "samples": [],
-                                    "first_audio_time": None
-                                }
-                            user_audio_results[u_id]["samples"].extend(samples)
-                            if user_audio_results[u_id]["first_audio_time"] is None:
-                                user_audio_results[u_id]["first_audio_time"] = time.time()
+                        for it, samples in zip(compute_items, batch_samples):
+                            u_id = it[0]
+                            with user_audio_lock:
+                                if u_id not in user_audio_results:
+                                    user_audio_results[u_id] = {
+                                        "samples": [],
+                                        "first_audio_time": None
+                                    }
+                                user_audio_results[u_id]["samples"].extend(samples)
+                                if user_audio_results[u_id]["first_audio_time"] is None:
+                                    user_audio_results[u_id]["first_audio_time"] = time.time()
 
-                # Process EOS completions
-                for it in batch_items:
-                    u_id, words, arr_time, t_start, frames_list, is_first, is_eos, total_frames, worker_tag = it
-                    if is_eos:
-                        t_end = time.time()
-                        with user_audio_lock:
-                            u_rec = user_audio_results.get(u_id, {})
-                            pcm_samples = u_rec.get("samples", [])
-                            fa_time = u_rec.get("first_audio_time", t_end)
+                    # Process EOS completions
+                    for it in batch_items:
+                        u_id, words, arr_time, t_start, frames_list, is_first, is_eos, total_frames, worker_tag = it
+                        if is_eos:
+                            t_end = time.time()
+                            with user_audio_lock:
+                                u_rec = user_audio_results.get(u_id, {})
+                                pcm_samples = u_rec.get("samples", [])
+                                fa_time = u_rec.get("first_audio_time", t_end)
 
-                        audio_s = len(pcm_samples) / 24000.0
-                        wall_s = t_end - t_start
-                        turnaround_s = t_end - arr_time
-                        wait_s = t_start - arr_time
-                        ttfa = (fa_time - arr_time) if fa_time else turnaround_s
-                        rtf = wall_s / (audio_s if audio_s > 0 else 1.0)
+                            audio_s = len(pcm_samples) / 24000.0
+                            wall_s = t_end - t_start
+                            turnaround_s = t_end - arr_time
+                            wait_s = t_start - arr_time
+                            ttfa = (fa_time - arr_time) if fa_time else turnaround_s
+                            rtf = wall_s / (audio_s if audio_s > 0 else 1.0)
 
-                        # Save WAV
-                        out_wav = os.path.join(out_dir, f"dual_gen_user_{u_id:02d}.wav")
-                        with wave.open(out_wav, "wb") as w:
-                            w.setnchannels(1)
-                            w.setsampwidth(2)
-                            w.setframerate(24000)
-                            pcm_np = np.array(pcm_samples, dtype=np.float32)
-                            pcm_int16 = (np.clip(pcm_np, -1.0, 1.0) * 32767.0).astype(np.int16)
-                            w.writeframes(pcm_int16.tobytes())
+                            # Save WAV
+                            out_wav = os.path.join(out_dir, f"dual_gen_user_{u_id:02d}.wav")
+                            with wave.open(out_wav, "wb") as w:
+                                w.setnchannels(1)
+                                w.setsampwidth(2)
+                                w.setframerate(24000)
+                                pcm_np = np.array(pcm_samples, dtype=np.float32)
+                                pcm_int16 = (np.clip(pcm_np, -1.0, 1.0) * 32767.0).astype(np.int16)
+                                w.writeframes(pcm_int16.tobytes())
 
-                        res = ClusterResult(
-                            id=u_id,
-                            words=words,
-                            audio_s=round(audio_s, 2),
-                            queue_wait_s=round(wait_s, 2),
-                            compute_wall_s=round(wall_s, 2),
-                            turnaround_s=round(turnaround_s, 2),
-                            ttfa_s=round(ttfa, 3),
-                            rtf=round(rtf, 3),
-                            worker=f"{worker_tag} + {voc_tag} [Batched]",
-                            wav_path=out_wav
-                        )
+                            res = ClusterResult(
+                                id=u_id,
+                                words=words,
+                                audio_s=round(audio_s, 2),
+                                queue_wait_s=round(wait_s, 2),
+                                compute_wall_s=round(wall_s, 2),
+                                turnaround_s=round(turnaround_s, 2),
+                                ttfa_s=round(ttfa, 3),
+                                rtf=round(rtf, 3),
+                                worker=f"{worker_tag} + {voc_tag} [Batched]",
+                                wav_path=out_wav
+                            )
 
-                        with results_lock:
-                            completed_results.append(res)
-                            if on_progress:
-                                on_progress(res)
-
-                    v_queue.task_done()
+                            with results_lock:
+                                completed_results.append(res)
+                                if on_progress:
+                                    on_progress(res)
+                finally:
+                    for _ in range(dequeued_count):
+                        v_queue.task_done()
 
         # Smart Hybrid Vocoder: Only spin up vocoder threads if at least one request requires server-side synthesis
         needs_server_vocoder = (not return_tokens) and any(not getattr(t, "client_has_vocoder", False) for t in tasks)
