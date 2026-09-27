@@ -390,6 +390,16 @@ class VocoderHandle:
             raise RuntimeError(f"Failed to initialize Streaming Vocoder on CUDA device {cuda_device}")
 
     def stream_decode(self, frames_tokens: List[int], n_frames: int) -> List[float]:
+        max_chunk = 64
+        if n_frames > max_chunk:
+            all_samples = []
+            for start in range(0, n_frames, max_chunk):
+                end = min(n_frames, start + max_chunk)
+                sub_n = end - start
+                sub_toks = frames_tokens[start * 16 : end * 16]
+                all_samples.extend(self.stream_decode(sub_toks, sub_n))
+            return all_samples
+
         pcm_buf = (ctypes.c_float * (n_frames * 1920))()
         c_frames = (ctypes.c_int * len(frames_tokens))(*frames_tokens)
         n_samples = self.lib.lib.breeze_vocoder_stream_decode(
