@@ -229,14 +229,14 @@ std::vector<std::vector<int>> DepthRunner::run_batched(BreezeModel & m, const st
                     comb_logits[v] = lu[v] + it.cfg_scale * (lc[v] - lu[v]);
                 }
                 sampled = sample_token(comb_logits, sp, *it.rng);
-                cur_audio_codes[b_idx] = sampled + head_idx * vs;
-                cur_audio_codes[b_idx + 1] = sampled + head_idx * vs;
+                cur_audio_codes[b_idx] = sampled + j * vs;
+                cur_audio_codes[b_idx + 1] = sampled + j * vs;
                 b_idx += 2;
             } else {
                 const float * lc = out.data() + b_idx * vocab;
                 std::vector<float> logits(lc, lc + vocab);
                 sampled = sample_token(logits, sp, *it.rng);
-                cur_audio_codes[b_idx] = sampled + head_idx * vs;
+                cur_audio_codes[b_idx] = sampled + j * vs;
                 b_idx += 1;
             }
             results[i].push_back(sampled);

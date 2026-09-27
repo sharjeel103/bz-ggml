@@ -747,7 +747,7 @@ class DualInstanceCluster:
                     # Post-hoc check: scan returned burst frames and truncate trailing dummy frames
                     for frame16 in s_frames:
                         cb0 = frame16[0]
-                        if cb0 < 0 or cb0 == 4096:
+                        if cb0 < 0 or cb0 == 2051 or cb0 == 4096:
                             stream_hit_eos = True
                             break
 
