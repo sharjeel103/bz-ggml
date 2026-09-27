@@ -232,11 +232,11 @@ def build_app(default_model: str) -> gr.Blocks:
                 placeholder="Path to breeze-base.gguf",
                 scale=4
             )
-            precision_badge = gr.Markdown(
-                "**Active Precision:** `Pure FP16 Weights (FP32 Accumulators)`\n\n"
-                "**Modular Q4 Surge:** `Disabled (100% Fidelity)`",
-                scale=1
-            )
+            with gr.Column(scale=1):
+                precision_badge = gr.Markdown(
+                    "**Active Precision:** `Pure FP16 Weights (FP32 Accumulators)`\n\n"
+                    "**Modular Q4 Surge:** `Disabled (100% Fidelity)`"
+                )
 
         with gr.Tabs():
             # ---------------- TAB 1: TEXT-TO-SPEECH & VOICE DESIGN ----------------
