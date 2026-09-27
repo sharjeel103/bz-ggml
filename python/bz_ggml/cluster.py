@@ -22,6 +22,25 @@ class UserTask:
     ref_codes: Optional[List[int]] = None
     ref_frames: int = 0
     client_has_vocoder: bool = False  # Per-request flag: True -> stream tokens (3.2kbps), False -> server-side vocoder (24kHz audio)
+    stream_pcm: bool = True  # True -> 32-frame streaming chunks, False -> Full Single-Pass vocoder at EOS
+
+
+@dataclass
+class VoiceConversionTask:
+    id: int
+    src_codes: List[int]
+    src_frames: int
+    ref_text: Optional[str] = None
+    ref_codes: Optional[List[int]] = None
+    ref_frames: int = 0
+    ref_audio: Optional[List[float]] = None
+    src_text: Optional[str] = None
+    cfg_scale: float = 1.5
+    keep_acoustic: int = 0
+    feed_source: bool = True
+    seed: int = 42
+    client_has_vocoder: bool = False
+    stream_pcm: bool = False
 
 
 @dataclass
@@ -37,6 +56,83 @@ class ClusterResult:
     worker: str
     wav_path: str
     tokens: Optional[List[int]] = None
+
+
+def estimate_conversion_profile(
+    src_frames: int,
+    ref_frames: int = 0,
+    ref_text: Optional[str] = None,
+    src_text: Optional[str] = None,
+    cfg_scale: float = 1.5
+) -> Dict[str, Any]:
+    """
+    Computes exact deterministic token requirements for Voice Conversion:
+      - Acoustic frame rate: 12.5 fps (each frame is 80ms of audio).
+      - src_frames: exact number of frames in the source audio (T = src_T).
+      - ref_frames: exact number of frames in the reference prompt.
+      - text_tokens: BPE token count of prompt/filler text.
+      - st_c capacity: total_c + src_frames + 8.
+      - st_u capacity: total_u + src_frames + 8 (if cfg_scale > 1.0).
+    """
+    ref_text_words = len(ref_text.split()) if ref_text else 0
+    ref_text_tokens = int(math.ceil(ref_text_words * 1.30)) if ref_text else 0
+
+    if src_text:
+        src_text_words = len(src_text.split())
+        text_tokens = int(math.ceil(src_text_words * 1.30))
+    else:
+        # filler_text generates ~4.0 tokens per second of speech
+        secs = src_frames / 12.5
+        text_tokens = int(math.ceil(secs * 4.0)) + 4
+
+    # total_c = [S0] + ref_text + ref_codes (ref_frames + 1 eos) + [S0] + text
+    total_c = 1 + ref_text_tokens + (ref_frames + 1 if ref_frames > 0 else 0) + 1 + text_tokens
+    st_c_capacity = total_c + src_frames + 8
+
+    use_cfg = (cfg_scale > 1.0)
+    if use_cfg:
+        # total_u = [S0] + text (negative branch drops reference voice)
+        total_u = 1 + text_tokens
+        st_u_capacity = total_u + src_frames + 8
+        total_needed = st_c_capacity + st_u_capacity
+    else:
+        st_u_capacity = 0
+        total_needed = st_c_capacity
+
+    return {
+        "src_frames": src_frames,
+        "ref_frames": ref_frames,
+        "text_tokens": text_tokens,
+        "st_c_capacity": st_c_capacity,
+        "st_u_capacity": st_u_capacity,
+        "total_needed": total_needed,
+        "vram_estimate_mib": (total_needed * 229376) / (1024 * 1024)
+    }
+
+
+class ConversionWorkerPool:
+    """
+    Strict Concurrency Limiter for Mode 4 Voice Conversion.
+    Limits active concurrent conversion requests (default: 2 per GPU) to prevent
+    GPU SM starvation and cache eviction.
+    """
+    def __init__(self, max_concurrent: int = 2):
+        self.semaphore = threading.BoundedSemaphore(max_concurrent)
+        self.max_concurrent = max_concurrent
+        self.active_count = 0
+        self.lock = threading.Lock()
+
+    def acquire(self, blocking: bool = True, timeout: Optional[float] = None) -> bool:
+        acquired = self.semaphore.acquire(blocking=blocking, timeout=timeout)
+        if acquired:
+            with self.lock:
+                self.active_count += 1
+        return acquired
+
+    def release(self):
+        with self.lock:
+            self.active_count = max(0, self.active_count - 1)
+        self.semaphore.release()
 
 
 def estimate_speech_profile(text: str, instruction: Optional[str] = None, ref_frames: int = 0, cfg_scale: float = 1.0) -> Dict[str, int]:
@@ -241,11 +337,92 @@ class DualInstanceCluster:
             self.has_q4_dd = True
             print(f"   -> Modular INT4 Depth Decoder Online in {time.time()-t0:.2f}s (Saved 2.24 GB VRAM per GPU!)")
 
+        # Mode 4 Strict Concurrency Limiters (default max 2 concurrent per GPU island)
+        self.max_concurrent_conversions = 2
+        self.conv_pool_a = ConversionWorkerPool(max_concurrent=self.max_concurrent_conversions)
+        self.conv_pool_b = ConversionWorkerPool(max_concurrent=self.max_concurrent_conversions)
+
         print(f"[Cluster Config] Active Token Ceiling: {self.active_token_budget} tokens/GPU (Base: {self.base_max_tokens} | Q4: {self.enable_q4_burst} | Vocoder: {self.vocoder_mode})")
+
+    def convert_voice_task(
+        self,
+        task: VoiceConversionTask,
+        gpu_id: Optional[int] = None,
+        timeout: Optional[float] = None
+    ) -> Tuple[Optional[List[float]], Optional[List[int]], Dict[str, Any]]:
+        """
+        Executes a Mode 4 Voice Conversion task with:
+          1. Strict Concurrency Throttling: bounded to max 2 concurrent requests per GPU island.
+          2. Exact Dynamic Token Budgeting: reserves only the exact deterministic KV cache tokens.
+          3. Zero Model Weight Reloading: reuses gen_a / gen_b in VRAM via base_model wrapper.
+        """
+        # 1. Exact Dynamic Token Accounting
+        profile = estimate_conversion_profile(
+            src_frames=task.src_frames,
+            ref_frames=task.ref_frames,
+            ref_text=task.ref_text,
+            src_text=task.src_text,
+            cfg_scale=task.cfg_scale
+        )
+        needed_tokens = profile["total_needed"]
+
+        # 2. Select GPU Island (load balancing by active conversion count)
+        if gpu_id is None:
+            if self.conv_pool_a.active_count <= self.conv_pool_b.active_count:
+                target_gpu = 0
+            else:
+                target_gpu = 1
+        else:
+            target_gpu = gpu_id
+
+        pool = self.conv_pool_a if target_gpu == 0 else self.conv_pool_b
+        gen = self.gen_a if target_gpu == 0 else self.gen_b
+        worker_tag = f"CUDA{target_gpu}"
+
+        # 3. Acquire Concurrency Semaphore (Blocks if 2 concurrent jobs are already running on this GPU)
+        acquired = pool.acquire(blocking=True, timeout=timeout)
+        if not acquired:
+            raise TimeoutError(f"Conversion concurrency limit ({pool.max_concurrent}) exceeded on {worker_tag}")
+
+        t_start = time.time()
+        try:
+            # 4. Execute conversion on the selected GPU generator
+            audio, tokens = gen.convert_voice(
+                src_codes=task.src_codes,
+                src_T=task.src_frames,
+                ref_audio=task.ref_audio,
+                ref_codes=task.ref_codes,
+                ref_frames=task.ref_frames,
+                ref_text=task.ref_text,
+                src_text=task.src_text,
+                cfg_scale=task.cfg_scale,
+                keep_acoustic=task.keep_acoustic,
+                feed_source=task.feed_source,
+                seed=task.seed,
+                return_pcm=not task.client_has_vocoder
+            )
+            wall_s = time.time() - t_start
+            audio_s = task.src_frames * (1920.0 / 24000.0)
+            rtf = wall_s / max(0.01, audio_s)
+
+            stats = {
+                "id": task.id,
+                "worker": worker_tag,
+                "src_frames": task.src_frames,
+                "audio_s": audio_s,
+                "compute_wall_s": wall_s,
+                "rtf": rtf,
+                "tokens_reserved": needed_tokens,
+                "vram_estimate_mib": profile["vram_estimate_mib"]
+            }
+            return audio, tokens, stats
+        finally:
+            # 5. Release Concurrency Semaphore immediately upon completion
+            pool.release()
 
     def run_workload(
         self,
-        tasks: List[UserTask],
+        tasks: List[Any],
         out_dir: str = "audio_out",
         arrival_delays: Optional[List[float]] = None,
         on_progress: Optional[Callable[[ClusterResult], None]] = None,
@@ -262,6 +439,9 @@ class DualInstanceCluster:
             if max_active_tokens_per_gpu is not None
             else self.active_token_budget
         )
+
+        conversion_tasks = [t for t in tasks if isinstance(t, VoiceConversionTask)]
+        tts_tasks = [t for t in tasks if not isinstance(t, VoiceConversionTask)]
 
         job_queue = queue.Queue()
         voc_a_queue = queue.Queue()
@@ -373,8 +553,8 @@ class DualInstanceCluster:
                     for _ in range(dequeued_count):
                         v_queue.task_done()
 
-        # Smart Hybrid Vocoder: Only spin up vocoder threads if at least one request requires server-side synthesis
-        needs_server_vocoder = (not return_tokens) and any(not getattr(t, "client_has_vocoder", False) for t in tasks)
+        # Smart Hybrid Vocoder: Only spin up vocoder threads if at least one TTS request requires server-side synthesis
+        needs_server_vocoder = (not return_tokens) and any(not getattr(t, "client_has_vocoder", False) for t in tts_tasks)
 
         voc_a_thread = None
         voc_b_thread = None
@@ -511,7 +691,8 @@ class DualInstanceCluster:
                         "all_tokens": [],
                         "first_step_time": None,
                         "max_steps": output_cap_frames,
-                        "client_has_vocoder": client_has_voc
+                        "client_has_vocoder": client_has_voc,
+                        "stream_pcm": getattr(task_item, "stream_pcm", True)
                     }
 
                 if not active_sessions:
@@ -584,6 +765,8 @@ class DualInstanceCluster:
                 burst_ready_chunks = []
                 for cur_sid, cur_s in active_sessions.items():
                     if cur_s["client_has_vocoder"]:
+                        continue
+                    if not cur_s.get("stream_pcm", True):
                         continue
                     while chunk_size > 0 and len(cur_s["chunk_buffer"]) >= (chunk_size * 16):
                         dispatch_tokens = cur_s["chunk_buffer"][:chunk_size * 16]
@@ -681,7 +864,7 @@ class DualInstanceCluster:
 
         # 3. Workload Dispatcher
         t_dispatch0 = time.time()
-        for idx, task in enumerate(tasks):
+        for idx, task in enumerate(tts_tasks):
             delay = arrival_delays[idx] if arrival_delays and idx < len(arrival_delays) else 0.0
             if delay > 0:
                 time.sleep(delay)
@@ -689,7 +872,45 @@ class DualInstanceCluster:
 
         all_dispatched.set()
 
+        # 4. Asynchronous Voice Conversion Worker Dispatch
+        conv_threads = []
+        def run_conv_job(c_task: VoiceConversionTask):
+            t0 = time.time()
+            audio, tokens, stats = self.convert_voice_task(c_task)
+            wav_path = os.path.join(out_dir, f"conversion_user_{c_task.id:04d}_{stats['worker']}.wav")
+            if audio:
+                pcm_16 = (np.clip(np.array(audio), -1.0, 1.0) * 32767.0).astype(np.int16)
+                with wave.open(wav_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(24000)
+                    wf.writeframes(pcm_16.tobytes())
+            res = ClusterResult(
+                id=c_task.id,
+                words=int(math.ceil(stats["audio_s"] * (140.0 / 60.0))),
+                audio_s=stats["audio_s"],
+                queue_wait_s=0.0,
+                compute_wall_s=stats["compute_wall_s"],
+                turnaround_s=time.time() - t0,
+                ttfa_s=stats["compute_wall_s"],
+                rtf=stats["rtf"],
+                worker=stats["worker"],
+                wav_path=wav_path if audio else "",
+                tokens=tokens
+            )
+            with results_lock:
+                completed_results.append(res)
+            if on_progress:
+                on_progress(res)
+
+        for c_task in conversion_tasks:
+            th = threading.Thread(target=run_conv_job, args=(c_task,))
+            th.start()
+            conv_threads.append(th)
+
         job_queue.join()
+        for th in conv_threads:
+            th.join()
         if needs_server_vocoder:
             voc_a_queue.join()
             voc_b_queue.join()

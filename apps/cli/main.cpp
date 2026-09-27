@@ -26,6 +26,7 @@ static void usage() {
            "  --save-voice <name> encode --ref-audio and save it as a reusable voice, then exit\n"
            "  --list-voices       print the saved voices and exit\n"
            "  --voices-dir <path> where saved voices live (default voices)\n"
+           "  --q4-depth <model>  path to Q4 GGUF to override depth decoder\n"
            "  --cfg-scale <f>     classifier free guidance scale (default 1.0)\n"
            "  --seed <n>          random seed (default 42)\n"
            "  --temp <f>          sampling temperature, 0 keeps the model default\n"
@@ -47,6 +48,7 @@ int main(int argc, char ** argv) {
     req.instruction = "Speak clearly and naturally.";
     std::string ref_audio_path, output = "output.wav";
     std::string voice_name, save_voice_name, voices_dir = "voices";
+    std::string q4_depth_path;
     bool list_voices = false;
     bool use_gpu = true;
     bool show_timings = false;
@@ -61,6 +63,7 @@ int main(int argc, char ** argv) {
         else if (a == "--save-voice") save_voice_name = arg(argc, argv, i, "--save-voice");
         else if (a == "--list-voices") list_voices = true;
         else if (a == "--voices-dir") voices_dir = arg(argc, argv, i, "--voices-dir");
+        else if (a == "--q4-depth") q4_depth_path = arg(argc, argv, i, "--q4-depth");
         else if (a == "--cfg-scale") req.cfg_scale = (float) atof(arg(argc, argv, i, "--cfg-scale"));
         else if (a == "--seed") req.seed = atoi(arg(argc, argv, i, "--seed"));
         else if (a == "--temp") req.temperature = (float) atof(arg(argc, argv, i, "--temp"));
@@ -115,6 +118,16 @@ int main(int argc, char ** argv) {
     if (!model.load(model_path, use_gpu)) { fprintf(stderr, "failed to load model\n"); return 1; }
     printf("backend: %s, sample rate: %d\n", model.backend.name(), model.cfg.sample_rate);
 
+    GGUFModel q4_dd;
+    if (!q4_depth_path.empty()) {
+        printf("loading modular Q4 depth decoder from %s ...\n", q4_depth_path.c_str());
+        if (!q4_dd.load_prefix(q4_depth_path, model.backend, "dd.")) {
+            fprintf(stderr, "failed to load modular Q4 depth decoder piece\n");
+            return 1;
+        }
+        model.dd_override = &q4_dd;
+    }
+
     if (!ref_audio_path.empty()) {
         if (!read_wav(ref_audio_path, model.cfg.sample_rate, req.ref_audio)) {
             fprintf(stderr, "failed to read reference audio\n");
@@ -136,6 +149,7 @@ int main(int argc, char ** argv) {
         if (!save_voice(path, v)) { fprintf(stderr, "failed to write %s\n", path.c_str()); return 1; }
         printf("wrote %s (%d frames, %.2f s)\n", path.c_str(), v.frames,
                (double) v.frames * model.cfg.samples_per_frame / v.sample_rate);
+        if (!q4_depth_path.empty()) q4_dd.free();
         model.free();
         return 0;
     }
@@ -167,6 +181,7 @@ int main(int argc, char ** argv) {
 
     if (!write_wav(output, audio, model.cfg.sample_rate)) { fprintf(stderr, "failed to write %s\n", output.c_str()); return 1; }
     printf("wrote %s (%.2f s)\n", output.c_str(), (float) audio.size() / model.cfg.sample_rate);
+    if (!q4_depth_path.empty()) q4_dd.free();
     model.free();
     return 0;
 }

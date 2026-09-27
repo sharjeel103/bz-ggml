@@ -59,13 +59,15 @@ struct ConvertOptions {
     // already encoded reference, used instead of the ref_audio argument when set
     std::vector<int> ref_codes;
     int ref_frames = 0;
+    bool tokens_only = false;
 };
 
 // respeak already encoded audio in the reference voice. words and frame timing come from the source,
 // pitch and timbre from the reference, so intonation is not carried over.
 std::vector<float> convert_voice(BreezeModel & m, MimiCodec & codec, const std::vector<int> & src_codes,
                                  int src_T, const std::vector<float> & ref_audio,
-                                 const std::string & ref_text, const ConvertOptions & opt = {});
+                                 const std::string & ref_text, const ConvertOptions & opt = {},
+                                 std::vector<int> * out_codes = nullptr);
 
 // called with each decoded audio chunk; return false to stop generation early
 using AudioCallback = std::function<bool(const float * samples, int n)>;

@@ -111,6 +111,21 @@ class BreezeLib:
         ]
         self.lib.breeze_generator_sessions_step_burst.restype = ctypes.c_int
 
+        # Mode 4 Voice Conversion API
+        self.lib.breeze_generator_convert_voice.argtypes = [
+            ctypes.c_void_p,                                  # gen
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,       # src_codes, src_T
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,     # ref_audio, ref_audio_len
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,       # ref_codes, ref_frames
+            ctypes.c_char_p,                                  # ref_text
+            ctypes.c_char_p,                                  # src_text
+            ctypes.c_float, ctypes.c_int, ctypes.c_int,       # cfg_scale, keep_acoustic, feed_source
+            ctypes.c_uint32,                                  # seed
+            ctypes.POINTER(ctypes.c_int),                     # out_codes
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int      # out_pcm, max_out_pcm
+        ]
+        self.lib.breeze_generator_convert_voice.restype = ctypes.c_int
+
         # Vocoder API
 
         self.lib.breeze_vocoder_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
@@ -282,6 +297,79 @@ class GeneratorHandle:
                 s_frames.append(list(c_frames[offset : offset + 16]))
             session_frames.append(s_frames)
         return next_cb0s, session_frames
+
+    def convert_voice(
+        self,
+        src_codes: List[int],
+        src_T: int,
+        ref_audio: Optional[List[float]] = None,
+        ref_codes: Optional[List[int]] = None,
+        ref_frames: int = 0,
+        ref_text: Optional[str] = None,
+        src_text: Optional[str] = None,
+        cfg_scale: float = 1.5,
+        keep_acoustic: int = 0,
+        feed_source: bool = True,
+        seed: int = 42,
+        return_pcm: bool = True
+    ) -> Tuple[Optional[List[float]], Optional[List[int]]]:
+        """
+        Executes Mode 4 Speech-to-Speech Voice Conversion directly on the Generator's
+        existing VRAM instance (via shallow base_model wrapper) with zero weight reloading.
+        """
+        if not self.handle:
+            raise RuntimeError("GeneratorHandle is closed")
+
+        c_src_codes = (ctypes.c_int * len(src_codes))(*src_codes)
+
+        if ref_audio and len(ref_audio) > 0:
+            c_ref_audio = (ctypes.c_float * len(ref_audio))(*ref_audio)
+            c_ref_audio_len = len(ref_audio)
+        else:
+            c_ref_audio = None
+            c_ref_audio_len = 0
+
+        if ref_codes and ref_frames > 0:
+            c_ref_codes = (ctypes.c_int * len(ref_codes))(*ref_codes)
+            c_ref_frames = ref_frames
+        else:
+            c_ref_codes = None
+            c_ref_frames = 0
+
+        c_ref_text = ref_text.encode("utf-8") if (ref_text and len(ref_text) > 0) else None
+        c_src_text = src_text.encode("utf-8") if (src_text and len(src_text) > 0) else None
+
+        c_out_codes = (ctypes.c_int * (src_T * 16))()
+
+        if return_pcm:
+            max_pcm_len = src_T * 1920 + 32000
+            c_out_pcm = (ctypes.c_float * max_pcm_len)()
+            max_pcm = max_pcm_len
+        else:
+            c_out_pcm = None
+            max_pcm = 0
+
+        res = self.lib.lib.breeze_generator_convert_voice(
+            self.handle,
+            c_src_codes, src_T,
+            c_ref_audio, c_ref_audio_len,
+            c_ref_codes, c_ref_frames,
+            c_ref_text, c_src_text,
+            ctypes.c_float(cfg_scale),
+            ctypes.c_int(keep_acoustic),
+            ctypes.c_int(1 if feed_source else 0),
+            ctypes.c_uint32(seed),
+            c_out_codes,
+            c_out_pcm, max_pcm
+        )
+
+        if res < 0:
+            err = self.lib.get_last_error()
+            raise RuntimeError(f"Voice conversion failed on Generator (device {self.device}): {err}")
+
+        out_codes = list(c_out_codes)
+        out_audio = list(c_out_pcm)[:res] if (return_pcm and c_out_pcm) else None
+        return out_audio, out_codes
 
     def close(self):
 

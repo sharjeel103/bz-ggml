@@ -291,7 +291,8 @@ static std::string filler_text(double secs) {
 
 std::vector<float> convert_voice(BreezeModel & m, MimiCodec & codec, const std::vector<int> & src_codes,
                                  int src_T, const std::vector<float> & ref_audio,
-                                 const std::string & ref_text, const ConvertOptions & opt) {
+                                 const std::string & ref_text, const ConvertOptions & opt,
+                                 std::vector<int> * out_codes) {
     const int nc = m.cfg.num_codebooks;
     const bool use_cfg = opt.cfg_scale != 1.0f;
     std::mt19937 rng((uint32_t) opt.seed);
@@ -355,6 +356,14 @@ std::vector<float> convert_voice(BreezeModel & m, MimiCodec & codec, const std::
     st_c.free();
     if (use_cfg) st_u.free();
     depth.free();
+
+    if (out_codes) {
+        *out_codes = out;
+    }
+
+    if (opt.tokens_only) {
+        return {};
+    }
 
     // the vocoder upsamples 1920x, so decoding a long clip in one graph asks for gigabytes at once.
     // walk it in windows with enough left context for the convolutions to reach back over

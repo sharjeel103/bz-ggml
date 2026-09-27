@@ -1015,4 +1015,75 @@ int breeze_vocoder_stream_decode_batch(breeze_vocoder * voc, int batch_size,
     }
 }
 
+BREEZE_API int breeze_generator_convert_voice(
+    breeze_generator * gen,
+    const int * src_codes, int src_T,
+    const float * ref_audio, int ref_audio_len,
+    const int * ref_codes, int ref_frames,
+    const char * ref_text,
+    const char * src_text,
+    float cfg_scale, int keep_acoustic, int feed_source,
+    unsigned int seed,
+    int * out_codes,
+    float * out_pcm, int max_out_pcm
+) {
+    if (!gen || !src_codes || src_T <= 0) return -1;
+    try {
+        // 1. Shallow model wrapper pointing to generator weights (0 MB reload)
+        breeze::BreezeModel conv_model;
+        conv_model.backend = gen->model.backend;
+        conv_model.cfg = gen->model.cfg;
+        conv_model.tok = gen->model.tok;
+        conv_model.base_model = &gen->model;
+
+        // 2. Setup options
+        breeze::ConvertOptions opt;
+        opt.cfg_scale = cfg_scale;
+        opt.keep_acoustic = keep_acoustic;
+        opt.feed_source = (feed_source != 0);
+        opt.seed = (int) seed;
+        if (src_text && std::strlen(src_text) > 0) {
+            opt.src_text = src_text;
+        }
+        if (ref_codes && ref_frames > 0) {
+            opt.ref_codes.assign(ref_codes, ref_codes + (size_t) ref_frames * 16);
+            opt.ref_frames = ref_frames;
+        }
+        opt.tokens_only = (out_pcm == nullptr || max_out_pcm <= 0);
+
+        // 3. Mimi Codec for reference audio / vocoder
+        breeze::MimiCodec codec;
+        codec.init(conv_model);
+
+        std::vector<int> src_v(src_codes, src_codes + (size_t) src_T * 16);
+        std::vector<float> ref_v;
+        if (ref_audio && ref_audio_len > 0) {
+            ref_v.assign(ref_audio, ref_audio + ref_audio_len);
+        }
+
+        std::vector<int> codes_result;
+        std::vector<float> audio = breeze::convert_voice(
+            conv_model, codec, src_v, src_T, ref_v,
+            ref_text ? ref_text : "", opt, &codes_result
+        );
+
+        if (out_codes && !codes_result.empty()) {
+            std::memcpy(out_codes, codes_result.data(), codes_result.size() * sizeof(int));
+        }
+
+        if (opt.tokens_only) {
+            return src_T; // Return number of frames converted
+        }
+
+        int written_samples = std::min((int) audio.size(), max_out_pcm);
+        if (out_pcm && written_samples > 0) {
+            std::memcpy(out_pcm, audio.data(), (size_t) written_samples * sizeof(float));
+        }
+        return written_samples;
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
 } // extern "C"

@@ -138,6 +138,19 @@ BREEZE_API int breeze_generator_sessions_step_burst(breeze_generator * gen,
                                                     const unsigned int * seeds,
                                                     int * out_frames_burst, int * out_next_cb0);
 
+// Mode 4 Voice Conversion: Reuses Generator VRAM weights via shallow base_model wrapper (0 MB weight reload)
+BREEZE_API int breeze_generator_convert_voice(
+    breeze_generator * gen,
+    const int * src_codes, int src_T,
+    const float * ref_audio, int ref_audio_len,
+    const int * ref_codes, int ref_frames,
+    const char * ref_text,
+    const char * src_text,
+    float cfg_scale, int keep_acoustic, int feed_source,
+    unsigned int seed,
+    int * out_codes,
+    float * out_pcm, int max_out_pcm);
+
 #ifdef __cplusplus
 
 }
