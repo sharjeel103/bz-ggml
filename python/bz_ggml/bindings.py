@@ -126,6 +126,14 @@ class BreezeLib:
         ]
         self.lib.breeze_generator_convert_voice.restype = ctypes.c_int
 
+        # Audio Encoder API
+        self.lib.breeze_generator_encode_audio.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
+        ]
+        self.lib.breeze_generator_encode_audio.restype = ctypes.c_int
+
         # Vocoder API
 
         self.lib.breeze_vocoder_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
@@ -370,6 +378,28 @@ class GeneratorHandle:
         out_codes = list(c_out_codes)
         out_audio = list(c_out_pcm)[:res] if (return_pcm and c_out_pcm) else None
         return out_audio, out_codes
+
+    def encode_audio(self, pcm_samples: List[float]) -> Tuple[List[int], int]:
+        n_samples = len(pcm_samples)
+        if n_samples == 0:
+            return [], 0
+        max_frames = int(math.ceil(n_samples / 1920.0)) + 64
+        c_pcm = (ctypes.c_float * n_samples)(*pcm_samples)
+        c_out_codes = (ctypes.c_int * (max_frames * 16))()
+        c_out_n_frames = ctypes.c_int(0)
+
+        res = self.lib.lib.breeze_generator_encode_audio(
+            self.handle,
+            c_pcm, n_samples,
+            c_out_codes, ctypes.byref(c_out_n_frames)
+        )
+        if res < 0:
+            err = self.lib.get_last_error()
+            raise RuntimeError(f"Audio encoding failed on Generator (device {self.device}): {err}")
+
+        n_frames = c_out_n_frames.value
+        total_tokens = n_frames * 16
+        return list(c_out_codes[:total_tokens]), n_frames
 
     def close(self):
 

@@ -344,6 +344,11 @@ class DualInstanceCluster:
 
         print(f"[Cluster Config] Active Token Ceiling: {self.active_token_budget} tokens/GPU (Base: {self.base_max_tokens} | Q4: {self.enable_q4_burst} | Vocoder: {self.vocoder_mode})")
 
+    def encode_audio(self, pcm_samples: List[float], gpu_id: int = 0) -> Tuple[List[int], int]:
+        """Encodes 24 kHz mono float32 audio samples into discrete 16-codebook tokens at 12.5 Hz."""
+        gen = self.gen_a if gpu_id == 0 else self.gen_b
+        return gen.encode_audio(pcm_samples)
+
     def convert_voice_task(
         self,
         task: VoiceConversionTask,
@@ -495,19 +500,25 @@ class DualInstanceCluster:
 
                         for it, samples in zip(compute_items, batch_samples):
                             u_id = it[0]
+                            skip_samples = it[5] if len(it) > 9 else 0
+                            want_samples = it[6] if len(it) > 9 else len(samples)
+                            valid_samples = samples[skip_samples : skip_samples + want_samples]
                             with user_audio_lock:
                                 if u_id not in user_audio_results:
                                     user_audio_results[u_id] = {
                                         "samples": [],
                                         "first_audio_time": None
                                     }
-                                user_audio_results[u_id]["samples"].extend(samples)
+                                user_audio_results[u_id]["samples"].extend(valid_samples)
                                 if user_audio_results[u_id]["first_audio_time"] is None:
                                     user_audio_results[u_id]["first_audio_time"] = time.time()
 
                     # Process EOS completions
                     for it in batch_items:
-                        u_id, words, arr_time, t_start, frames_list, is_first, is_eos, total_frames, worker_tag = it
+                        if len(it) > 9:
+                            u_id, words, arr_time, t_start, frames_list, skip_s, want_s, is_eos, total_frames, worker_tag = it
+                        else:
+                            u_id, words, arr_time, t_start, frames_list, is_first, is_eos, total_frames, worker_tag = it
                         if is_eos:
                             t_end = time.time()
                             with user_audio_lock:
@@ -686,6 +697,7 @@ class DualInstanceCluster:
                         "expected_eos": profile["expected_eos"],
                         "cb0": cb0,
                         "total_frames": 0,
+                        "emitted_frames": 0,
                         "trimmed_dummy_frames": 0,
                         "chunk_buffer": [],
                         "all_tokens": [],
@@ -761,19 +773,27 @@ class DualInstanceCluster:
                     if stream_hit_eos or final_cb0 < 0 or s["total_frames"] >= s["max_steps"]:
                         finished_sids.append(sid)
 
-                # B2. Dynamic Batch Gathering: Coalesce all streams that filled >= 32 frames
+                # B2. Dynamic Batch Gathering: Coalesce all streams that filled >= 32 frames with 48-frame sliding window context
                 burst_ready_chunks = []
                 for cur_sid, cur_s in active_sessions.items():
                     if cur_s["client_has_vocoder"]:
                         continue
                     if not cur_s.get("stream_pcm", True):
                         continue
-                    while chunk_size > 0 and len(cur_s["chunk_buffer"]) >= (chunk_size * 16):
-                        dispatch_tokens = cur_s["chunk_buffer"][:chunk_size * 16]
-                        cur_s["chunk_buffer"] = cur_s["chunk_buffer"][chunk_size * 16:]
+                    have = len(cur_s["all_tokens"]) // 16
+                    emitted = cur_s.get("emitted_frames", 0)
+                    while chunk_size > 0 and (have - emitted) >= chunk_size:
+                        start = emitted
+                        count = chunk_size
+                        ctx_start = max(0, start - 48)
+                        dispatch_tokens = cur_s["all_tokens"][ctx_start * 16 : (start + count) * 16]
+                        skip_samples = (start - ctx_start) * 1920
+                        want_samples = count * 1920
+                        cur_s["emitted_frames"] = start + count
+                        emitted = cur_s["emitted_frames"]
                         burst_ready_chunks.append((
                             cur_s["task"].id, cur_s["words"], cur_s["arr_time"], cur_s["t_exec_start"],
-                            dispatch_tokens, False, False, cur_s["total_frames"],
+                            dispatch_tokens, skip_samples, want_samples, False, cur_s["total_frames"],
                             f"GPU {gpu_id} ({worker_name} [{cur_s['model_tag']}])"
                         ))
                 if burst_ready_chunks:
@@ -814,12 +834,25 @@ class DualInstanceCluster:
                             if on_progress:
                                 on_progress(res)
                     else:
-                        # Terminal partial flush: dispatch remaining frames in chunk_buffer
-                        leftover_tokens = list(s["chunk_buffer"])
-                        s["chunk_buffer"] = []
+                        # Terminal partial flush: dispatch remaining un-emitted frames with sliding window context
+                        have = len(s["all_tokens"]) // 16
+                        emitted = s.get("emitted_frames", 0)
+                        if have > emitted:
+                            start = emitted
+                            count = have - emitted
+                            ctx_start = max(0, start - 48) if s.get("stream_pcm", True) else 0
+                            leftover_tokens = s["all_tokens"][ctx_start * 16 : (start + count) * 16]
+                            skip_samples = (start - ctx_start) * 1920
+                            want_samples = count * 1920
+                            s["emitted_frames"] = have
+                        else:
+                            leftover_tokens = []
+                            skip_samples = 0
+                            want_samples = 0
+
                         eos_ready_chunks.append((
                             task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                            leftover_tokens, False, True, s["total_frames"],
+                            leftover_tokens, skip_samples, want_samples, True, s["total_frames"],
                             f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
                         ))
 

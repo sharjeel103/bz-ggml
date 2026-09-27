@@ -151,6 +151,12 @@ BREEZE_API int breeze_generator_convert_voice(
     int * out_codes,
     float * out_pcm, int max_out_pcm);
 
+// Audio Encoder: Encodes 24 kHz mono PCM into discrete 16-codebook tokens at 12.5 Hz
+BREEZE_API int breeze_generator_encode_audio(
+    breeze_generator * gen,
+    const float * pcm, int n_samples,
+    int * out_codes, int * out_n_frames);
+
 #ifdef __cplusplus
 
 }

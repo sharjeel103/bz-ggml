@@ -10,12 +10,61 @@ import os
 import sys
 import tempfile
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bz_ggml import DualInstanceCluster, UserTask, VoiceConversionTask
 
 import gradio as gr
+
+
+def load_audio_24k(audio_path: str) -> List[float]:
+    """Loads an audio file and converts to 24 kHz mono float32 in [-1.0, 1.0]."""
+    try:
+        import torchaudio
+        sig, sr = torchaudio.load(audio_path)
+        if sig.shape[0] > 1:
+            sig = sig.mean(dim=0, keepdim=True)
+        if sr != 24000:
+            sig = torchaudio.functional.resample(sig, sr, 24000)
+        return sig.squeeze().cpu().numpy().astype(np.float32).tolist()
+    except Exception:
+        pass
+
+    try:
+        import soundfile as sf
+        import scipy.signal
+        data, sr = sf.read(audio_path)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if sr != 24000:
+            num_samples = int(len(data) * 24000 / sr)
+            data = scipy.signal.resample(data, num_samples)
+        return data.astype(np.float32).tolist()
+    except Exception:
+        pass
+
+    import wave
+    with wave.open(audio_path, 'rb') as wf:
+        n_ch = wf.getnchannels()
+        width = wf.getsampwidth()
+        sr = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+        if width == 2:
+            data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+        elif width == 4:
+            data = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            data = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+        if n_ch > 1:
+            data = data.reshape(-1, n_ch).mean(axis=1)
+        if sr != 24000:
+            import scipy.signal
+            num_samples = int(len(data) * 24000 / sr)
+            data = scipy.signal.resample(data, num_samples)
+        return data.astype(np.float32).tolist()
+
 
 # Global cluster instance
 cluster_instance: Optional[DualInstanceCluster] = None
@@ -117,11 +166,18 @@ def voice_clone_generate(
 
     try:
         cluster = get_cluster(model_path, current_lib_path)
+        print(f"[Gradio Voice Clone] Encoding reference audio: {ref_audio}")
+        ref_pcm = load_audio_24k(ref_audio)
+        ref_codes, ref_frames = cluster.encode_audio(ref_pcm)
+        print(f"[Gradio Voice Clone] Reference voice encoded: {ref_frames} frames ({len(ref_codes)} tokens)")
+
         task = UserTask(
             id=int(time.time() * 1000) % 100000,
             text=text,
             instruction=instruction,
             ref_text=ref_text.strip(),
+            ref_codes=ref_codes,
+            ref_frames=ref_frames,
             cfg_scale=float(cfg_scale),
             seed=int(seed),
             max_steps=int(max_steps),
@@ -267,7 +323,7 @@ def build_app(default_model: str) -> gr.Blocks:
 
                         with gr.Accordion("Advanced Generation Parameters", open=False):
                             with gr.Row():
-                                tts_cfg = gr.Slider(1.0, 3.5, value=2.0, step=0.1, label="CFG Guidance Scale")
+                                tts_cfg = gr.Slider(1.0, 3.0, value=1.0, step=0.1, label="CFG Guidance Scale (1.0 = Default, 1.5 = Enhanced)")
                                 tts_temp = gr.Slider(0.1, 1.2, value=0.25, step=0.05, label="Temperature")
                                 tts_seed = gr.Number(value=42, label="Random Seed")
                                 tts_max = gr.Slider(100, 2000, value=1000, step=50, label="Max Output Frames")
@@ -325,7 +381,7 @@ def build_app(default_model: str) -> gr.Blocks:
 
                         with gr.Accordion("Advanced Voice Cloning Parameters", open=False):
                             with gr.Row():
-                                clone_cfg = gr.Slider(1.0, 3.5, value=2.0, step=0.1, label="CFG Guidance Scale")
+                                clone_cfg = gr.Slider(1.0, 3.0, value=1.0, step=0.1, label="CFG Guidance Scale (1.0 = Default, 1.5 = Enhanced)")
                                 clone_temp = gr.Slider(0.1, 1.2, value=0.25, step=0.05, label="Temperature")
                                 clone_seed = gr.Number(value=42, label="Random Seed")
                                 clone_max = gr.Slider(100, 2000, value=1000, step=50, label="Max Output Frames")

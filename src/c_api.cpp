@@ -1086,4 +1086,35 @@ BREEZE_API int breeze_generator_convert_voice(
     }
 }
 
+BREEZE_API int breeze_generator_encode_audio(
+    breeze_generator * gen,
+    const float * pcm, int n_samples,
+    int * out_codes, int * out_n_frames
+) {
+    if (!gen || !pcm || n_samples <= 0 || !out_codes || !out_n_frames) return -1;
+    try {
+        breeze::BreezeModel conv_model;
+        conv_model.backend = gen->model.backend;
+        conv_model.cfg = gen->model.cfg;
+        conv_model.tok = gen->model.tok;
+        conv_model.base_model = &gen->model;
+
+        breeze::MimiCodec codec;
+        codec.init(conv_model);
+
+        std::vector<float> audio(pcm, pcm + n_samples);
+        int n_frames = 0;
+        std::vector<int> codes = codec.encode(audio, n_frames);
+
+        *out_n_frames = n_frames;
+        if (!codes.empty()) {
+            std::memcpy(out_codes, codes.data(), codes.size() * sizeof(int));
+        }
+        return (int) codes.size();
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
 } // extern "C"
