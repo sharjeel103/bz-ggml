@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <memory>
 #include <algorithm>
+#include <mutex>
 
 using namespace breeze;
 
