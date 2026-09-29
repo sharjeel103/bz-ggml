@@ -317,15 +317,15 @@ class DualInstanceCluster:
         print(f"[Cluster] Initializing Autonomous Island 0 on CUDA0 (Vocoder Mode: {self.vocoder_mode})...")
         t0 = time.time()
         self.gen_a = GeneratorHandle(self.lib, model_path, cuda_device=0)
-        self.voc_a = VocoderHandle(self.lib, model_path, cuda_device=0) if self.enable_vocoder else None
-        print(f"   -> Island 0 Generator Online on CUDA0 in {time.time()-t0:.2f}s")
+        self.voc_a = self.gen_a.create_vocoder() if self.enable_vocoder else None
+        print(f"   -> Island 0 Generator & Shared Vocoder Online on CUDA0 in {time.time()-t0:.2f}s (Saved 420 MB Duplicate Weights!)")
 
         # Autonomous Island 1 (GPU 1)
         print(f"[Cluster] Initializing Autonomous Island 1 on CUDA1 (Vocoder Mode: {self.vocoder_mode})...")
         t0 = time.time()
         self.gen_b = GeneratorHandle(self.lib, model_path, cuda_device=1)
-        self.voc_b = VocoderHandle(self.lib, model_path, cuda_device=1) if self.enable_vocoder else None
-        print(f"   -> Island 1 Generator Online on CUDA1 in {time.time()-t0:.2f}s")
+        self.voc_b = self.gen_b.create_vocoder() if self.enable_vocoder else None
+        print(f"   -> Island 1 Generator & Shared Vocoder Online on CUDA1 in {time.time()-t0:.2f}s (Saved 420 MB Duplicate Weights!)")
 
         # Optional Modular INT4 Depth Decoder piece (~300 MiB)
         self.has_q4_dd = False
@@ -342,12 +342,24 @@ class DualInstanceCluster:
         self.conv_pool_a = ConversionWorkerPool(max_concurrent=self.max_concurrent_conversions)
         self.conv_pool_b = ConversionWorkerPool(max_concurrent=self.max_concurrent_conversions)
 
+        # Isolated Audio Reference Encoder Pool on GPU 0 (max 2 concurrent jobs, strictly bounded scratchpad)
+        self.audio_encoder_pool = ConversionWorkerPool(max_concurrent=2)
+
         print(f"[Cluster Config] Active Token Ceiling: {self.active_token_budget} tokens/GPU (Base: {self.base_max_tokens} | Q4: {self.enable_q4_burst} | Vocoder: {self.vocoder_mode})")
 
     def encode_audio(self, pcm_samples: List[float], gpu_id: int = 0) -> Tuple[List[int], int]:
-        """Encodes 24 kHz mono float32 audio samples into discrete 16-codebook tokens at 12.5 Hz."""
-        gen = self.gen_a if gpu_id == 0 else self.gen_b
-        return gen.encode_audio(pcm_samples)
+        """Encodes 24 kHz mono float32 audio samples into discrete 16-codebook tokens at 12.5 Hz (max 10s audio ceiling)."""
+        MAX_SAMPLES = 240000  # Strictly enforce 10-second cap (240,000 samples @ 24 kHz)
+        if len(pcm_samples) > MAX_SAMPLES:
+            pcm_samples = pcm_samples[:MAX_SAMPLES]
+        acquired = self.audio_encoder_pool.acquire(blocking=True, timeout=15.0)
+        if not acquired:
+            raise TimeoutError("Audio reference encoder concurrency limit (2 jobs) exceeded on GPU 0")
+        try:
+            # Pinned strictly to Island A on GPU 0
+            return self.gen_a.encode_audio(pcm_samples)
+        finally:
+            self.audio_encoder_pool.release()
 
     def convert_voice_task(
         self,
@@ -492,26 +504,42 @@ class DualInstanceCluster:
                     # Separate items with audio tokens to compute on GPU
                     compute_items = [it for it in batch_items if len(it[4]) > 0]
                     if compute_items:
-                        batch_tokens = [it[4] for it in compute_items]
-                        batch_n_frames = [len(it[4]) // 16 for it in compute_items]
+                        # Adaptive Batch Slicing: Prevent graph scratchpad memory exhaustion
+                        # Cap sub-batch at 500 total acoustic frames (~120 MiB VRAM peak ceiling)
+                        MAX_VOCODER_FRAMES = 500
+                        sub_batches = []
+                        curr_sub = []
+                        curr_f = 0
+                        for it in compute_items:
+                            nf = len(it[4]) // 16
+                            if curr_sub and (curr_f + nf > MAX_VOCODER_FRAMES):
+                                sub_batches.append(curr_sub)
+                                curr_sub = []
+                                curr_f = 0
+                            curr_sub.append(it)
+                            curr_f += nf
+                        if curr_sub:
+                            sub_batches.append(curr_sub)
 
-                        # SINGLE UNIFIED GPU DISPATCH FOR ALL READY STREAMS IN THE BATCH
-                        batch_samples = voc_handle.stream_decode_batch(batch_tokens, batch_n_frames)
+                        for sub in sub_batches:
+                            sub_sids = [it[0] for it in sub]
+                            sub_tokens = [it[4] for it in sub]
+                            sub_n_frames = [len(it[4]) // 16 for it in sub]
 
-                        for it, samples in zip(compute_items, batch_samples):
-                            u_id = it[0]
-                            skip_samples = it[5] if len(it) > 9 else 0
-                            want_samples = it[6] if len(it) > 9 else len(samples)
-                            valid_samples = samples[skip_samples : skip_samples + want_samples]
-                            with user_audio_lock:
-                                if u_id not in user_audio_results:
-                                    user_audio_results[u_id] = {
-                                        "samples": [],
-                                        "first_audio_time": None
-                                    }
-                                user_audio_results[u_id]["samples"].extend(valid_samples)
-                                if user_audio_results[u_id]["first_audio_time"] is None:
-                                    user_audio_results[u_id]["first_audio_time"] = time.time()
+                            # Unified stateful GPU dispatch for ready streams within safe frame budget
+                            sub_samples = voc_handle.session_decode_batch(sub_sids, sub_tokens, sub_n_frames)
+
+                            for it, samples in zip(sub, sub_samples):
+                                u_id = it[0]
+                                with user_audio_lock:
+                                    if u_id not in user_audio_results:
+                                        user_audio_results[u_id] = {
+                                            "samples": [],
+                                            "first_audio_time": None
+                                        }
+                                    user_audio_results[u_id]["samples"].extend(samples)
+                                    if user_audio_results[u_id]["first_audio_time"] is None:
+                                        user_audio_results[u_id]["first_audio_time"] = time.time()
 
                     # Process EOS completions
                     for it in batch_items:
@@ -520,6 +548,7 @@ class DualInstanceCluster:
                         else:
                             u_id, words, arr_time, t_start, frames_list, is_first, is_eos, total_frames, worker_tag = it
                         if is_eos:
+                            voc_handle.session_free(u_id)
                             t_end = time.time()
                             with user_audio_lock:
                                 u_rec = user_audio_results.get(u_id, {})
@@ -785,15 +814,12 @@ class DualInstanceCluster:
                     while chunk_size > 0 and (have - emitted) >= chunk_size:
                         start = emitted
                         count = chunk_size
-                        ctx_start = max(0, start - 48)
-                        dispatch_tokens = cur_s["all_tokens"][ctx_start * 16 : (start + count) * 16]
-                        skip_samples = (start - ctx_start) * 1920
-                        want_samples = count * 1920
+                        dispatch_tokens = cur_s["all_tokens"][start * 16 : (start + count) * 16]
                         cur_s["emitted_frames"] = start + count
                         emitted = cur_s["emitted_frames"]
                         burst_ready_chunks.append((
                             cur_s["task"].id, cur_s["words"], cur_s["arr_time"], cur_s["t_exec_start"],
-                            dispatch_tokens, skip_samples, want_samples, False, cur_s["total_frames"],
+                            dispatch_tokens, 0, count * 1920, False, cur_s["total_frames"],
                             f"GPU {gpu_id} ({worker_name} [{cur_s['model_tag']}])"
                         ))
                 if burst_ready_chunks:
@@ -834,25 +860,21 @@ class DualInstanceCluster:
                             if on_progress:
                                 on_progress(res)
                     else:
-                        # Terminal partial flush: dispatch remaining un-emitted frames with sliding window context
+                        # Terminal partial flush: dispatch remaining un-emitted frames directly to stateful vocoder
                         have = len(s["all_tokens"]) // 16
                         emitted = s.get("emitted_frames", 0)
                         if have > emitted:
                             start = emitted
                             count = have - emitted
-                            ctx_start = max(0, start - 48) if s.get("stream_pcm", True) else 0
-                            leftover_tokens = s["all_tokens"][ctx_start * 16 : (start + count) * 16]
-                            skip_samples = (start - ctx_start) * 1920
-                            want_samples = count * 1920
+                            leftover_tokens = s["all_tokens"][start * 16 : (start + count) * 16]
                             s["emitted_frames"] = have
                         else:
                             leftover_tokens = []
-                            skip_samples = 0
-                            want_samples = 0
+                            count = 0
 
                         eos_ready_chunks.append((
                             task_item.id, s["words"], s["arr_time"], s["t_exec_start"],
-                            leftover_tokens, skip_samples, want_samples, True, s["total_frames"],
+                            leftover_tokens, 0, count * 1920, True, s["total_frames"],
                             f"GPU {gpu_id} ({worker_name} [{s['model_tag']}])"
                         ))
 

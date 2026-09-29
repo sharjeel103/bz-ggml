@@ -6,6 +6,7 @@
 #include "breeze/sampling.h"
 #include "breeze/text_encoder.h"
 #include "breeze/codec.h"
+#include "breeze/voice.h"
 
 #include <exception>
 #include <random>
@@ -186,11 +187,20 @@ struct breeze_generator {
     bool st_init = false;
 };
 
+struct VocoderStreamSession {
+    int session_id = 0;
+    std::vector<int> history_codes;
+    int total_frames = 0;
+    bool active = false;
+};
+
 struct breeze_vocoder {
     breeze::BreezeModel model;
     breeze::MimiCodec codec;
     int device = 1;
     bool codec_init = false;
+    bool owns_model = true;
+    std::unordered_map<int, std::unique_ptr<VocoderStreamSession>> sessions;
 };
 
 extern "C" {
@@ -955,17 +965,208 @@ breeze_vocoder * breeze_vocoder_init(const char * gguf_path, int cuda_device) {
     }
 }
 
+breeze_vocoder * breeze_vocoder_create_from_generator(breeze_generator * gen) {
+    if (!gen) return nullptr;
+    breeze_vocoder * voc = new breeze_vocoder();
+    voc->device = gen->device;
+    voc->codec.init(gen->model);
+    voc->codec_init = true;
+    voc->owns_model = false;
+    return voc;
+}
+
 void breeze_vocoder_free(breeze_vocoder * voc) {
     if (!voc) return;
-    voc->model.free();
+    voc->sessions.clear();
+    if (voc->owns_model) {
+        voc->model.free();
+    }
     delete voc;
+}
+
+int breeze_vocoder_session_create(breeze_vocoder * voc, int session_id) {
+    if (!voc) return -1;
+    auto sess = std::make_unique<VocoderStreamSession>();
+    sess->session_id = session_id;
+    sess->total_frames = 0;
+    sess->active = true;
+    voc->sessions[session_id] = std::move(sess);
+    return 0;
+}
+
+int breeze_vocoder_session_decode(breeze_vocoder * voc, int session_id,
+                                 const int * frames, int n_frames,
+                                 float * out_pcm) {
+    if (!voc || !frames || n_frames <= 0 || !out_pcm) return 0;
+    try {
+        auto it = voc->sessions.find(session_id);
+        if (it == voc->sessions.end() || !it->second) {
+            auto new_sess = std::make_unique<VocoderStreamSession>();
+            new_sess->session_id = session_id;
+            new_sess->total_frames = 0;
+            new_sess->active = true;
+            voc->sessions[session_id] = std::move(new_sess);
+            it = voc->sessions.find(session_id);
+        }
+        VocoderStreamSession * sess = it->second.get();
+
+        const int nc = voc->codec.m->cfg.num_codebooks;
+        const int spf = 1920;
+        int past_f = (int) sess->history_codes.size() / nc;
+
+        std::vector<int> combined;
+        int total_T = past_f + n_frames;
+        if (past_f > 0) {
+            combined.reserve((size_t) total_T * nc);
+            combined.insert(combined.end(), sess->history_codes.begin(), sess->history_codes.end());
+            combined.insert(combined.end(), frames, frames + (size_t) n_frames * nc);
+        } else {
+            combined.assign(frames, frames + (size_t) n_frames * nc);
+        }
+
+        std::vector<float> audio = voc->codec.decode(combined, total_T);
+
+        const int skip = past_f * spf;
+        const int want = n_frames * spf;
+        if ((int) audio.size() >= skip + want) {
+            std::memcpy(out_pcm, audio.data() + skip, (size_t) want * sizeof(float));
+        } else {
+            int available = std::max(0, (int) audio.size() - skip);
+            if (available > 0) {
+                std::memcpy(out_pcm, audio.data() + skip, (size_t) available * sizeof(float));
+            }
+        }
+
+        sess->history_codes.insert(sess->history_codes.end(), frames, frames + (size_t) n_frames * nc);
+        sess->total_frames += n_frames;
+
+        // Keep last 72 frames for next causal lookback
+        const int max_hist = 72;
+        int cur_hist_f = (int) sess->history_codes.size() / nc;
+        if (cur_hist_f > max_hist) {
+            int drop_f = cur_hist_f - max_hist;
+            sess->history_codes.erase(sess->history_codes.begin(), sess->history_codes.begin() + (size_t) drop_f * nc);
+        }
+
+        return want;
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return 0;
+    }
+}
+
+int breeze_vocoder_session_decode_batch(breeze_vocoder * voc, int batch_size,
+                                       const int * session_ids,
+                                       const int * flat_tokens, const int * token_offsets,
+                                       const int * n_frames_per_stream,
+                                       float * flat_pcm, const int * pcm_offsets,
+                                       int * out_n_samples) {
+    if (!voc || batch_size <= 0 || !session_ids || !flat_tokens || !n_frames_per_stream || !flat_pcm) return 0;
+    try {
+        const int nc = voc->codec.m ? voc->codec.m->cfg.num_codebooks : 16;
+        const int spf = 1920;
+        const int max_hist = 72;
+
+        std::vector<VocoderStreamSession *> sess_ptrs(batch_size);
+        std::vector<int> past_frames(batch_size);
+        std::vector<std::vector<int>> batch_codes(batch_size);
+        std::vector<int> batch_T(batch_size);
+
+        int running_tok = 0;
+        for (int b = 0; b < batch_size; b++) {
+            int sid = session_ids[b];
+            auto it = voc->sessions.find(sid);
+            if (it == voc->sessions.end() || !it->second) {
+                auto new_sess = std::make_unique<VocoderStreamSession>();
+                new_sess->session_id = sid;
+                new_sess->total_frames = 0;
+                new_sess->active = true;
+                voc->sessions[sid] = std::move(new_sess);
+                it = voc->sessions.find(sid);
+            }
+            VocoderStreamSession * sess = it->second.get();
+            sess_ptrs[b] = sess;
+
+            int past_f = (int) sess->history_codes.size() / nc;
+            past_frames[b] = past_f;
+
+            int nf = n_frames_per_stream[b];
+            int offset = token_offsets ? token_offsets[b] : running_tok;
+            const int * new_codes = flat_tokens + offset;
+
+            int total_T = past_f + nf;
+            batch_T[b] = total_T;
+            if (past_f > 0) {
+                batch_codes[b].reserve((size_t) total_T * nc);
+                batch_codes[b].insert(batch_codes[b].end(), sess->history_codes.begin(), sess->history_codes.end());
+                batch_codes[b].insert(batch_codes[b].end(), new_codes, new_codes + (size_t) nf * nc);
+            } else {
+                batch_codes[b].assign(new_codes, new_codes + (size_t) nf * nc);
+            }
+
+            running_tok += nf * nc;
+        }
+
+        std::vector<std::vector<float>> audios = voc->codec.decode_batch(batch_codes, batch_T);
+
+        int running_pcm = 0;
+        for (int b = 0; b < batch_size; b++) {
+            VocoderStreamSession * sess = sess_ptrs[b];
+            int past_f = past_frames[b];
+            int nf = n_frames_per_stream[b];
+            int skip = past_f * spf;
+            int want = nf * spf;
+            int p_off = pcm_offsets ? pcm_offsets[b] : running_pcm;
+
+            const auto & audio = audios[b];
+            if ((int) audio.size() >= skip + want) {
+                std::memcpy(flat_pcm + p_off, audio.data() + skip, (size_t) want * sizeof(float));
+            } else {
+                int available = std::max(0, (int) audio.size() - skip);
+                if (available > 0) {
+                    std::memcpy(flat_pcm + p_off, audio.data() + skip, (size_t) available * sizeof(float));
+                }
+            }
+
+            sess->history_codes.insert(sess->history_codes.end(),
+                                       batch_codes[b].begin() + (size_t) past_f * nc,
+                                       batch_codes[b].end());
+            sess->total_frames += nf;
+
+            int cur_hist_f = (int) sess->history_codes.size() / nc;
+            if (cur_hist_f > max_hist) {
+                int drop_f = cur_hist_f - max_hist;
+                sess->history_codes.erase(sess->history_codes.begin(), sess->history_codes.begin() + (size_t) drop_f * nc);
+            }
+
+            if (out_n_samples) {
+                out_n_samples[b] = want;
+            }
+            running_pcm += want;
+        }
+
+        return batch_size;
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return 0;
+    }
+}
+
+int breeze_vocoder_session_free(breeze_vocoder * voc, int session_id) {
+    if (!voc) return -1;
+    auto it = voc->sessions.find(session_id);
+    if (it != voc->sessions.end()) {
+        voc->sessions.erase(it);
+        return 0;
+    }
+    return -1;
 }
 
 int breeze_vocoder_stream_decode(breeze_vocoder * voc, const int * frames, 
                                  int n_frames, float * out_pcm) {
     if (!voc || !frames || n_frames <= 0 || !out_pcm) return 0;
     try {
-        const int nc = voc->model.cfg.num_codebooks;
+        const int nc = voc->codec.m ? voc->codec.m->cfg.num_codebooks : 16;
         std::vector<int> sub(frames, frames + n_frames * nc);
         std::vector<float> audio = voc->codec.decode(sub, n_frames);
         std::memcpy(out_pcm, audio.data(), audio.size() * sizeof(float));
@@ -983,7 +1184,7 @@ int breeze_vocoder_stream_decode_batch(breeze_vocoder * voc, int batch_size,
                                       int * out_n_samples) {
     if (!voc || batch_size <= 0 || !flat_tokens || !n_frames_per_stream || !flat_pcm) return 0;
     try {
-        const int nc = voc->model.cfg.num_codebooks;
+        const int nc = voc->codec.m ? voc->codec.m->cfg.num_codebooks : 16;
         std::vector<std::vector<int>> batch_codes(batch_size);
         std::vector<int> batch_T(batch_size);
 
@@ -1113,6 +1314,50 @@ BREEZE_API int breeze_generator_encode_audio(
         return (int) codes.size();
     } catch (const std::exception & e) {
         g_error = e.what();
+        return -1;
+    }
+}
+
+BREEZE_API int breeze_voice_save_file(
+    const char * path, const char * name, const char * text,
+    const int * codes, int n_frames, int n_codebooks, int sample_rate) {
+    if (!path || !name || !text || !codes || n_frames <= 0 || n_codebooks <= 0) return -1;
+    try {
+        breeze::Voice v;
+        v.name = name;
+        v.text = text;
+        v.frames = n_frames;
+        v.n_codebooks = n_codebooks;
+        v.sample_rate = sample_rate > 0 ? sample_rate : 24000;
+        v.codes.assign(codes, codes + (size_t) n_frames * n_codebooks);
+        return breeze::save_voice(path, v) ? 0 : -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
+BREEZE_API int breeze_voice_load_file(
+    const char * path, char * out_name, int name_max,
+    char * out_text, int text_max, int * out_codes,
+    int * out_n_frames, int * out_n_codebooks, int * out_sample_rate) {
+    if (!path || !out_codes || !out_n_frames || !out_n_codebooks) return -1;
+    try {
+        breeze::Voice v;
+        if (!breeze::load_voice(path, v)) return -1;
+        if (out_name && name_max > 0) {
+            std::strncpy(out_name, v.name.c_str(), name_max - 1);
+            out_name[name_max - 1] = '\0';
+        }
+        if (out_text && text_max > 0) {
+            std::strncpy(out_text, v.text.c_str(), text_max - 1);
+            out_text[text_max - 1] = '\0';
+        }
+        *out_n_frames = v.frames;
+        *out_n_codebooks = v.n_codebooks;
+        if (out_sample_rate) *out_sample_rate = v.sample_rate;
+        std::memcpy(out_codes, v.codes.data(), v.codes.size() * sizeof(int));
+        return (int) v.codes.size();
+    } catch (...) {
         return -1;
     }
 }

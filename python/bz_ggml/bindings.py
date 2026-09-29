@@ -140,8 +140,34 @@ class BreezeLib:
         self.lib.breeze_vocoder_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
         self.lib.breeze_vocoder_init.restype = ctypes.c_void_p
 
+        self.lib.breeze_vocoder_create_from_generator.argtypes = [ctypes.c_void_p]
+        self.lib.breeze_vocoder_create_from_generator.restype = ctypes.c_void_p
+
         self.lib.breeze_vocoder_free.argtypes = [ctypes.c_void_p]
         self.lib.breeze_vocoder_free.restype = None
+
+        self.lib.breeze_vocoder_session_create.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.breeze_vocoder_session_create.restype = ctypes.c_int
+
+        self.lib.breeze_vocoder_session_decode.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float)
+        ]
+        self.lib.breeze_vocoder_session_decode.restype = ctypes.c_int
+
+        self.lib.breeze_vocoder_session_decode_batch.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int)
+        ]
+        self.lib.breeze_vocoder_session_decode_batch.restype = ctypes.c_int
+
+        self.lib.breeze_vocoder_session_free.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.breeze_vocoder_session_free.restype = ctypes.c_int
 
         self.lib.breeze_vocoder_stream_decode.argtypes = [
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
@@ -180,6 +206,13 @@ class GeneratorHandle:
             self.handle, session_id, 1 if use_q4 else 0
         )
         return res == 0
+
+    def create_vocoder(self) -> 'VocoderHandle':
+        """Creates a streaming vocoder sharing this Generator's resident model weights (0 MB extra VRAM)."""
+        h = self.lib.lib.breeze_vocoder_create_from_generator(self.handle)
+        if not h:
+            raise RuntimeError(f"Failed to create shared vocoder from Generator on CUDA device {self.device}")
+        return VocoderHandle(self.lib, "", cuda_device=self.device, existing_handle=h)
 
     def prefill(self, text: str, instruction: str = "Speak clearly and naturally.", seed: int = 42) -> int:
         cb0_buf = ctypes.c_int()
@@ -413,12 +446,72 @@ class GeneratorHandle:
 
 
 class VocoderHandle:
-    def __init__(self, lib: BreezeLib, model_path: str, cuda_device: int = 1):
+    def __init__(self, lib: BreezeLib, model_path: str = "", cuda_device: int = 1, existing_handle=None):
         self.lib = lib
         self.device = cuda_device
-        self.handle = self.lib.lib.breeze_vocoder_init(model_path.encode("utf-8"), cuda_device)
-        if not self.handle:
-            raise RuntimeError(f"Failed to initialize Streaming Vocoder on CUDA device {cuda_device}")
+        if existing_handle:
+            self.handle = existing_handle
+        else:
+            self.handle = self.lib.lib.breeze_vocoder_init(model_path.encode("utf-8"), cuda_device)
+            if not self.handle:
+                raise RuntimeError(f"Failed to initialize Streaming Vocoder on CUDA device {cuda_device}")
+
+    def session_create(self, session_id: int) -> int:
+        return self.lib.lib.breeze_vocoder_session_create(self.handle, session_id)
+
+    def session_decode(self, session_id: int, frames_tokens: List[int]) -> List[float]:
+        n_frames = len(frames_tokens) // 16
+        if n_frames <= 0:
+            return []
+        c_frames = (ctypes.c_int * len(frames_tokens))(*frames_tokens)
+        max_samples = n_frames * 1920
+        c_pcm = (ctypes.c_float * max_samples)()
+        n_out = self.lib.lib.breeze_vocoder_session_decode(self.handle, session_id, c_frames, n_frames, c_pcm)
+        return list(c_pcm[:n_out])
+
+    def session_free(self, session_id: int) -> int:
+        return self.lib.lib.breeze_vocoder_session_free(self.handle, session_id)
+
+    def session_decode_batch(self, session_ids: List[int], batch_tokens: List[List[int]], batch_n_frames: List[int]) -> List[List[float]]:
+        B = len(session_ids)
+        if B == 0:
+            return []
+        if B == 1:
+            return [self.session_decode(session_ids[0], batch_tokens[0])]
+
+        flat_tokens = []
+        tok_offsets = []
+        pcm_offsets = []
+        total_samples = 0
+
+        for b in range(B):
+            tok_offsets.append(len(flat_tokens))
+            flat_tokens.extend(batch_tokens[b])
+            pcm_offsets.append(total_samples)
+            total_samples += batch_n_frames[b] * 1920
+
+        c_session_ids = (ctypes.c_int * B)(*session_ids)
+        c_flat_tokens = (ctypes.c_int * len(flat_tokens))(*flat_tokens)
+        c_tok_offsets = (ctypes.c_int * B)(*tok_offsets)
+        c_n_frames = (ctypes.c_int * B)(*batch_n_frames)
+        c_flat_pcm = (ctypes.c_float * total_samples)()
+        c_pcm_offsets = (ctypes.c_int * B)(*pcm_offsets)
+        c_out_samples = (ctypes.c_int * B)()
+
+        ok = self.lib.lib.breeze_vocoder_session_decode_batch(
+            self.handle, B, c_session_ids, c_flat_tokens, c_tok_offsets, c_n_frames,
+            c_flat_pcm, c_pcm_offsets, c_out_samples
+        )
+        if ok <= 0:
+            raise RuntimeError(f"breeze_vocoder_session_decode_batch failed for batch of {B} sessions")
+
+        results = []
+        pcm_arr = list(c_flat_pcm)
+        for b in range(B):
+            start = pcm_offsets[b]
+            cnt = c_out_samples[b]
+            results.append(pcm_arr[start:start + cnt])
+        return results
 
     def stream_decode(self, frames_tokens: List[int], n_frames: int) -> List[float]:
         max_chunk = 64
@@ -505,4 +598,17 @@ def load_breeze_voice(path: str) -> dict:
             "sample_rate": sample_rate,
             "n_codebooks": n_codebooks
         }
+
+
+def save_breeze_voice(path: str, text: str, codes: List[int], frames: int, sample_rate: int = 24000, n_codebooks: int = 16) -> str:
+    """Saves reference voice codes and transcript into a standard .breeze container."""
+    import struct
+    text_bytes = text.encode("utf-8")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b"BRZV")
+        f.write(struct.pack("<5I", 1, sample_rate, n_codebooks, frames, len(text_bytes)))
+        f.write(text_bytes)
+        f.write(struct.pack(f"<{len(codes)}i", *codes))
+    return path
 

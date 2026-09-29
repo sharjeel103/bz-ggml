@@ -14,7 +14,11 @@ from typing import Optional, Tuple, List
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bz_ggml import DualInstanceCluster, UserTask, VoiceConversionTask
+from bz_ggml import (
+    DualInstanceCluster, UserTask, VoiceConversionTask,
+    load_breeze_voice, save_breeze_voice
+)
+from bz_ggml.asr import ASRService
 
 import gradio as gr
 
@@ -66,10 +70,82 @@ def load_audio_24k(audio_path: str) -> List[float]:
         return data.astype(np.float32).tolist()
 
 
-# Global cluster instance
+# Global cluster and ASR instances
 cluster_instance: Optional[DualInstanceCluster] = None
 current_model_path: Optional[str] = None
 current_lib_path: Optional[str] = None
+asr_service_instance: Optional[ASRService] = None
+
+
+def get_asr_service(cuda_device: int = 1) -> ASRService:
+    """Lazy-initializes ASR service pinned strictly to GPU 1."""
+    global asr_service_instance
+    if asr_service_instance is None:
+        asr_service_instance = ASRService(model_size="small", cuda_device=cuda_device, compute_type="int8_float16")
+    return asr_service_instance
+
+
+def transcribe_audio_sample(audio_path: Optional[str]) -> str:
+    """Transcribes an audio sample on GPU 1 using faster-whisper-small."""
+    if not audio_path or not os.path.exists(audio_path):
+        return "Error: Please upload or record an audio file first."
+    try:
+        asr = get_asr_service(cuda_device=1)
+        transcript = asr.transcribe(audio_path)
+        return transcript.strip()
+    except Exception as e:
+        return f"ASR Transcription Error: {str(e)}"
+
+
+def register_voice_file(
+    voice_name: str,
+    audio_path: Optional[str],
+    transcript: str,
+    model_path: str
+) -> Tuple[Optional[str], str]:
+    """Encodes voice reference on GPU 0 and saves into standard .breeze container."""
+    if not voice_name.strip():
+        return None, "❌ Error: Voice name is required."
+    if not audio_path or not os.path.exists(audio_path):
+        return None, "❌ Error: Audio sample file is required."
+    if not transcript.strip():
+        return None, "❌ Error: Exact verbatim transcript is required for voice registration."
+
+    try:
+        cluster = get_cluster(model_path, current_lib_path)
+        print(f"[Register Voice] Loading audio: {audio_path}")
+        pcm = load_audio_24k(audio_path)
+        t0 = time.time()
+        codes, frames = cluster.encode_audio(pcm, gpu_id=0)
+        enc_time = time.time() - t0
+
+        out_dir = tempfile.mkdtemp(prefix="breeze_voice_")
+        safe_name = "".join(c for c in voice_name.strip() if c.isalnum() or c in (' ', '_', '-')).rstrip()
+        breeze_filename = f"{safe_name.lower().replace(' ', '_')}.breeze"
+        breeze_path = os.path.join(out_dir, breeze_filename)
+
+        save_breeze_voice(
+            path=breeze_path,
+            text=transcript.strip(),
+            codes=codes,
+            frames=frames,
+            sample_rate=24000,
+            n_codebooks=16
+        )
+
+        file_kb = os.path.getsize(breeze_path) / 1024.0
+        msg = (
+            f"✅ **Voice Registered Successfully!**\n\n"
+            f"• **Voice Name**: `{voice_name.strip()}`\n"
+            f"• **Frames**: {frames} ({frames * 0.08:.2f}s acoustic reference)\n"
+            f"• **Tokens**: {len(codes)} (16 codebooks @ 12.5 Hz)\n"
+            f"• **Encode Latency**: {enc_time:.2f}s (Pinned to GPU 0 Audio Encoder Pool)\n"
+            f"• **Container Size**: {file_kb:.1f} KB (`.breeze` format)\n"
+            f"• **Ready for Zero-Shot Cloning**: Instant zero-latency loading with 0 MB audio re-encoding!"
+        )
+        return breeze_path, msg
+    except Exception as e:
+        return None, f"❌ Voice Registration Failed: {str(e)}"
 
 
 def get_cluster(model_path: str, lib_path: Optional[str] = None) -> DualInstanceCluster:
@@ -144,6 +220,7 @@ def tts_generate(
 
 def voice_clone_generate(
     text: str,
+    ref_breeze_file: Optional[str],
     ref_audio: Optional[str],
     ref_text: str,
     instruction: str,
@@ -156,26 +233,41 @@ def voice_clone_generate(
 ) -> Tuple[Optional[str], str]:
     if not text.strip():
         return None, "Error: Target text is empty."
-    if not ref_audio:
-        return None, "Error: Reference audio file is required for voice cloning."
-    if not ref_text.strip():
-        return None, "Error: Exact verbatim reference transcript is required."
+
+    # Priority 1: Pre-registered .breeze container file (instant load, 0 MB re-encoding)
+    if ref_breeze_file and os.path.exists(ref_breeze_file):
+        try:
+            v_data = load_breeze_voice(ref_breeze_file)
+            ref_codes = v_data["codes"]
+            ref_frames = v_data["frames"]
+            final_ref_text = v_data["text"]
+            source_desc = f"Pre-registered Voice Container (`{os.path.basename(ref_breeze_file)}`)"
+        except Exception as e:
+            return None, f"❌ Error loading .breeze file: {str(e)}"
+    elif ref_audio and os.path.exists(ref_audio):
+        if not ref_text.strip():
+            return None, "❌ Error: Exact verbatim reference transcript is required when using raw audio."
+        try:
+            cluster = get_cluster(model_path, current_lib_path)
+            ref_pcm = load_audio_24k(ref_audio)
+            ref_codes, ref_frames = cluster.encode_audio(ref_pcm, gpu_id=0)
+            final_ref_text = ref_text.strip()
+            source_desc = f"Raw Audio Sample (`{os.path.basename(ref_audio)}`)"
+        except Exception as e:
+            return None, f"❌ Error encoding reference audio: {str(e)}"
+    else:
+        return None, "❌ Error: Please provide either a registered .breeze voice container or an audio sample with transcript."
 
     stream_pcm = (delivery_mode != "Studio Master (Full Single-Pass, Zero Clicks)")
     out_dir = tempfile.mkdtemp(prefix="breeze_clone_")
 
     try:
         cluster = get_cluster(model_path, current_lib_path)
-        print(f"[Gradio Voice Clone] Encoding reference audio: {ref_audio}")
-        ref_pcm = load_audio_24k(ref_audio)
-        ref_codes, ref_frames = cluster.encode_audio(ref_pcm)
-        print(f"[Gradio Voice Clone] Reference voice encoded: {ref_frames} frames ({len(ref_codes)} tokens)")
-
         task = UserTask(
             id=int(time.time() * 1000) % 100000,
             text=text,
             instruction=instruction,
-            ref_text=ref_text.strip(),
+            ref_text=final_ref_text,
             ref_codes=ref_codes,
             ref_frames=ref_frames,
             cfg_scale=float(cfg_scale),
@@ -195,7 +287,7 @@ def voice_clone_generate(
         mode_label = "Studio Master (Full Single-Pass FP16)" if not stream_pcm else "Real-Time Streaming (32-frame chunks)"
         stats_msg = (
             f"✅ **Cloned Successfully** | {mode_label}\n\n"
-            f"• **Target Speaker**: Matched from reference audio ({os.path.basename(ref_audio)})\n"
+            f"• **Reference Voice**: {source_desc}\n"
             f"• **Audio Length**: {res.audio_s:.2f}s\n"
             f"• **Compute Time**: {res.compute_wall_s:.2f}s (Total: {wall:.2f}s)\n"
             f"• **Real-Time Factor (RTF)**: {res.rtf:.3f}x\n"
@@ -353,16 +445,34 @@ def build_app(default_model: str) -> gr.Blocks:
                             lines=3,
                             value="This is a test of zero-shot voice cloning with perfect speaker identity preservation."
                         )
-                        with gr.Row():
+                        
+                        with gr.Group():
+                            gr.Markdown("#### Option A: Use Pre-Registered Voice Container (`.breeze`) — Instant 0ms Load")
+                            clone_ref_breeze = gr.File(
+                                label="Upload .breeze Voice File",
+                                file_types=[".breeze"],
+                                type="filepath"
+                            )
+
+                        with gr.Group():
+                            gr.Markdown("#### Option B: Upload Raw Audio & Auto-Transcribe (GPU 1 ASR)")
                             clone_ref_audio = gr.Audio(
                                 label="Reference Voice Sample (4 to 7 seconds WAV/MP3 recommended)",
                                 type="filepath"
                             )
-                        clone_ref_text = gr.Textbox(
-                            label="Reference Transcript (Must be 100% exact verbatim transcript of reference audio)",
-                            placeholder="Type exactly what the speaker says in the reference audio clip...",
-                            lines=2
-                        )
+                            with gr.Row():
+                                clone_asr_btn = gr.Button("🎙️ Auto-Transcribe Audio (GPU 1 Whisper ASR)", variant="secondary")
+                            clone_ref_text = gr.Textbox(
+                                label="Reference Transcript (Must match verbatim. Click Auto-Transcribe or edit manually)",
+                                placeholder="Speaker verbatim transcript...",
+                                lines=2
+                            )
+                            clone_asr_btn.click(
+                                fn=transcribe_audio_sample,
+                                inputs=[clone_ref_audio],
+                                outputs=[clone_ref_text]
+                            )
+
                         clone_instruction = gr.Textbox(
                             label="Emotional Delivery Adjustment (Optional)",
                             placeholder="e.g., Speak with excitement and energy",
@@ -390,18 +500,65 @@ def build_app(default_model: str) -> gr.Blocks:
 
                     with gr.Column(scale=2):
                         clone_output_audio = gr.Audio(label="Cloned Speech Output (24 kHz)", type="filepath")
-                        clone_stats = gr.Markdown("Upload reference audio and transcript to begin.")
+                        clone_stats = gr.Markdown("Provide a registered `.breeze` voice container or upload reference audio to begin.")
 
                 clone_btn.click(
                     fn=voice_clone_generate,
                     inputs=[
-                        clone_text, clone_ref_audio, clone_ref_text, clone_instruction,
+                        clone_text, clone_ref_breeze, clone_ref_audio, clone_ref_text, clone_instruction,
                         clone_delivery, clone_cfg, clone_temp, clone_seed, clone_max, model_input
                     ],
                     outputs=[clone_output_audio, clone_stats]
                 )
 
-            # ---------------- TAB 3: SPEECH-TO-SPEECH CONVERSION ----------------
+            # ---------------- TAB 3: VOICE REGISTRATION & MANAGEMENT ----------------
+            with gr.TabItem("🎙️ Voice Registration & Management (.breeze)"):
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        gr.Markdown(
+                            """
+                            ### Human-in-the-Loop Voice Registration
+                            1. **Record or Upload** reference audio (4–10 seconds).
+                            2. **Click Auto-Transcribe** to run GPU 1 ASR (`faster-whisper-small`).
+                            3. **Review & Correct** transcript to ensure 100% phonetic accuracy.
+                            4. **Register**: Encodes reference tokens on GPU 0 and exports a portable `.breeze` container.
+                            """
+                        )
+                        reg_name = gr.Textbox(
+                            label="Voice Persona Name",
+                            placeholder="e.g. David Attenborough, Scarlett, Morgan...",
+                            value="My Speaker"
+                        )
+                        reg_audio = gr.Audio(
+                            label="Speaker Audio Sample (WAV / MP3, max 10s)",
+                            type="filepath"
+                        )
+                        with gr.Row():
+                            reg_asr_btn = gr.Button("🎙️ Auto-Transcribe Sample (GPU 1 Whisper ASR)", variant="secondary")
+                        reg_transcript = gr.Textbox(
+                            label="Verbatim Transcript (Human in the Loop Review)",
+                            placeholder="Transcript will appear here. Edit for any mistakes...",
+                            lines=3
+                        )
+                        reg_asr_btn.click(
+                            fn=transcribe_audio_sample,
+                            inputs=[reg_audio],
+                            outputs=[reg_transcript]
+                        )
+
+                        reg_btn = gr.Button("💾 Register Voice (.breeze)", variant="primary", size="lg")
+
+                    with gr.Column(scale=2):
+                        reg_file = gr.File(label="Exported .breeze Voice File (Download & Reuse)")
+                        reg_stats = gr.Markdown("Ready to register new voice persona.")
+
+                reg_btn.click(
+                    fn=register_voice_file,
+                    inputs=[reg_name, reg_audio, reg_transcript, model_input],
+                    outputs=[reg_file, reg_stats]
+                )
+
+            # ---------------- TAB 4: SPEECH-TO-SPEECH CONVERSION ----------------
             with gr.TabItem("🔄 Speech-to-Speech Voice Conversion (Mode 4)"):
                 with gr.Row():
                     with gr.Column(scale=3):
@@ -437,7 +594,7 @@ def build_app(default_model: str) -> gr.Blocks:
                     outputs=[conv_output_audio, conv_stats]
                 )
 
-            # ---------------- TAB 4: TELEMETRY & HARDWARE ----------------
+            # ---------------- TAB 5: TELEMETRY & HARDWARE ----------------
             with gr.TabItem("📊 Hardware & Precision Telemetry"):
                 gr.Markdown(
                     """

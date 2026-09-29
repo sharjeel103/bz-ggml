@@ -75,6 +75,22 @@ BREEZE_API int breeze_generator_step_frame(breeze_generator * gen, int cb0,
 BREEZE_API breeze_vocoder * breeze_vocoder_init(const char * gguf_path, int cuda_device);
 BREEZE_API void breeze_vocoder_free(breeze_vocoder * voc);
 
+// Create a vocoder sharing the generator's already-loaded base model (Zero duplicate weight VRAM!)
+BREEZE_API breeze_vocoder * breeze_vocoder_create_from_generator(breeze_generator * gen);
+
+// Stateful Vocoder Streaming Session API (Zero context overlap, bit-exact studio quality)
+BREEZE_API int breeze_vocoder_session_create(breeze_vocoder * voc, int session_id);
+BREEZE_API int breeze_vocoder_session_decode(breeze_vocoder * voc, int session_id,
+                                             const int * frames, int n_frames,
+                                             float * out_pcm);
+BREEZE_API int breeze_vocoder_session_decode_batch(breeze_vocoder * voc, int batch_size,
+                                                   const int * session_ids,
+                                                   const int * flat_tokens, const int * token_offsets,
+                                                   const int * n_frames_per_stream,
+                                                   float * flat_pcm, const int * pcm_offsets,
+                                                   int * out_n_samples);
+BREEZE_API int breeze_vocoder_session_free(breeze_vocoder * voc, int session_id);
+
 // Stream decode frame chunk (1 to N frames) into 24 kHz float PCM
 BREEZE_API int breeze_vocoder_stream_decode(breeze_vocoder * voc, const int * frames, 
                                             int n_frames, float * out_pcm);
@@ -156,6 +172,16 @@ BREEZE_API int breeze_generator_encode_audio(
     breeze_generator * gen,
     const float * pcm, int n_samples,
     int * out_codes, int * out_n_frames);
+
+// Voice Package (.breeze) Serialization API
+BREEZE_API int breeze_voice_save_file(
+    const char * path, const char * name, const char * text,
+    const int * codes, int n_frames, int n_codebooks, int sample_rate);
+
+BREEZE_API int breeze_voice_load_file(
+    const char * path, char * out_name, int name_max,
+    char * out_text, int text_max, int * out_codes,
+    int * out_n_frames, int * out_n_codebooks, int * out_sample_rate);
 
 #ifdef __cplusplus
 
