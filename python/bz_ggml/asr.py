@@ -40,9 +40,12 @@ class ASRService:
         model_size: str = "small",
         device: str = "cuda",
         device_index: int = 1,
+        cuda_device: Optional[int] = None,
         compute_type: str = "int8_float16",
         max_concurrent: int = 2
     ):
+        if cuda_device is not None:
+            device_index = cuda_device
         self.model_size = model_size
         self.device = device
         self.device_index = device_index
