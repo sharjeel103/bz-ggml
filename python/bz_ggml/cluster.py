@@ -176,13 +176,13 @@ class TieredSlotPool:
     80-Slot Tiered KV Cache Memory Pool for Zero-cudaMalloc Runtime.
       Tier 1: Short (up to 600 tokens / 30s audio, 56.25 MB/slot)
       Tier 2: Standard (up to 1,000 tokens / 1-min audio, 93.75 MB/slot - 50% pool)
-      Tier 3: Long (up to 1,800 tokens / 2-min audio, 168.75 MB/slot)
+      Tier 3: Long (up to 2,040 tokens / 2.5-min audio, 191.25 MB/slot)
     """
     def __init__(self, short_slots: int = 16, standard_slots: int = 24, long_slots: int = 56):
         self.tiers = {
             "short": {"capacity": 600, "total": short_slots, "free": list(range(1, short_slots + 1))},
             "standard": {"capacity": 1000, "total": standard_slots, "free": list(range(short_slots + 1, short_slots + standard_slots + 1))},
-            "long": {"capacity": 1800, "total": long_slots, "free": list(range(short_slots + standard_slots + 1, short_slots + standard_slots + long_slots + 1))}
+            "long": {"capacity": 2040, "total": long_slots, "free": list(range(short_slots + standard_slots + 1, short_slots + standard_slots + long_slots + 1))}
         }
         self.slot_to_tier = {}
         for tier_name, tier_info in self.tiers.items():
@@ -196,7 +196,7 @@ class TieredSlotPool:
                 tier_order = ["short", "standard", "long"]
             elif needed_tokens <= 1000:
                 tier_order = ["standard", "long"]
-            elif needed_tokens <= 1800:
+            elif needed_tokens <= 2040:
                 tier_order = ["long"]
             else:
                 tier_order = ["long"]
@@ -686,9 +686,11 @@ class DualInstanceCluster:
                         break
 
                     slot_id, slot_tier, slot_capacity = slot_res
-                    output_cap_frames = min(slot_capacity - profile["prefix_tokens"], profile["conservative_max"])
+                    max_slot_output = max(64, slot_capacity - profile["prefix_tokens"])
                     if hasattr(task_item, "max_steps") and task_item.max_steps > 0:
-                        output_cap_frames = min(output_cap_frames, task_item.max_steps)
+                        output_cap_frames = min(max_slot_output, task_item.max_steps)
+                    else:
+                        output_cap_frames = min(max_slot_output, profile["conservative_max"])
 
                     pending_item = None
                     t_exec_start = time.time()

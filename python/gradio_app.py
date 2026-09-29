@@ -634,7 +634,7 @@ def build_app() -> gr.Blocks:
                                 tts_cfg = gr.Slider(1.0, 3.0, value=1.0, step=0.1, label="CFG Guidance Scale (1.0 = Default, 1.5 = Enhanced)")
                                 tts_temp = gr.Slider(0.1, 1.2, value=0.25, step=0.05, label="Temperature")
                                 tts_seed = gr.Number(value=42, label="Random Seed")
-                                tts_max = gr.Slider(100, 2000, value=1000, step=50, label="Max Output Frames")
+                                tts_max = gr.Slider(100, 2040, value=1200, step=10, label="Max Output Frames (Up to 2,040 Hardware Limit)")
 
                         tts_btn = gr.Button("▶ Generate Audio", variant="primary", size="lg")
 
@@ -712,7 +712,7 @@ def build_app() -> gr.Blocks:
                                 clone_cfg = gr.Slider(1.0, 3.0, value=1.0, step=0.1, label="CFG Guidance Scale")
                                 clone_temp = gr.Slider(0.1, 1.2, value=0.25, step=0.05, label="Temperature")
                                 clone_seed = gr.Number(value=42, label="Random Seed")
-                                clone_max = gr.Slider(100, 2000, value=1000, step=50, label="Max Output Frames")
+                                clone_max = gr.Slider(100, 2040, value=1200, step=10, label="Max Output Frames (Up to 2,040 Hardware Limit)")
 
                         clone_btn = gr.Button("▶ Clone Voice & Synthesize", variant="primary", size="lg")
 
