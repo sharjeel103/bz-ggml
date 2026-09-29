@@ -631,7 +631,7 @@ def build_app() -> gr.Blocks:
 
                         with gr.Accordion("Advanced Generation Parameters", open=False):
                             with gr.Row():
-                                tts_cfg = gr.Slider(1.0, 3.0, value=1.0, step=0.1, label="CFG Guidance Scale (1.0 = Default, 1.5 = Enhanced)")
+                                tts_cfg = gr.Slider(1.0, 5.0, value=1.0, step=0.1, label="CFG Guidance Scale (1.0 = Pure TTS, 2.5 = (laugh)/(sigh), 4.0 = Voice Design)")
                                 tts_temp = gr.Slider(0.1, 1.2, value=0.25, step=0.05, label="Temperature")
                                 tts_seed = gr.Number(value=42, label="Random Seed")
                                 tts_max = gr.Slider(100, 2040, value=1200, step=10, label="Max Output Frames (Up to 2,040 Hardware Limit)")
@@ -709,7 +709,7 @@ def build_app() -> gr.Blocks:
 
                         with gr.Accordion("Advanced Voice Cloning Parameters", open=False):
                             with gr.Row():
-                                clone_cfg = gr.Slider(1.0, 3.0, value=1.0, step=0.1, label="CFG Guidance Scale")
+                                clone_cfg = gr.Slider(1.0, 5.0, value=1.0, step=0.1, label="CFG Guidance Scale (1.0 = Exact Clone, 4.0 = Emotional Steering/Voice Edit)")
                                 clone_temp = gr.Slider(0.1, 1.2, value=0.25, step=0.05, label="Temperature")
                                 clone_seed = gr.Number(value=42, label="Random Seed")
                                 clone_max = gr.Slider(100, 2040, value=1200, step=10, label="Max Output Frames (Up to 2,040 Hardware Limit)")
@@ -824,7 +824,7 @@ def build_app() -> gr.Blocks:
                                 0, 15, value=0, step=1,
                                 label="Keep Acoustic Codebooks (0=Full Transfer, 1..3=Keep Pitch/Melody)"
                             )
-                            conv_cfg = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="CFG Scale")
+                            conv_cfg = gr.Slider(1.0, 5.0, value=1.5, step=0.1, label="CFG Scale (1.5 = Standard, 2.0 = Enhanced Conversion, 4.0 = Strong Steering)")
                             conv_seed = gr.Number(value=42, label="Random Seed")
 
                         conv_btn = gr.Button("▶ Convert Speech", variant="primary", size="lg")
