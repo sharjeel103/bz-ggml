@@ -363,9 +363,6 @@ def tts_generate(
 def voice_clone_generate(
     text: str,
     selected_voice: str,
-    custom_breeze_file: Optional[str],
-    ref_audio: Optional[str],
-    ref_text: str,
     instruction: str,
     delivery_mode: str,
     cfg_scale: float,
@@ -377,41 +374,20 @@ def voice_clone_generate(
         yield gr.skip(), None, gr.update(visible=False), "❌ Error: Target text is empty."
         return
 
-    # Priority 1: Selected voice from pre-registered dropdown
+    # Look up selected voice from pre-registered dropdown
     voice_path = get_voice_file_path(selected_voice)
-    if voice_path:
+    if not voice_path:
+        yield gr.skip(), None, gr.update(visible=False), f"❌ Error: Voice persona '{selected_voice}' not found in registry."
+        return
+
+    try:
         v_data = load_breeze_voice(voice_path)
         ref_codes = v_data["codes"]
         ref_frames = v_data["frames"]
         final_ref_text = v_data["text"]
         source_desc = f"Pre-registered Voice (`{selected_voice}`)"
-    # Priority 2: Custom uploaded .breeze container file
-    elif custom_breeze_file and os.path.exists(custom_breeze_file):
-        try:
-            v_data = load_breeze_voice(custom_breeze_file)
-            ref_codes = v_data["codes"]
-            ref_frames = v_data["frames"]
-            final_ref_text = v_data["text"]
-            source_desc = f"Uploaded .breeze Container (`{os.path.basename(custom_breeze_file)}`)"
-        except Exception as e:
-            yield gr.skip(), None, gr.update(visible=False), f"❌ Error loading .breeze file: {str(e)}"
-            return
-    # Priority 3: Raw audio file + transcript
-    elif ref_audio and os.path.exists(ref_audio):
-        if not ref_text.strip():
-            yield gr.skip(), None, gr.update(visible=False), "❌ Error: Verbatim reference transcript is required when using raw audio."
-            return
-        try:
-            cluster = get_cluster()
-            ref_pcm = load_audio_24k(ref_audio)
-            ref_codes, ref_frames = cluster.encode_audio(ref_pcm, gpu_id=0)
-            final_ref_text = ref_text.strip()
-            source_desc = f"Raw Audio Sample (`{os.path.basename(ref_audio)}`)"
-        except Exception as e:
-            yield gr.skip(), None, gr.update(visible=False), f"❌ Error encoding reference audio: {str(e)}"
-            return
-    else:
-        yield gr.skip(), None, gr.update(visible=False), "❌ Error: Please select a registered voice, upload a .breeze file, or provide raw audio with transcript."
+    except Exception as e:
+        yield gr.skip(), None, gr.update(visible=False), f"❌ Error loading voice container: {str(e)}"
         return
 
     stream_pcm = (delivery_mode != "Studio Master (Full Single-Pass, Zero Clicks)")
@@ -545,14 +521,17 @@ def voice_convert_generate(
     else:
         return None, "Error: Please select a registered voice or provide target reference audio."
 
-    out_dir = tempfile.mkdtemp(prefix="breeze_conv_")
-
     try:
         cluster = get_cluster()
+        src_pcm = load_audio_24k(source_audio)
+        src_codes, src_frames = cluster.encode_audio(src_pcm, gpu_id=0)
+        if src_frames <= 0 or not src_codes:
+            return None, "❌ Error: Could not encode source audio frames."
+
         task = VoiceConversionTask(
             id=int(time.time() * 1000) % 100000,
-            src_codes=[],
-            src_frames=0,
+            src_codes=src_codes,
+            src_frames=src_frames,
             ref_codes=ref_codes,
             ref_frames=ref_frames,
             ref_text=final_ref_text,
@@ -567,8 +546,8 @@ def voice_convert_generate(
         if not audio_samples:
             return None, "Error: Voice conversion produced no samples."
 
+        out_wav = os.path.join(tempfile.gettempdir(), f"converted_voice_{task.id}.wav")
         import wave
-        out_wav = os.path.join(out_dir, f"converted_voice_{task.id}.wav")
         with wave.open(out_wav, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
@@ -577,9 +556,11 @@ def voice_convert_generate(
             pcm_int16 = (np.clip(pcm_np, -1.0, 1.0) * 32767.0).astype(np.int16)
             w.writeframes(pcm_int16.tobytes())
 
+        target_desc = selected_voice if voice_path else (os.path.basename(ref_audio) if ref_audio else "Reference Audio")
         stats_msg = (
             f"✅ **Voice Conversion Complete (Mode 4)**\n\n"
-            f"• **Audio Length**: {stats['audio_s']:.2f}s\n"
+            f"• **Source Audio**: `{os.path.basename(source_audio)}` ({src_frames * 0.08:.2f}s, {src_frames} frames)\n"
+            f"• **Target Persona**: `{target_desc}`\n"
             f"• **Wall Time**: {stats['compute_wall_s']:.2f}s (RTF: {stats['rtf']:.3f}x)\n"
             f"• **Acoustic Codebooks Kept**: {keep_acoustic}/15\n"
             f"• **Worker Island**: {stats['worker']}"
@@ -695,49 +676,20 @@ def build_app() -> gr.Blocks:
                             value="This is a demonstration of zero-shot voice cloning using pre-registered voice containers."
                         )
 
-                        with gr.Group():
-                            gr.Markdown("#### Option A: Select Pre-Registered Voice (Instant 0 ms Load)")
-                            with gr.Row():
-                                clone_voice_dropdown = gr.Dropdown(
-                                    choices=initial_voices,
-                                    value=initial_voices[0],
-                                    label="Registered Voice Persona",
-                                    scale=4
-                                )
-                                clone_refresh_btn = gr.Button("🔄", scale=1)
+                        with gr.Row():
+                            clone_voice_dropdown = gr.Dropdown(
+                                choices=initial_voices,
+                                value=initial_voices[0] if initial_voices else None,
+                                label="Voice Persona (From Voices Registry)",
+                                scale=4
+                            )
+                            clone_refresh_btn = gr.Button("🔄", scale=1)
 
-                            clone_refresh_btn.click(
-                                fn=lambda: gr.update(choices=list_saved_voices()),
-                                inputs=[],
-                                outputs=[clone_voice_dropdown]
-                            )
-
-                        with gr.Group():
-                            gr.Markdown("#### Option B: Upload External `.breeze` Voice File")
-                            clone_ref_breeze = gr.File(
-                                label="Upload .breeze Container",
-                                file_types=[".breeze"],
-                                type="filepath"
-                            )
-
-                        with gr.Group():
-                            gr.Markdown("#### Option C: Upload Raw Audio & Auto-Transcribe (GPU 1 ASR)")
-                            clone_ref_audio = gr.Audio(
-                                label="Reference Audio Sample (4 to 10 seconds)",
-                                type="filepath"
-                            )
-                            with gr.Row():
-                                clone_asr_btn = gr.Button("🎙️ Auto-Transcribe Audio (GPU 1 Whisper)", variant="secondary")
-                            clone_ref_text = gr.Textbox(
-                                label="Reference Transcript (Must match verbatim)",
-                                placeholder="Transcript will appear here...",
-                                lines=2
-                            )
-                            clone_asr_btn.click(
-                                fn=transcribe_audio_sample,
-                                inputs=[clone_ref_audio],
-                                outputs=[clone_ref_text]
-                            )
+                        clone_refresh_btn.click(
+                            fn=lambda: gr.update(choices=list_saved_voices()),
+                            inputs=[],
+                            outputs=[clone_voice_dropdown]
+                        )
 
                         clone_instruction = gr.Textbox(
                             label="Emotional Delivery Adjustment (Optional)",
@@ -780,13 +732,12 @@ def build_app() -> gr.Blocks:
                             file_types=[".wav"],
                             visible=False
                         )
-                        clone_stats = gr.Markdown("Select a registered voice or provide reference audio to begin.")
+                        clone_stats = gr.Markdown("Select a registered voice to begin.")
 
                 clone_btn.click(
                     fn=voice_clone_generate,
                     inputs=[
-                        clone_text, clone_voice_dropdown, clone_ref_breeze, clone_ref_audio,
-                        clone_ref_text, clone_instruction, clone_delivery,
+                        clone_text, clone_voice_dropdown, clone_instruction, clone_delivery,
                         clone_cfg, clone_temp, clone_seed, clone_max
                     ],
                     outputs=[clone_stream_audio, clone_master_audio, clone_download_file, clone_stats]

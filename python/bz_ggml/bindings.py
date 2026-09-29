@@ -406,8 +406,7 @@ class GeneratorHandle:
         )
 
         if res < 0:
-            err = self.lib.get_last_error()
-            raise RuntimeError(f"Voice conversion failed on Generator (device {self.device}): {err}")
+            raise RuntimeError(f"Voice conversion failed on Generator (device {self.device}): error code {res}")
 
         out_codes = list(c_out_codes)
         out_audio = list(c_out_pcm)[:res] if (return_pcm and c_out_pcm) else None
@@ -428,8 +427,7 @@ class GeneratorHandle:
             c_out_codes, ctypes.byref(c_out_n_frames)
         )
         if res < 0:
-            err = self.lib.get_last_error()
-            raise RuntimeError(f"Audio encoding failed on Generator (device {self.device}): {err}")
+            raise RuntimeError(f"Audio encoding failed on Generator (device {self.device}): error code {res}")
 
         n_frames = c_out_n_frames.value
         total_tokens = n_frames * 16
