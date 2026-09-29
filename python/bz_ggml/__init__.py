@@ -2,7 +2,11 @@
 bz-ggml: High-Performance C++ Inference Engine for Breeze-TTS-2 on Dual GPUs with GGML
 """
 
-from .bindings import BreezeLib, GeneratorHandle, VocoderHandle, load_breeze_voice, save_breeze_voice
+from .bindings import (
+    BreezeLib, GeneratorHandle, VocoderHandle,
+    load_breeze_voice, save_breeze_voice,
+    serialize_breeze_voice, deserialize_breeze_voice
+)
 from .cluster import DualInstanceCluster, ClusterResult, UserTask, VoiceConversionTask, estimate_conversion_profile
 from .telemetry import TelemetryProfiler
 ClusterTelemetry = TelemetryProfiler
@@ -20,5 +24,7 @@ __all__ = [
     "TelemetryProfiler",
     "ClusterTelemetry",
     "load_breeze_voice",
-    "save_breeze_voice"
+    "save_breeze_voice",
+    "serialize_breeze_voice",
+    "deserialize_breeze_voice"
 ]

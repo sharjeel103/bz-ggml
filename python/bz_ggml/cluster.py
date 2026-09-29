@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import numpy as np
 
-from .bindings import BreezeLib, GeneratorHandle, VocoderHandle
+from .bindings import BreezeLib, GeneratorHandle, VocoderHandle, serialize_breeze_voice, deserialize_breeze_voice
 
 @dataclass
 class UserTask:
@@ -361,6 +361,14 @@ class DualInstanceCluster:
         finally:
             self.audio_encoder_pool.release()
 
+    def encode_voice_container(self, pcm_samples: List[float], transcript: str, gpu_id: int = 0) -> bytes:
+        """
+        Encodes 24 kHz mono float32 audio samples on GPU 0 and returns portable in-memory .breeze bytes.
+        Does not touch the filesystem; caller handles persistence (to local disk, cloud bucket, etc.).
+        """
+        codes, frames = self.encode_audio(pcm_samples, gpu_id=gpu_id)
+        return serialize_breeze_voice(text=transcript.strip(), codes=codes, frames=frames)
+
     def convert_voice_task(
         self,
         task: VoiceConversionTask,
@@ -443,6 +451,7 @@ class DualInstanceCluster:
         out_dir: str = "audio_out",
         arrival_delays: Optional[List[float]] = None,
         on_progress: Optional[Callable[[ClusterResult], None]] = None,
+        on_pcm_chunk: Optional[Callable[[int, np.ndarray, bool], None]] = None,
         quantum_frames: int = 16,
         max_slots_per_gpu: Optional[int] = 64,
         vocoder_chunk_size: int = 32,
@@ -540,6 +549,8 @@ class DualInstanceCluster:
                                     user_audio_results[u_id]["samples"].extend(samples)
                                     if user_audio_results[u_id]["first_audio_time"] is None:
                                         user_audio_results[u_id]["first_audio_time"] = time.time()
+                                if on_pcm_chunk and len(samples) > 0:
+                                    on_pcm_chunk(u_id, np.array(samples, dtype=np.float32), False)
 
                     # Process EOS completions
                     for it in batch_items:
@@ -549,6 +560,8 @@ class DualInstanceCluster:
                             u_id, words, arr_time, t_start, frames_list, is_first, is_eos, total_frames, worker_tag = it
                         if is_eos:
                             voc_handle.session_free(u_id)
+                            if on_pcm_chunk:
+                                on_pcm_chunk(u_id, np.array([], dtype=np.float32), True)
                             t_end = time.time()
                             with user_audio_lock:
                                 u_rec = user_audio_results.get(u_id, {})

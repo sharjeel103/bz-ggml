@@ -29,11 +29,20 @@ class ASRWorkerPool:
         self.semaphore.release()
 
 
+def format_srt_time(seconds: float) -> str:
+    millis = int(round((seconds - int(seconds)) * 1000))
+    s = int(seconds) % 60
+    m = (int(seconds) // 60) % 60
+    h = int(seconds) // 3600
+    return f"{h:02d}:{m:02d}:{s:02d},{millis:03d}"
+
+
 class ASRService:
     """
     Dedicated Speech-to-Text Micro-Service using faster-whisper.
     Pinned strictly to GPU 1 (or CPU fallback) with bounded concurrency.
     Memory Footprint: ~288 MiB weights + ~106 MiB scratchpad (small int8_float16).
+    Constant VRAM scaling across 5-second to 2-hour audio via 30s sliding window.
     """
     def __init__(
         self,
@@ -76,11 +85,14 @@ class ASRService:
         audio: Union[str, np.ndarray, List[float]],
         language: str = "en",
         beam_size: int = 1,
-        timeout: Optional[float] = 15.0
-    ) -> str:
+        vad_filter: bool = True,
+        return_subtitles: bool = False,
+        timeout: Optional[float] = 30.0
+    ) -> Union[str, Tuple[str, str, List[dict]]]:
         """
-        Transcribes speech audio into verified text.
+        Transcribes speech audio into verified text with optional timestamped subtitles.
         Acquires semaphore before execution to strictly guarantee max 2 concurrent jobs on GPU 1.
+        VRAM usage is constant (~288 MiB) regardless of audio duration.
         """
         self._ensure_model_loaded()
 
@@ -90,7 +102,6 @@ class ASRService:
 
         t0 = time.time()
         try:
-            # Handle float list / numpy
             if isinstance(audio, list):
                 audio = np.array(audio, dtype=np.float32)
 
@@ -98,11 +109,34 @@ class ASRService:
                 audio,
                 beam_size=beam_size,
                 language=language,
-                temperature=0.0
+                temperature=0.0,
+                vad_filter=vad_filter
             )
-            text_segments = [s.text.strip() for s in segments]
+
+            seg_list = []
+            text_segments = []
+            srt_lines = []
+
+            for idx, s in enumerate(segments, start=1):
+                clean_text = s.text.strip()
+                if clean_text:
+                    text_segments.append(clean_text)
+                    seg_list.append({
+                        "id": idx,
+                        "start": round(s.start, 3),
+                        "end": round(s.end, 3),
+                        "text": clean_text
+                    })
+                    srt_lines.append(f"{idx}\n{format_srt_time(s.start)} --> {format_srt_time(s.end)}\n{clean_text}\n")
+
             transcript = " ".join(text_segments).strip()
-            print(f"[ASR Service] Transcribed in {(time.time()-t0)*1000:.1f}ms: \"{transcript}\"")
+            srt_content = "\n".join(srt_lines).strip()
+
+            dur = info.duration if hasattr(info, "duration") else 0.0
+            print(f"[ASR Service] Transcribed {dur:.1f}s audio in {(time.time()-t0)*1000:.1f}ms: \"{transcript[:60]}...\"")
+
+            if return_subtitles:
+                return transcript, srt_content, seg_list
             return transcript
         finally:
             self.pool.release()

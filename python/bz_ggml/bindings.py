@@ -580,35 +580,48 @@ class VocoderHandle:
         self.close()
 
 
+def serialize_breeze_voice(text: str, codes: List[int], frames: int, sample_rate: int = 24000, n_codebooks: int = 16) -> bytes:
+    """Serializes reference voice codes and transcript into in-memory BRZV binary container bytes."""
+    import struct
+    text_bytes = text.strip().encode("utf-8")
+    header = b"BRZV" + struct.pack("<5I", 1, sample_rate, n_codebooks, frames, len(text_bytes))
+    return header + text_bytes + struct.pack(f"<{len(codes)}i", *codes)
+
+
+def deserialize_breeze_voice(data: bytes) -> dict:
+    """Deserializes binary BRZV container bytes into a python dictionary."""
+    import struct
+    import io
+    bio = io.BytesIO(data)
+    magic = bio.read(4)
+    if magic != b"BRZV":
+        raise ValueError(f"Invalid voice file magic: {magic}")
+    version, sample_rate, n_codebooks, frames, text_len = struct.unpack("<5I", bio.read(20))
+    text = bio.read(text_len).decode("utf-8")
+    codes = list(struct.unpack(f"<{frames * n_codebooks}i", bio.read()))
+    return {
+        "text": text,
+        "codes": codes,
+        "frames": frames,
+        "sample_rate": sample_rate,
+        "n_codebooks": n_codebooks
+    }
+
+
 def load_breeze_voice(path: str) -> dict:
     """Loads a pre-encoded .breeze voice file into memory for instant zero-shot cloning."""
-    import struct
     with open(path, "rb") as f:
-        magic = f.read(4)
-        if magic != b"BRZV":
-            raise ValueError(f"Invalid voice file magic: {magic} in {path}")
-        version, sample_rate, n_codebooks, frames, text_len = struct.unpack("<5I", f.read(20))
-        text = f.read(text_len).decode("utf-8")
-        codes = list(struct.unpack(f"<{frames * n_codebooks}i", f.read()))
-        return {
-            "name": os.path.basename(path).replace(".breeze", ""),
-            "text": text,
-            "codes": codes,
-            "frames": frames,
-            "sample_rate": sample_rate,
-            "n_codebooks": n_codebooks
-        }
+        data = f.read()
+    res = deserialize_breeze_voice(data)
+    res["name"] = os.path.basename(path).replace(".breeze", "")
+    return res
 
 
 def save_breeze_voice(path: str, text: str, codes: List[int], frames: int, sample_rate: int = 24000, n_codebooks: int = 16) -> str:
-    """Saves reference voice codes and transcript into a standard .breeze container."""
-    import struct
-    text_bytes = text.encode("utf-8")
+    """Saves reference voice codes and transcript into a standard .breeze container file."""
+    raw_bytes = serialize_breeze_voice(text, codes, frames, sample_rate, n_codebooks)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "wb") as f:
-        f.write(b"BRZV")
-        f.write(struct.pack("<5I", 1, sample_rate, n_codebooks, frames, len(text_bytes)))
-        f.write(text_bytes)
-        f.write(struct.pack(f"<{len(codes)}i", *codes))
+        f.write(raw_bytes)
     return path
 
