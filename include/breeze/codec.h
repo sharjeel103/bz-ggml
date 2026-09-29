@@ -9,7 +9,11 @@ namespace breeze {
 
 struct MimiCodec {
     BreezeModel * m = nullptr;
-    void init(BreezeModel & model) { m = &model; }
+    Backend * be_override = nullptr;
+    void init(BreezeModel & model, Backend * backend = nullptr) {
+        m = &model;
+        be_override = backend;
+    }
 
     // codes frame-major [f * n_cb + cb]; n_cb 0 means the full set. fewer codebooks drops detail,
     // 1 leaves only the semantic stage

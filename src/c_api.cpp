@@ -196,10 +196,12 @@ struct VocoderStreamSession {
 
 struct breeze_vocoder {
     breeze::BreezeModel model;
+    breeze::Backend backend;
     breeze::MimiCodec codec;
     int device = 1;
     bool codec_init = false;
     bool owns_model = true;
+    std::mutex voc_mutex;
     std::unordered_map<int, std::unique_ptr<VocoderStreamSession>> sessions;
 };
 
@@ -969,7 +971,8 @@ breeze_vocoder * breeze_vocoder_create_from_generator(breeze_generator * gen) {
     if (!gen) return nullptr;
     breeze_vocoder * voc = new breeze_vocoder();
     voc->device = gen->device;
-    voc->codec.init(gen->model);
+    voc->backend.init_device(gen->device);
+    voc->codec.init(gen->model, &voc->backend);
     voc->codec_init = true;
     voc->owns_model = false;
     return voc;
@@ -977,7 +980,9 @@ breeze_vocoder * breeze_vocoder_create_from_generator(breeze_generator * gen) {
 
 void breeze_vocoder_free(breeze_vocoder * voc) {
     if (!voc) return;
+    std::lock_guard<std::mutex> lock(voc->voc_mutex);
     voc->sessions.clear();
+    voc->backend.free();
     if (voc->owns_model) {
         voc->model.free();
     }
@@ -986,6 +991,7 @@ void breeze_vocoder_free(breeze_vocoder * voc) {
 
 int breeze_vocoder_session_create(breeze_vocoder * voc, int session_id) {
     if (!voc) return -1;
+    std::lock_guard<std::mutex> lock(voc->voc_mutex);
     auto sess = std::make_unique<VocoderStreamSession>();
     sess->session_id = session_id;
     sess->total_frames = 0;
@@ -998,6 +1004,7 @@ int breeze_vocoder_session_decode(breeze_vocoder * voc, int session_id,
                                  const int * frames, int n_frames,
                                  float * out_pcm) {
     if (!voc || !frames || n_frames <= 0 || !out_pcm) return 0;
+    std::lock_guard<std::mutex> lock(voc->voc_mutex);
     try {
         auto it = voc->sessions.find(session_id);
         if (it == voc->sessions.end() || !it->second) {
@@ -1062,6 +1069,7 @@ int breeze_vocoder_session_decode_batch(breeze_vocoder * voc, int batch_size,
                                        float * flat_pcm, const int * pcm_offsets,
                                        int * out_n_samples) {
     if (!voc || batch_size <= 0 || !session_ids || !flat_tokens || !n_frames_per_stream || !flat_pcm) return 0;
+    std::lock_guard<std::mutex> lock(voc->voc_mutex);
     try {
         const int nc = voc->codec.m ? voc->codec.m->cfg.num_codebooks : 16;
         const int spf = 1920;
@@ -1154,6 +1162,7 @@ int breeze_vocoder_session_decode_batch(breeze_vocoder * voc, int batch_size,
 
 int breeze_vocoder_session_free(breeze_vocoder * voc, int session_id) {
     if (!voc) return -1;
+    std::lock_guard<std::mutex> lock(voc->voc_mutex);
     auto it = voc->sessions.find(session_id);
     if (it != voc->sessions.end()) {
         voc->sessions.erase(it);
@@ -1165,6 +1174,7 @@ int breeze_vocoder_session_free(breeze_vocoder * voc, int session_id) {
 int breeze_vocoder_stream_decode(breeze_vocoder * voc, const int * frames, 
                                  int n_frames, float * out_pcm) {
     if (!voc || !frames || n_frames <= 0 || !out_pcm) return 0;
+    std::lock_guard<std::mutex> lock(voc->voc_mutex);
     try {
         const int nc = voc->codec.m ? voc->codec.m->cfg.num_codebooks : 16;
         std::vector<int> sub(frames, frames + n_frames * nc);
@@ -1183,6 +1193,7 @@ int breeze_vocoder_stream_decode_batch(breeze_vocoder * voc, int batch_size,
                                       float * flat_pcm, const int * pcm_offsets,
                                       int * out_n_samples) {
     if (!voc || batch_size <= 0 || !flat_tokens || !n_frames_per_stream || !flat_pcm) return 0;
+    std::lock_guard<std::mutex> lock(voc->voc_mutex);
     try {
         const int nc = voc->codec.m ? voc->codec.m->cfg.num_codebooks : 16;
         std::vector<std::vector<int>> batch_codes(batch_size);

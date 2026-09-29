@@ -17,7 +17,8 @@ std::vector<float> MimiCodec::decode(const std::vector<int> & codes, int T, int 
     Graph g(32768);
     ggml_tensor * x = vocoder_decode(g.ctx, *m, g, codes, n_cb, T);
     ggml_tensor * audio = ggml_cont(g.ctx, ggml_reshape_1d(g.ctx, x, x->ne[0]));
-    g.compute(m->backend, audio);
+    Backend & be = be_override ? *be_override : m->backend;
+    g.compute(be, audio);
     return tensor_to_f32(audio);
 }
 
@@ -47,7 +48,8 @@ std::vector<std::vector<float>> MimiCodec::decode_batch(
         }
     }
 
-    g.compute(m->backend, audio_nodes.back());
+    Backend & be = be_override ? *be_override : m->backend;
+    g.compute(be, audio_nodes.back());
 
     std::vector<std::vector<float>> results(B);
     for (int b = 0; b < B; b++) {
