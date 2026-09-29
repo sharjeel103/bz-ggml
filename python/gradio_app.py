@@ -200,6 +200,11 @@ def register_voice_file(
         with open(breeze_path, "wb") as f:
             f.write(container_bytes)
 
+        # Also create tempfile copy for Gradio file widget serving
+        temp_export = os.path.join(tempfile.gettempdir(), breeze_filename)
+        with open(temp_export, "wb") as f:
+            f.write(container_bytes)
+
         # Read back container metadata for display
         meta = deserialize_breeze_voice(container_bytes)
         file_kb = len(container_bytes) / 1024.0
@@ -210,13 +215,13 @@ def register_voice_file(
             f"• **Acoustic Frames**: {meta['frames']} ({meta['frames'] * 0.08:.2f}s reference audio)\n"
             f"• **Discrete Tokens**: {len(meta['codes'])} tokens (16 codebooks @ 12.5 Hz)\n"
             f"• **Encode Time**: {enc_time:.2f}s (Pinned to GPU 0 Reference Encoder Pool)\n"
-            f"• **Saved To**: `{breeze_path}` ({file_kb:.1f} KB)\n"
+            f"• **Saved In Registry**: `{breeze_path}` ({file_kb:.1f} KB)\n"
             f"• **Instant Availability**: Now selectable in all Cloning & TTS dropdowns with 0 ms load!"
         )
 
         updated_choices = list_saved_voices()
         return (
-            breeze_path,
+            temp_export,
             msg,
             gr.update(choices=updated_choices, value=voice_name.strip().title()),
             gr.update(choices=updated_choices, value=voice_name.strip().title())
@@ -798,12 +803,40 @@ def main():
 
     os.makedirs(APP_CONFIG["voices_dir"], exist_ok=True)
 
+    print("⏳ Pre-warming cluster engine & ASR service...")
+    try:
+        get_cluster()
+        print("   ✅ DualInstanceCluster initialized & ready.")
+    except Exception as e:
+        print(f"   ⚠️ Cluster initialization deferred/failed: {e}")
+
+    try:
+        get_asr_service()
+        print("   ✅ Whisper ASR initialized & ready.")
+    except Exception as e:
+        print(f"   ⚠️ ASR initialization deferred/failed: {e}")
+
     demo = build_app()
     print(f"\n🚀 Launching Breeze-TTS Studio on http://{args.host}:{args.port}")
     print(f"   • Model: {APP_CONFIG['model_path']}")
     print(f"   • Voices Registry: {os.path.abspath(APP_CONFIG['voices_dir'])}")
     print(f"   • ASR Device: CUDA:{APP_CONFIG['asr_device']}")
-    demo.launch(server_name=args.host, server_port=args.port, share=args.share)
+
+    allowed_dirs = [
+        os.path.abspath(APP_CONFIG["voices_dir"]),
+        tempfile.gettempdir(),
+        os.getcwd()
+    ]
+    if os.path.exists("/kaggle/working/data"):
+        allowed_dirs.append(os.path.abspath("/kaggle/working/data"))
+    allowed_dirs = list(set([d for d in allowed_dirs if os.path.exists(d)]))
+
+    demo.launch(
+        server_name=args.host,
+        server_port=args.port,
+        share=args.share,
+        allowed_paths=allowed_dirs
+    )
 
 
 if __name__ == "__main__":
