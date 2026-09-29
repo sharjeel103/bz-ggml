@@ -2,7 +2,7 @@ import os
 import threading
 import queue
 import time
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Tuple
 import numpy as np
 
 class ASRWorkerPool:
