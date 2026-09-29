@@ -242,9 +242,9 @@ def tts_generate(
     temperature: float,
     seed: int,
     max_steps: int
-) -> Generator[Tuple[Any, Any, str], None, None]:
+) -> Generator[Tuple[Any, Any, Any, str], None, None]:
     if not text.strip():
-        yield gr.skip(), gr.update(visible=False), "❌ Error: Text input is empty."
+        yield gr.skip(), None, gr.update(visible=False), "❌ Error: Text input is empty."
         return
 
     ref_codes = None
@@ -302,7 +302,7 @@ def tts_generate(
         total_samples = 0
         chunk_count = 0
 
-        yield gr.skip(), gr.update(visible=False), f"⏳ Synthesizing audio on Dual GPU Islands ({mode_label})..."
+        yield gr.skip(), None, gr.update(visible=False), f"⏳ Synthesizing audio on Dual GPU Islands ({mode_label})..."
 
         while True:
             try:
@@ -326,7 +326,7 @@ def tts_generate(
                     f"• **Chunk #{chunk_count}**: {len(pcm_i16)} samples (32 frames @ 24 kHz)\n"
                     f"• **Elapsed Time**: {elapsed:.2f}s"
                 )
-                yield (24000, pcm_i16), gr.update(visible=False), status_text
+                yield (24000, pcm_i16), gr.skip(), gr.skip(), status_text
 
             elif msg_type == "EOS":
                 pass
@@ -347,25 +347,17 @@ def tts_generate(
                         f"• **Worker Island**: {res.worker}\n"
                         f"• **Master File**: `{os.path.basename(master_wav)}` ({os.path.getsize(master_wav)/1024:.1f} KB)"
                     )
-
-                    if not stream_pcm:
-                        import wave
-                        with wave.open(master_wav, "rb") as wf:
-                            frames = wf.readframes(wf.getnframes())
-                            full_i16 = np.frombuffer(frames, dtype=np.int16)
-                        yield (24000, full_i16), gr.update(value=master_wav, visible=True), stats_msg
-                    else:
-                        yield gr.skip(), gr.update(value=master_wav, visible=True), stats_msg
+                    yield gr.skip(), master_wav, gr.update(value=master_wav, visible=True), stats_msg
                 else:
-                    yield gr.skip(), gr.update(visible=False), "❌ Error: Generation returned no audio."
+                    yield gr.skip(), None, gr.update(visible=False), "❌ Error: Generation returned no audio."
                 break
 
             elif msg_type == "ERROR":
-                yield gr.skip(), gr.update(visible=False), f"❌ Error during synthesis: {str(extra)}"
+                yield gr.skip(), None, gr.update(visible=False), f"❌ Error during synthesis: {str(extra)}"
                 break
 
     except Exception as e:
-        yield gr.skip(), gr.update(visible=False), f"❌ Error during synthesis: {str(e)}"
+        yield gr.skip(), None, gr.update(visible=False), f"❌ Error during synthesis: {str(e)}"
 
 
 def voice_clone_generate(
@@ -380,9 +372,9 @@ def voice_clone_generate(
     temperature: float,
     seed: int,
     max_steps: int
-) -> Generator[Tuple[Any, Any, str], None, None]:
+) -> Generator[Tuple[Any, Any, Any, str], None, None]:
     if not text.strip():
-        yield gr.skip(), gr.update(visible=False), "❌ Error: Target text is empty."
+        yield gr.skip(), None, gr.update(visible=False), "❌ Error: Target text is empty."
         return
 
     # Priority 1: Selected voice from pre-registered dropdown
@@ -402,12 +394,12 @@ def voice_clone_generate(
             final_ref_text = v_data["text"]
             source_desc = f"Uploaded .breeze Container (`{os.path.basename(custom_breeze_file)}`)"
         except Exception as e:
-            yield gr.skip(), gr.update(visible=False), f"❌ Error loading .breeze file: {str(e)}"
+            yield gr.skip(), None, gr.update(visible=False), f"❌ Error loading .breeze file: {str(e)}"
             return
     # Priority 3: Raw audio file + transcript
     elif ref_audio and os.path.exists(ref_audio):
         if not ref_text.strip():
-            yield gr.skip(), gr.update(visible=False), "❌ Error: Verbatim reference transcript is required when using raw audio."
+            yield gr.skip(), None, gr.update(visible=False), "❌ Error: Verbatim reference transcript is required when using raw audio."
             return
         try:
             cluster = get_cluster()
@@ -416,10 +408,10 @@ def voice_clone_generate(
             final_ref_text = ref_text.strip()
             source_desc = f"Raw Audio Sample (`{os.path.basename(ref_audio)}`)"
         except Exception as e:
-            yield gr.skip(), gr.update(visible=False), f"❌ Error encoding reference audio: {str(e)}"
+            yield gr.skip(), None, gr.update(visible=False), f"❌ Error encoding reference audio: {str(e)}"
             return
     else:
-        yield gr.skip(), gr.update(visible=False), "❌ Error: Please select a registered voice, upload a .breeze file, or provide raw audio with transcript."
+        yield gr.skip(), None, gr.update(visible=False), "❌ Error: Please select a registered voice, upload a .breeze file, or provide raw audio with transcript."
         return
 
     stream_pcm = (delivery_mode != "Studio Master (Full Single-Pass, Zero Clicks)")
@@ -465,7 +457,7 @@ def voice_clone_generate(
         total_samples = 0
         chunk_count = 0
 
-        yield gr.skip(), gr.update(visible=False), f"⏳ Synthesizing cloned voice on Dual GPU Islands ({mode_label})..."
+        yield gr.skip(), None, gr.update(visible=False), f"⏳ Synthesizing cloned voice on Dual GPU Islands ({mode_label})..."
 
         while True:
             try:
@@ -489,7 +481,7 @@ def voice_clone_generate(
                     f"• **Chunk #{chunk_count}**: {len(pcm_i16)} samples (32 frames @ 24 kHz)\n"
                     f"• **Elapsed Time**: {elapsed:.2f}s"
                 )
-                yield (24000, pcm_i16), gr.update(visible=False), status_text
+                yield (24000, pcm_i16), gr.skip(), gr.skip(), status_text
 
             elif msg_type == "EOS":
                 pass
@@ -510,25 +502,17 @@ def voice_clone_generate(
                         f"• **Worker Island**: {res.worker}\n"
                         f"• **Master File**: `{os.path.basename(master_wav)}` ({os.path.getsize(master_wav)/1024:.1f} KB)"
                     )
-
-                    if not stream_pcm:
-                        import wave
-                        with wave.open(master_wav, "rb") as wf:
-                            frames = wf.readframes(wf.getnframes())
-                            full_i16 = np.frombuffer(frames, dtype=np.int16)
-                        yield (24000, full_i16), gr.update(value=master_wav, visible=True), stats_msg
-                    else:
-                        yield gr.skip(), gr.update(value=master_wav, visible=True), stats_msg
+                    yield gr.skip(), master_wav, gr.update(value=master_wav, visible=True), stats_msg
                 else:
-                    yield gr.skip(), gr.update(visible=False), "❌ Error: Voice cloning returned no audio."
+                    yield gr.skip(), None, gr.update(visible=False), "❌ Error: Voice cloning returned no audio."
                 break
 
             elif msg_type == "ERROR":
-                yield gr.skip(), gr.update(visible=False), f"❌ Error during voice cloning: {str(extra)}"
+                yield gr.skip(), None, gr.update(visible=False), f"❌ Error during voice cloning: {str(extra)}"
                 break
 
     except Exception as e:
-        yield gr.skip(), gr.update(visible=False), f"❌ Error during voice cloning: {str(e)}"
+        yield gr.skip(), None, gr.update(visible=False), f"❌ Error during voice cloning: {str(e)}"
 
 
 def voice_convert_generate(
@@ -674,14 +658,18 @@ def build_app() -> gr.Blocks:
                         tts_btn = gr.Button("▶ Generate Audio", variant="primary", size="lg")
 
                     with gr.Column(scale=2):
-                        tts_output_audio = gr.Audio(
-                            label="Live Audio Stream (24 kHz)",
+                        tts_stream_audio = gr.Audio(
+                            label="🔊 Live Audio Stream (Real-Time Playback)",
                             streaming=True,
-                            autoplay=True,
+                            autoplay=True
+                        )
+                        tts_master_audio = gr.Audio(
+                            label="🎵 Complete Master Audio Recording (Seekable Waveform & Replay)",
+                            type="filepath",
                             show_download_button=True
                         )
                         tts_download_file = gr.File(
-                            label="Download Master WAV (Full File)",
+                            label="Download Master WAV (Single-File)",
                             file_types=[".wav"],
                             visible=False
                         )
@@ -693,7 +681,7 @@ def build_app() -> gr.Blocks:
                         tts_text, tts_instruction, tts_voice_dropdown, tts_delivery,
                         tts_cfg, tts_temp, tts_seed, tts_max
                     ],
-                    outputs=[tts_output_audio, tts_download_file, tts_stats]
+                    outputs=[tts_stream_audio, tts_master_audio, tts_download_file, tts_stats]
                 )
 
             # ---------------- TAB 2: ZERO-SHOT VOICE CLONING ----------------
@@ -777,14 +765,18 @@ def build_app() -> gr.Blocks:
                         clone_btn = gr.Button("▶ Clone Voice & Synthesize", variant="primary", size="lg")
 
                     with gr.Column(scale=2):
-                        clone_output_audio = gr.Audio(
-                            label="Live Cloned Speech Stream (24 kHz)",
+                        clone_stream_audio = gr.Audio(
+                            label="🔊 Live Cloned Speech Stream (Real-Time Playback)",
                             streaming=True,
-                            autoplay=True,
+                            autoplay=True
+                        )
+                        clone_master_audio = gr.Audio(
+                            label="🎵 Complete Master Audio Recording (Seekable Waveform & Replay)",
+                            type="filepath",
                             show_download_button=True
                         )
                         clone_download_file = gr.File(
-                            label="Download Master Cloned WAV (Full File)",
+                            label="Download Master Cloned WAV (Single-File)",
                             file_types=[".wav"],
                             visible=False
                         )
@@ -797,7 +789,7 @@ def build_app() -> gr.Blocks:
                         clone_ref_text, clone_instruction, clone_delivery,
                         clone_cfg, clone_temp, clone_seed, clone_max
                     ],
-                    outputs=[clone_output_audio, clone_download_file, clone_stats]
+                    outputs=[clone_stream_audio, clone_master_audio, clone_download_file, clone_stats]
                 )
 
             # ---------------- TAB 3: VOICE REGISTRATION & MANAGEMENT ----------------
