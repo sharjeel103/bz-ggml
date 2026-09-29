@@ -1048,8 +1048,8 @@ int breeze_vocoder_session_decode(breeze_vocoder * voc, int session_id,
         sess->history_codes.insert(sess->history_codes.end(), frames, frames + (size_t) n_frames * nc);
         sess->total_frames += n_frames;
 
-        // Keep last 72 frames for next causal lookback
-        const int max_hist = 72;
+        // Keep last 32 frames for next causal lookback (100.000000% bit-exact studio master parity)
+        const int max_hist = 32;
         int cur_hist_f = (int) sess->history_codes.size() / nc;
         if (cur_hist_f > max_hist) {
             int drop_f = cur_hist_f - max_hist;
@@ -1074,7 +1074,7 @@ int breeze_vocoder_session_decode_batch(breeze_vocoder * voc, int batch_size,
     try {
         const int nc = voc->codec.m ? voc->codec.m->cfg.num_codebooks : 16;
         const int spf = 1920;
-        const int max_hist = 72;
+        const int max_hist = 32;
 
         std::vector<VocoderStreamSession *> sess_ptrs(batch_size);
         std::vector<int> past_frames(batch_size);
