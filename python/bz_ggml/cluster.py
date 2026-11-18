@@ -57,6 +57,10 @@ class ClusterResult:
     wav_path: str
     tokens: Optional[List[int]] = None
 
+    @property
+    def audio_path(self) -> str:
+        return self.wav_path
+
 
 def estimate_conversion_profile(
     src_frames: int,

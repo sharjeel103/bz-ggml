@@ -9,8 +9,33 @@ class BreezeLib:
 
     def __init__(self, lib_path: Optional[str] = None):
         self.lib_path = self._resolve_lib_path(lib_path)
-        self.lib = ctypes.CDLL(self.lib_path)
+        self._preload_companion_libs()
+        self.lib = ctypes.CDLL(self.lib_path, mode=ctypes.RTLD_GLOBAL)
         self._bind_functions()
+
+    def _preload_companion_libs(self):
+        """Preloads GGML companion shared libraries with RTLD_GLOBAL to avoid dynamic linker lookup failures."""
+        lib_dir = os.path.dirname(os.path.abspath(self.lib_path))
+        companion_names = [
+            "libggml-base.so",
+            "libggml-cpu.so",
+            "libggml-cuda.so",
+            "libggml.so",
+        ]
+        search_dirs = [
+            lib_dir,
+            os.path.join(lib_dir, "lib"),
+            os.path.join(lib_dir, "third_party", "ggml", "src"),
+            os.path.join(lib_dir, "third_party", "ggml", "src", "ggml-cuda"),
+        ]
+        for s_dir in search_dirs:
+            for c_name in companion_names:
+                candidate = os.path.join(s_dir, c_name)
+                if os.path.exists(candidate):
+                    try:
+                        ctypes.CDLL(candidate, mode=ctypes.RTLD_GLOBAL)
+                    except Exception:
+                        pass
 
     def _resolve_lib_path(self, user_path: Optional[str]) -> str:
         candidates = []
