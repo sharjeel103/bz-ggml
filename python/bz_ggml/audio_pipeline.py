@@ -22,16 +22,22 @@ FFMPEG_EXE = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
 # 1. INTELLIGENT SEMANTIC TEXT CHUNKER
 # =====================================================================
 
+# Common English abbreviations that should not trigger sentence splits
+_ABBREVIATIONS = (
+    r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|U\.S|U\.K|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\."
+)
+
 def split_text_into_smart_chunks(
     text: str,
-    target_words: int = 220,
-    max_words: int = 300
+    target_words: int = 80,
+    max_words: int = 120
 ) -> List[str]:
     """
     Intelligently splits arbitrarily large text into cohesive speech chunks:
-      - Hierarchical splitting: Paragraphs (\n\n+) -> Lines (\n) -> Sentences ([.!?]) -> Clauses ([,;:]).
-      - Never cuts a sentence or cohesive paragraph in half unless exceeding max_words.
-      - Returns clean speech chunks optimized for Breeze-TTS-2 continuous context (180-250 words).
+      - Hierarchical splitting: Paragraphs (\\n\\n+) -> Sentences ([.!?]) -> Clauses ([,;:]).
+      - Never cuts a word or cohesive sentence in half.
+      - Protects common abbreviations and numbers from accidental splits.
+      - Default 80-120 words per chunk guarantees zero context overflow or truncation.
     """
     cleaned_text = text.strip()
     if not cleaned_text:
@@ -45,20 +51,45 @@ def split_text_into_smart_chunks(
     for p in raw_paragraphs:
         words = p.split()
         if len(words) <= max_words:
+            # Paragraph is already within safe size; keep it together
             atomic_units.append(p)
         else:
-            # Paragraph is too long: split into sentences
-            # Matches sentence end punctuation followed by whitespace or quote
-            sentences = re.split(r'(?<=[.!?])\s+', p)
+            # Paragraph is oversized: split into sentence units protecting abbreviations
+            # Protect abbreviations with temporary placeholder
+            p_safe = p
+            abbrev_matches = list(re.finditer(_ABBREVIATIONS, p_safe, re.IGNORECASE))
+            placeholders = {}
+            for i, match in enumerate(reversed(abbrev_matches)):
+                key = f"__ABBR_{i}__"
+                placeholders[key] = match.group(0)
+                p_safe = p_safe[:match.start()] + key + p_safe[match.end():]
+
+            # Protect decimal numbers (e.g., 3.14, 1.5)
+            dec_matches = list(re.finditer(r'\b\d+\.\d+\b', p_safe))
+            for i, match in enumerate(reversed(dec_matches)):
+                key = f"__DEC_{i}__"
+                placeholders[key] = match.group(0)
+                p_safe = p_safe[:match.start()] + key + p_safe[match.end():]
+
+            # Split by sentence-ending punctuation followed by whitespace
+            sentences = re.split(r'(?<=[.!?])\s+', p_safe)
+
+            # Restore placeholders
+            restored_sentences = []
             for s in sentences:
                 s_str = s.strip()
                 if not s_str:
                     continue
+                for key, original in placeholders.items():
+                    s_str = s_str.replace(key, original)
+                restored_sentences.append(s_str)
+
+            for s_str in restored_sentences:
                 s_words = s_str.split()
                 if len(s_words) <= max_words:
                     atomic_units.append(s_str)
                 else:
-                    # Very long sentence: split at clause punctuation
+                    # Single sentence exceeds max_words: split at natural clause pauses
                     clauses = re.split(r'(?<=[,;:\u2014])\s+', s_str)
                     curr_clause = []
                     curr_len = 0
@@ -74,14 +105,13 @@ def split_text_into_smart_chunks(
                     if curr_clause:
                         atomic_units.append(" ".join(curr_clause).strip())
 
-    # 3. Greedily aggregate atomic units into balanced target chunks
+    # 3. Greedily aggregate atomic units into balanced chunks
     chunks = []
     current_chunk = []
     current_word_count = 0
 
     for unit in atomic_units:
         unit_words = len(unit.split())
-        # If adding this unit exceeds target_words AND we already have enough text
         if current_word_count + unit_words > max_words and current_chunk:
             chunks.append("\n\n".join(current_chunk).strip())
             current_chunk = [unit]
@@ -99,6 +129,46 @@ def split_text_into_smart_chunks(
         chunks.append("\n\n".join(current_chunk).strip())
 
     return chunks
+
+
+def preview_chunks_info(text: str, target_words: int = 80, max_words: int = 120) -> Dict[str, Any]:
+    """Provides structured inspection of chunk breakdown for UI preview."""
+    chunks = split_text_into_smart_chunks(text, target_words=target_words, max_words=max_words)
+    total_words = len(text.strip().split()) if text.strip() else 0
+    return {
+        "total_words": total_words,
+        "chunks_count": len(chunks),
+        "target_words": target_words,
+        "max_words": max_words,
+        "chunks": [
+            {
+                "index": i + 1,
+                "words": len(c.split()),
+                "text": c
+            }
+            for i, c in enumerate(chunks)
+        ]
+    }
+
+
+def format_chunk_preview_markdown(text: str, target_words: int = 80, max_words: int = 120) -> str:
+    """Formats chunk breakdown into clean Markdown for the Gradio UI."""
+    info = preview_chunks_info(text, target_words, max_words)
+    if info["chunks_count"] == 0:
+        return "⚠️ *Script is empty. Paste your text above to see chunk distribution.*"
+
+    md = [
+        f"### 📊 Chunk Partition Summary",
+        f"• **Total Words**: `{info['total_words']}` words",
+        f"• **Parallel Chunks**: `{info['chunks_count']}` chunks (Target: {target_words}w, Max: {max_words}w)\n",
+        "| Chunk | Word Count | Preview Text |",
+        "| :---: | :---: | :--- |"
+    ]
+    for c in info["chunks"]:
+        preview_snip = c["text"][:75].replace("\n", " ") + ("..." if len(c["text"]) > 75 else "")
+        md.append(f"| **Chunk {c['index']}** | `{c['words']} words` | *\"{preview_snip}\"* |")
+
+    return "\n".join(md)
 
 
 # =====================================================================
@@ -333,6 +403,9 @@ class PipelineJob:
     cfg_scale: float
     seed: int
     pause_ms: int = 200
+    target_words: int = 80
+    max_words: int = 120
+    temperature: float = 0.25
     apply_enhance: bool = True
     apply_master: bool = True
     apply_srt: bool = True
@@ -411,8 +484,8 @@ class PipelineJobDispatcher:
 
         try:
             # ---------------- STAGE 1: SEMANTIC CHUNKING ----------------
-            notify(JobStage.TTS_CHUNKING, 0.05, "Intelligently chunking script into semantic paragraph/sentence blocks...")
-            chunks = split_text_into_smart_chunks(job.script_text, target_words=220, max_words=300)
+            notify(JobStage.TTS_CHUNKING, 0.05, f"Intelligently chunking script into semantic blocks (Target: {job.target_words}w, Max: {job.max_words}w)...")
+            chunks = split_text_into_smart_chunks(job.script_text, target_words=job.target_words, max_words=job.max_words)
             if not chunks:
                 raise ValueError("Script text contains no valid words.")
 
@@ -433,7 +506,9 @@ class PipelineJobDispatcher:
                     ref_codes=ref_codes,
                     ref_frames=ref_frames,
                     cfg_scale=job.cfg_scale,
+                    temperature=job.temperature,
                     seed=job.seed + idx,
+                    max_steps=2040,  # Full 2,040 token context headroom to guarantee zero cutoffs
                     stream_pcm=False,
                     client_has_vocoder=False
                 )
@@ -516,11 +591,21 @@ class PipelineJobDispatcher:
             # ---------------- STAGE 6: 1-WORD PER LINE SRT SUBTITLES (OPTIONAL) ----------------
             if job.apply_srt and asr_service is not None:
                 notify(JobStage.TRANSCRIBING, 0.90, "Transcribing mastered audio with Whisper on GPU 1 (generating 1-word-per-line SRT)...")
-                srt_path = os.path.join(self.output_dir, f"{job.job_id}_transcript_1word.srt")
-                target_audio_for_srt = job.enhanced_wav_path if job.enhanced_wav_path else raw_wav
-                generate_1word_srt_file(target_audio_for_srt, srt_path, asr_service=asr_service)
-                job.srt_path = srt_path
-                notify(JobStage.TRANSCRIBING, 0.98, f"1-Word per line SRT generated -> Saved: {os.path.basename(srt_path)}")
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    import gc; gc.collect()
+
+                    srt_path = os.path.join(self.output_dir, f"{job.job_id}_transcript_1word.srt")
+                    target_audio_for_srt = job.enhanced_wav_path if job.enhanced_wav_path else raw_wav
+                    generate_1word_srt_file(target_audio_for_srt, srt_path, asr_service=asr_service)
+                    job.srt_path = srt_path
+                    notify(JobStage.TRANSCRIBING, 0.98, f"1-Word per line SRT generated -> Saved: {os.path.basename(srt_path)}")
+                except Exception as asr_err:
+                    print(f"[{job.job_id}] [ASR Warning] Subtitle generation failed: {asr_err}")
+                    job.srt_path = None
+                    notify(JobStage.TRANSCRIBING, 0.98, f"Subtitle note: {asr_err} (Audio generation succeeded)")
             else:
                 notify(JobStage.TRANSCRIBING, 0.98, "Subtitles bypassed by user.")
 

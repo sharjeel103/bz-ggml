@@ -28,7 +28,8 @@ from bz_ggml.audio_pipeline import (
     split_text_into_smart_chunks, stitch_audio_chunks,
     apply_resemble_enhancer, apply_studio_normalization,
     convert_to_mp3_256k, generate_1word_srt_file,
-    PipelineJob, PipelineJobDispatcher, JobStage
+    PipelineJob, PipelineJobDispatcher, JobStage,
+    format_chunk_preview_markdown
 )
 
 import gradio as gr
@@ -44,7 +45,7 @@ APP_CONFIG: Dict[str, Any] = {
     "voices_dir": "data/voices",
     "outputs_dir": "/kaggle/working/data/outputs" if os.path.exists("/kaggle/working") else "data/outputs",
     "asr_device": 1,
-    "asr_model": "small"
+    "asr_model": "base.en"
 }
 
 cluster_instance: Optional[DualInstanceCluster] = None
@@ -90,7 +91,7 @@ def get_asr_service() -> ASRService:
         asr_service_instance = ASRService(
             model_size=APP_CONFIG["asr_model"],
             cuda_device=APP_CONFIG["asr_device"],
-            compute_type="int8_float16"
+            compute_type="float16"
         )
     return asr_service_instance
 
@@ -594,14 +595,17 @@ def run_longform_pipeline_ui(
     selected_voice: str,
     instruction: str,
     cfg_scale: float,
+    temperature: float,
     seed: int,
     pause_ms: int,
+    target_words: int,
+    max_words: int,
     apply_enhance: bool,
     apply_master: bool,
     apply_srt: bool
-) -> Generator[Tuple[str, Optional[str], Optional[str], Optional[str], Any], None, None]:
+) -> Generator[Tuple[str, Optional[str], Optional[str], Optional[str], Any, Any, Any, Any], None, None]:
     if not script_text.strip():
-        yield "❌ Error: Script text is empty.", None, None, "", gr.skip()
+        yield "❌ Error: Script text is empty.", None, None, "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.skip()
         return
 
     dispatcher = get_dispatcher()
@@ -625,8 +629,11 @@ def run_longform_pipeline_ui(
         voice_name=selected_voice,
         instruction=instruction,
         cfg_scale=float(cfg_scale),
+        temperature=float(temperature),
         seed=int(seed),
         pause_ms=int(pause_ms),
+        target_words=int(target_words),
+        max_words=int(max_words),
         apply_enhance=bool(apply_enhance),
         apply_master=bool(apply_master),
         apply_srt=bool(apply_srt)
@@ -641,7 +648,8 @@ def run_longform_pipeline_ui(
             "log": updated_job.status_log,
             "raw_mp3": updated_job.raw_mp3_path,
             "enhanced_mp3": updated_job.enhanced_mp3_path,
-            "srt_path": updated_job.srt_path
+            "srt_path": updated_job.srt_path,
+            "job": updated_job
         })
 
     def worker_thread():
@@ -657,7 +665,7 @@ def run_longform_pipeline_ui(
             )
             update_queue.put({"stage": "completed", "job": job})
         except Exception as e:
-            update_queue.put({"stage": "failed", "error": str(e)})
+            update_queue.put({"stage": "failed", "error": str(e), "job": job})
 
     thread = threading.Thread(target=worker_thread, daemon=True)
     thread.start()
@@ -673,7 +681,7 @@ def run_longform_pipeline_ui(
             stage = item.get("stage")
 
             if stage == "completed":
-                done_job = item["job"]
+                done_job = item.get("job", job)
                 saved_files = dispatcher.get_saved_files()
                 final_srt_content = ""
                 if done_job.srt_path and os.path.exists(done_job.srt_path):
@@ -691,12 +699,31 @@ def run_longform_pipeline_ui(
                     f"• **Mastered Voiceover**: `{os.path.basename(done_job.enhanced_mp3_path) if done_job.enhanced_mp3_path else 'N/A'}` (Broadcast Standard)\n"
                     f"• **Word Subtitles**: `{os.path.basename(done_job.srt_path) if done_job.srt_path else 'Disabled'}`"
                 )
-                yield summary, done_job.raw_mp3_path, done_job.enhanced_mp3_path, final_srt_content, saved_files
+                yield (
+                    summary,
+                    done_job.raw_mp3_path,
+                    done_job.enhanced_mp3_path,
+                    final_srt_content,
+                    gr.update(value=done_job.enhanced_mp3_path, visible=bool(done_job.enhanced_mp3_path)),
+                    gr.update(value=done_job.raw_mp3_path, visible=bool(done_job.raw_mp3_path)),
+                    gr.update(value=done_job.srt_path, visible=bool(done_job.srt_path and os.path.exists(done_job.srt_path))),
+                    saved_files
+                )
                 break
 
             elif stage == "failed":
                 err = item.get("error", "Unknown error")
-                yield f"❌ **Pipeline Failed**: {err}", None, None, "", dispatcher.get_saved_files()
+                failed_job = item.get("job", job)
+                yield (
+                    f"❌ **Pipeline Note**: {err}",
+                    failed_job.raw_mp3_path,
+                    failed_job.enhanced_mp3_path,
+                    "",
+                    gr.update(value=failed_job.enhanced_mp3_path, visible=bool(failed_job.enhanced_mp3_path)),
+                    gr.update(value=failed_job.raw_mp3_path, visible=bool(failed_job.raw_mp3_path)),
+                    gr.update(visible=False),
+                    dispatcher.get_saved_files()
+                )
                 break
 
             else:
@@ -709,7 +736,16 @@ def run_longform_pipeline_ui(
                     with open(item["srt_path"], "r", encoding="utf-8") as f:
                         srt_text_val = f.read()
 
-                yield f"⏳ **Status**: {last_log}", raw_mp3_val, enh_mp3_val, srt_text_val, gr.skip()
+                yield (
+                    f"⏳ **Status**: {last_log}",
+                    raw_mp3_val,
+                    enh_mp3_val,
+                    srt_text_val,
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.skip()
+                )
 
         except queue.Empty:
             if not thread.is_alive():
@@ -779,8 +815,22 @@ def build_app() -> gr.Blocks:
 
                         with gr.Row():
                             lf_cfg = gr.Slider(1.0, 5.0, value=1.5, step=0.1, label="CFG Guidance Scale (1.0 = Clean, 4.0 = Expressive)")
+                            lf_temp = gr.Slider(0.05, 1.2, value=0.25, step=0.05, label="Temperature (Sampling Randomness)")
                             lf_seed = gr.Number(value=42, label="Base Random Seed", precision=0)
                             lf_pause = gr.Slider(100, 600, value=200, step=25, label="Inter-Chunk Breath Pause (ms)")
+
+                        with gr.Accordion("✂️ Intelligent Chunking Controls & Visual Preview", open=True):
+                            with gr.Row():
+                                lf_target_words = gr.Slider(30, 200, value=80, step=5, label="Target Words per Chunk (Ideal: 70-90w)")
+                                lf_max_words = gr.Slider(50, 250, value=120, step=5, label="Max Words per Chunk (Ceiling: 120-150w)")
+                            lf_preview_btn = gr.Button("🔍 Preview Chunks & Word Breakdown")
+                            lf_preview_box = gr.Markdown("Paste or type your script above and click **Preview Chunks** to inspect how the parser partitions your text.")
+
+                        lf_preview_btn.click(
+                            fn=lambda text, tw, mw: format_chunk_preview_markdown(text, target_words=int(tw), max_words=int(mw)),
+                            inputs=[lf_script, lf_target_words, lf_max_words],
+                            outputs=[lf_preview_box]
+                        )
 
                         gr.Markdown("#### 🎛️ Post-Processing & Mastering Controls")
                         with gr.Row():
@@ -794,7 +844,12 @@ def build_app() -> gr.Blocks:
                         lf_status_box = gr.Markdown("Ready to process script.")
                         lf_audio_raw = gr.Audio(label="1️⃣ Raw Stitched Voiceover (256k MP3)", type="filepath")
                         lf_audio_mastered = gr.Audio(label="2️⃣ Enhanced & Mastered Voiceover (256k MP3)", type="filepath")
-                        lf_srt_box = gr.Textbox(label="3️⃣ 1-Word per Line SRT Subtitles Preview", lines=6)
+                        lf_srt_box = gr.Textbox(label="3️⃣ 1-Word per Line SRT Subtitles Preview", lines=7)
+
+                        with gr.Row():
+                            lf_down_mastered = gr.DownloadButton("📥 Download Mastered MP3 (256k)", visible=False, variant="primary")
+                            lf_down_raw = gr.DownloadButton("📥 Download Raw MP3", visible=False)
+                            lf_down_srt = gr.DownloadButton("📥 Download 1-Word SRT", visible=False)
 
                         gr.Markdown("### 📂 Saved Deliverables History")
                         lf_history_refresh = gr.Button("🔄 Refresh Saved Files")
@@ -813,11 +868,14 @@ def build_app() -> gr.Blocks:
                     fn=run_longform_pipeline_ui,
                     inputs=[
                         lf_script, lf_voice_dropdown, lf_instruction,
-                        lf_cfg, lf_seed, lf_pause,
+                        lf_cfg, lf_temp, lf_seed, lf_pause,
+                        lf_target_words, lf_max_words,
                         lf_chk_enhance, lf_chk_master, lf_chk_srt
                     ],
                     outputs=[
-                        lf_status_box, lf_audio_raw, lf_audio_mastered, lf_srt_box, lf_history_files
+                        lf_status_box, lf_audio_raw, lf_audio_mastered, lf_srt_box,
+                        lf_down_mastered, lf_down_raw, lf_down_srt,
+                        lf_history_files
                     ]
                 )
 
@@ -1145,6 +1203,7 @@ def main():
     APP_CONFIG["asr_model"] = args.asr_model
 
     os.makedirs(APP_CONFIG["voices_dir"], exist_ok=True)
+    os.makedirs(APP_CONFIG["outputs_dir"], exist_ok=True)
 
     print("⏳ Pre-warming cluster engine & ASR service...")
     try:
@@ -1171,8 +1230,12 @@ def main():
         tempfile.gettempdir(),
         os.getcwd()
     ]
+    if os.path.exists("/kaggle/working"):
+        allowed_dirs.append(os.path.abspath("/kaggle/working"))
     if os.path.exists("/kaggle/working/data"):
         allowed_dirs.append(os.path.abspath("/kaggle/working/data"))
+    if os.path.exists("/kaggle/working/data/outputs"):
+        allowed_dirs.append(os.path.abspath("/kaggle/working/data/outputs"))
     allowed_dirs = list(set([d for d in allowed_dirs if os.path.exists(d)]))
 
     demo.queue(default_concurrency_limit=10)

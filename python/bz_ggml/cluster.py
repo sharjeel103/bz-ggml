@@ -16,8 +16,9 @@ class UserTask:
     text: str
     instruction: str = "Speak clearly and naturally."
     cfg_scale: float = 1.0
+    temperature: float = 0.25
     seed: int = 42
-    max_steps: int = 1000
+    max_steps: int = 2040
     ref_text: Optional[str] = None
     ref_codes: Optional[List[int]] = None
     ref_frames: int = 0
