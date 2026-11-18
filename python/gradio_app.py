@@ -24,6 +24,12 @@ from bz_ggml import (
     serialize_breeze_voice, deserialize_breeze_voice
 )
 from bz_ggml.asr import ASRService
+from bz_ggml.audio_pipeline import (
+    split_text_into_smart_chunks, stitch_audio_chunks,
+    apply_resemble_enhancer, apply_studio_normalization,
+    convert_to_mp3_256k, generate_1word_srt_file,
+    PipelineJob, PipelineJobDispatcher, JobStage
+)
 
 import gradio as gr
 
@@ -36,12 +42,24 @@ APP_CONFIG: Dict[str, Any] = {
     "q4_threshold": 10,
     "vocoder_mode": "on",
     "voices_dir": "data/voices",
+    "outputs_dir": "/kaggle/working/data/outputs" if os.path.exists("/kaggle/working") else "data/outputs",
     "asr_device": 1,
     "asr_model": "small"
 }
 
 cluster_instance: Optional[DualInstanceCluster] = None
 asr_service_instance: Optional[ASRService] = None
+dispatcher_instance: Optional[PipelineJobDispatcher] = None
+
+
+def get_dispatcher() -> PipelineJobDispatcher:
+    """Initializes or returns the singleton PipelineJobDispatcher."""
+    global dispatcher_instance
+    if dispatcher_instance is None:
+        out_dir = APP_CONFIG.get("outputs_dir", "data/outputs")
+        os.makedirs(out_dir, exist_ok=True)
+        dispatcher_instance = PipelineJobDispatcher(output_dir=out_dir)
+    return dispatcher_instance
 
 
 def get_cluster() -> DualInstanceCluster:
@@ -227,10 +245,11 @@ def register_voice_file(
             temp_export,
             msg,
             gr.update(choices=updated_choices, value=voice_name.strip().title()),
+            gr.update(choices=updated_choices, value=voice_name.strip().title()),
             gr.update(choices=updated_choices, value=voice_name.strip().title())
         )
     except Exception as e:
-        return None, f"❌ Voice Registration Failed: {str(e)}", gr.update(), gr.update()
+        return None, f"❌ Voice Registration Failed: {str(e)}", gr.update(), gr.update(), gr.update()
 
 
 def tts_generate(
@@ -570,6 +589,133 @@ def voice_convert_generate(
         return None, f"❌ Error during voice conversion: {str(e)}"
 
 
+def run_longform_pipeline_ui(
+    script_text: str,
+    selected_voice: str,
+    instruction: str,
+    cfg_scale: float,
+    seed: int,
+    pause_ms: int,
+    apply_enhance: bool,
+    apply_master: bool,
+    apply_srt: bool
+) -> Generator[Tuple[str, Optional[str], Optional[str], Optional[str], Any], None, None]:
+    if not script_text.strip():
+        yield "❌ Error: Script text is empty.", None, None, "", gr.skip()
+        return
+
+    dispatcher = get_dispatcher()
+    cluster = get_cluster()
+    asr = get_asr_service() if apply_srt else None
+
+    ref_codes = None
+    ref_frames = 0
+    ref_text = None
+    voice_path = get_voice_file_path(selected_voice)
+    if voice_path:
+        v_data = load_breeze_voice(voice_path)
+        ref_codes = v_data["codes"]
+        ref_frames = v_data["frames"]
+        ref_text = v_data["text"]
+
+    job_id = f"prod_{int(time.time() * 1000)}"
+    job = PipelineJob(
+        job_id=job_id,
+        script_text=script_text.strip(),
+        voice_name=selected_voice,
+        instruction=instruction,
+        cfg_scale=float(cfg_scale),
+        seed=int(seed),
+        pause_ms=int(pause_ms),
+        apply_enhance=bool(apply_enhance),
+        apply_master=bool(apply_master),
+        apply_srt=bool(apply_srt)
+    )
+
+    update_queue = queue.Queue()
+
+    def progress_callback(updated_job: PipelineJob):
+        update_queue.put({
+            "stage": updated_job.stage.value,
+            "progress": updated_job.progress,
+            "log": updated_job.status_log,
+            "raw_mp3": updated_job.raw_mp3_path,
+            "enhanced_mp3": updated_job.enhanced_mp3_path,
+            "srt_path": updated_job.srt_path
+        })
+
+    def worker_thread():
+        try:
+            dispatcher.run_pipeline(
+                job=job,
+                cluster=cluster,
+                asr_service=asr,
+                ref_text=ref_text,
+                ref_codes=ref_codes,
+                ref_frames=ref_frames,
+                update_callback=progress_callback
+            )
+            update_queue.put({"stage": "completed", "job": job})
+        except Exception as e:
+            update_queue.put({"stage": "failed", "error": str(e)})
+
+    thread = threading.Thread(target=worker_thread, daemon=True)
+    thread.start()
+
+    last_log = "🚀 Dispatching Long-Form Production Pipeline..."
+    raw_mp3_val = None
+    enh_mp3_val = None
+    srt_text_val = ""
+
+    while True:
+        try:
+            item = update_queue.get(timeout=0.25)
+            stage = item.get("stage")
+
+            if stage == "completed":
+                done_job = item["job"]
+                saved_files = dispatcher.get_saved_files()
+                final_srt_content = ""
+                if done_job.srt_path and os.path.exists(done_job.srt_path):
+                    with open(done_job.srt_path, "r", encoding="utf-8") as f:
+                        final_srt_content = f.read()
+
+                mins = int(done_job.total_audio_s // 60)
+                secs = int(done_job.total_audio_s % 60)
+                summary = (
+                    f"🎉 **Production Pipeline Completed Successfully!**\n\n"
+                    f"• **Job ID**: `{done_job.job_id}`\n"
+                    f"• **Cohesive Chunks**: {done_job.chunks_completed} chunks synthesized concurrently across Dual GPUs\n"
+                    f"• **Total Audio**: {done_job.total_audio_s:.2f}s ({mins}m {secs}s)\n"
+                    f"• **Raw Voiceover**: `{os.path.basename(done_job.raw_mp3_path) if done_job.raw_mp3_path else 'N/A'}` (256k MP3)\n"
+                    f"• **Mastered Voiceover**: `{os.path.basename(done_job.enhanced_mp3_path) if done_job.enhanced_mp3_path else 'N/A'}` (Broadcast Standard)\n"
+                    f"• **Word Subtitles**: `{os.path.basename(done_job.srt_path) if done_job.srt_path else 'Disabled'}`"
+                )
+                yield summary, done_job.raw_mp3_path, done_job.enhanced_mp3_path, final_srt_content, saved_files
+                break
+
+            elif stage == "failed":
+                err = item.get("error", "Unknown error")
+                yield f"❌ **Pipeline Failed**: {err}", None, None, "", dispatcher.get_saved_files()
+                break
+
+            else:
+                last_log = item.get("log", last_log)
+                if item.get("raw_mp3"):
+                    raw_mp3_val = item["raw_mp3"]
+                if item.get("enhanced_mp3"):
+                    enh_mp3_val = item["enhanced_mp3"]
+                if item.get("srt_path") and os.path.exists(item["srt_path"]):
+                    with open(item["srt_path"], "r", encoding="utf-8") as f:
+                        srt_text_val = f.read()
+
+                yield f"⏳ **Status**: {last_log}", raw_mp3_val, enh_mp3_val, srt_text_val, gr.skip()
+
+        except queue.Empty:
+            if not thread.is_alive():
+                break
+
+
 def build_app() -> gr.Blocks:
     custom_css = """
     .gradio-container { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -588,6 +734,93 @@ def build_app() -> gr.Blocks:
         )
 
         with gr.Tabs():
+            # ---------------- TAB 0: LONG-FORM PRODUCTION PIPELINE ----------------
+            with gr.TabItem("🎬 Long-Form Studio (Auto-Chunk, Multi-GPU Parallel & Mastering)"):
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        gr.Markdown(
+                            """
+                            ### 🎬 Long-Form Script Engine & Studio Mastering
+                            *Unlimited Length Scripts • Semantic Chunking • Dual-GPU Continuous Batching • Resemble Enhancer • Studio Broadcast Normalization • 1-Word SRT*
+                            """
+                        )
+                        lf_script = gr.Textbox(
+                            label="Full Script to Synthesize (Unlimited Length)",
+                            placeholder="Paste your long-form script here (articles, documentary scripts, stories)... It will be chunked intelligently at natural paragraph and sentence boundaries.",
+                            lines=10,
+                            value=(
+                                "Welcome to the full production pipeline demonstration.\n\n"
+                                "Our system features an autonomous dual-island architecture with zero PCIe bottlenecks. "
+                                "Each Tesla T4 GPU operates its own resident generator and dedicated streaming vocoder in VRAM.\n\n"
+                                "When long scripts are submitted, the intelligent semantic chunker partitions the text into cohesive "
+                                "speech units without ever slicing sentences or paragraphs in half. All chunks are dispatched concurrently "
+                                "across both GPUs using multi-session continuous batching, saturating hardware capacity for maximum throughput."
+                            )
+                        )
+                        with gr.Row():
+                            lf_voice_dropdown = gr.Dropdown(
+                                choices=initial_voices,
+                                value=initial_voices[0],
+                                label="Voice Persona (From Voices Registry)",
+                                scale=4
+                            )
+                            lf_refresh_voice = gr.Button("🔄", scale=1)
+
+                        lf_refresh_voice.click(
+                            fn=lambda: gr.update(choices=list_saved_voices()),
+                            inputs=[],
+                            outputs=[lf_voice_dropdown]
+                        )
+
+                        lf_instruction = gr.Textbox(
+                            label="Speaker Style / Narration Direction",
+                            value="Speak with natural clarity, warm authoritative pacing, and professional broadcast presence."
+                        )
+
+                        with gr.Row():
+                            lf_cfg = gr.Slider(1.0, 5.0, value=1.5, step=0.1, label="CFG Guidance Scale (1.0 = Clean, 4.0 = Expressive)")
+                            lf_seed = gr.Number(value=42, label="Base Random Seed", precision=0)
+                            lf_pause = gr.Slider(100, 600, value=200, step=25, label="Inter-Chunk Breath Pause (ms)")
+
+                        gr.Markdown("#### 🎛️ Post-Processing & Mastering Controls")
+                        with gr.Row():
+                            lf_chk_enhance = gr.Checkbox(value=True, label="✨ Apply Resemble Enhancer (44.1 kHz Denoise & Upsample)")
+                            lf_chk_master = gr.Checkbox(value=True, label="🎚️ Apply Gentle Studio Mastering (swift_history Winning Preset)")
+                            lf_chk_srt = gr.Checkbox(value=True, label="📝 Generate 1-Word per Line SRT Subtitles")
+
+                        lf_submit_btn = gr.Button("🚀 Dispatch Long-Form Production Pipeline", variant="primary", size="lg")
+
+                    with gr.Column(scale=2):
+                        lf_status_box = gr.Markdown("Ready to process script.")
+                        lf_audio_raw = gr.Audio(label="1️⃣ Raw Stitched Voiceover (256k MP3)", type="filepath")
+                        lf_audio_mastered = gr.Audio(label="2️⃣ Enhanced & Mastered Voiceover (256k MP3)", type="filepath")
+                        lf_srt_box = gr.Textbox(label="3️⃣ 1-Word per Line SRT Subtitles Preview", lines=6)
+
+                        gr.Markdown("### 📂 Saved Deliverables History")
+                        lf_history_refresh = gr.Button("🔄 Refresh Saved Files")
+                        lf_history_files = gr.File(
+                            label="Download Output Files (.mp3 / .srt)",
+                            file_count="multiple",
+                            value=get_dispatcher().get_saved_files()
+                        )
+                        lf_history_refresh.click(
+                            fn=lambda: get_dispatcher().get_saved_files(),
+                            inputs=[],
+                            outputs=[lf_history_files]
+                        )
+
+                lf_submit_btn.click(
+                    fn=run_longform_pipeline_ui,
+                    inputs=[
+                        lf_script, lf_voice_dropdown, lf_instruction,
+                        lf_cfg, lf_seed, lf_pause,
+                        lf_chk_enhance, lf_chk_master, lf_chk_srt
+                    ],
+                    outputs=[
+                        lf_status_box, lf_audio_raw, lf_audio_mastered, lf_srt_box, lf_history_files
+                    ]
+                )
+
             # ---------------- TAB 1: TEXT-TO-SPEECH & VOICE DESIGN ----------------
             with gr.TabItem("✨ Text-to-Speech & Voice Design"):
                 with gr.Row():
@@ -787,7 +1020,7 @@ def build_app() -> gr.Blocks:
                 reg_btn.click(
                     fn=register_voice_file,
                     inputs=[reg_name, reg_audio, reg_transcript],
-                    outputs=[reg_file, reg_stats, tts_voice_dropdown, clone_voice_dropdown]
+                    outputs=[reg_file, reg_stats, tts_voice_dropdown, clone_voice_dropdown, lf_voice_dropdown]
                 )
 
             # ---------------- TAB 4: SPEECH-TO-SPEECH CONVERSION ----------------
@@ -934,6 +1167,7 @@ def main():
 
     allowed_dirs = [
         os.path.abspath(APP_CONFIG["voices_dir"]),
+        os.path.abspath(APP_CONFIG["outputs_dir"]),
         tempfile.gettempdir(),
         os.getcwd()
     ]
