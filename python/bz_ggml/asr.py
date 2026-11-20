@@ -30,6 +30,17 @@ class ASRWorkerPool:
         self.semaphore.release()
 
 
+def _resample_to_16k(data: np.ndarray, orig_sr: int) -> np.ndarray:
+    if orig_sr == 16000 or len(data) == 0:
+        return data.astype(np.float32)
+    import math
+    import scipy.signal
+    gcd = math.gcd(int(orig_sr), 16000)
+    up = 16000 // gcd
+    down = int(orig_sr) // gcd
+    return scipy.signal.resample_poly(data, up, down).astype(np.float32)
+
+
 def load_audio_16k(audio_input: Union[str, np.ndarray, List[float]], sample_rate: int = 24000) -> np.ndarray:
     """
     Loads an audio file or array and converts to 16 kHz mono float32 in [-1.0, 1.0].
@@ -39,19 +50,13 @@ def load_audio_16k(audio_input: Union[str, np.ndarray, List[float]], sample_rate
         data = audio_input.astype(np.float32)
         if data.ndim > 1:
             data = data.mean(axis=1)
-        if sample_rate != 16000 and len(data) > 0:
-            import scipy.signal
-            num_samples = int(round(len(data) * 16000.0 / float(sample_rate)))
-            data = scipy.signal.resample(data, num_samples).astype(np.float32)
-        return data
+        return _resample_to_16k(data, sample_rate)
 
     if isinstance(audio_input, list):
         data = np.array(audio_input, dtype=np.float32)
-        if sample_rate != 16000 and len(data) > 0:
-            import scipy.signal
-            num_samples = int(round(len(data) * 16000.0 / float(sample_rate)))
-            data = scipy.signal.resample(data, num_samples).astype(np.float32)
-        return data
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        return _resample_to_16k(data, sample_rate)
 
     audio_path = str(audio_input)
     try:
@@ -59,11 +64,7 @@ def load_audio_16k(audio_input: Union[str, np.ndarray, List[float]], sample_rate
         data, sr = sf.read(audio_path, dtype="float32")
         if data.ndim > 1:
             data = data.mean(axis=1)
-        if sr != 16000 and len(data) > 0:
-            import scipy.signal
-            num_samples = int(round(len(data) * 16000.0 / float(sr)))
-            data = scipy.signal.resample(data, num_samples).astype(np.float32)
-        return data
+        return _resample_to_16k(data, sr)
     except Exception:
         pass
 
@@ -92,11 +93,7 @@ def load_audio_16k(audio_input: Union[str, np.ndarray, List[float]], sample_rate
             data = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
         if n_ch > 1:
             data = data.reshape(-1, n_ch).mean(axis=1)
-        if sr != 16000 and len(data) > 0:
-            import scipy.signal
-            num_samples = int(round(len(data) * 16000.0 / float(sr)))
-            data = scipy.signal.resample(data, num_samples).astype(np.float32)
-        return data
+        return _resample_to_16k(data, sr)
 
 
 def format_srt_time(seconds: float) -> str:

@@ -245,6 +245,7 @@ class EngineOrchestrator:
         )
 
         def report(stage: str, progress: float, msg: str):
+            print(f"   [Orchestrator: {stage} ({progress*100:.0f}%)] {msg}", flush=True)
             if progress_callback:
                 try:
                     progress_callback(stage, progress, msg)

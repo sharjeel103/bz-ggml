@@ -237,7 +237,7 @@ def get_resemble_enhancer_model(device: str = "cuda:1"):
             from resemble_enhance.enhancer.inference import load_enhancer
             print(f"[Resemble Enhancer] Loading permanent model weights on {device} (~1,477 MiB VRAM)...")
             t0 = time.time()
-            model = load_enhancer(device=device)
+            model = load_enhancer(None, device=device)
             _RESEMBLE_MODEL_CACHE[device] = model
             print(f"   -> Resemble Enhancer Online on {device} in {time.time()-t0:.2f}s!")
             return model
