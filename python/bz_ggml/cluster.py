@@ -23,7 +23,7 @@ class UserTask:
     ref_codes: Optional[List[int]] = None
     ref_frames: int = 0
     client_has_vocoder: bool = False  # Per-request flag: True -> stream tokens (3.2kbps), False -> server-side vocoder (24kHz audio)
-    stream_pcm: bool = True  # True -> 32-frame streaming chunks, False -> Full Single-Pass vocoder at EOS
+    stream_pcm: bool = False  # True -> 32-frame streaming chunks, False -> Full Single-Pass vocoder at EOS (Default)
 
 
 @dataclass

@@ -28,8 +28,12 @@ from .audio_pipeline import (
     stitch_audio_chunks,
     enhance_audio_array,
     master_audio_array,
-    format_chunk_preview_markdown
+    format_chunk_preview_markdown,
+    load_any_audio,
+    encode_pcm_to_mp3_bytes,
+    encode_pcm_to_wav_bytes
 )
+import urllib.request
 from .bindings import serialize_breeze_voice, deserialize_breeze_voice
 
 
@@ -41,6 +45,7 @@ class TaskType(str, Enum):
     ASR = "asr"
     VOICE_REGISTER = "voice_register"
     VOICE_CONVERT = "voice_convert"
+    UPLOAD = "upload"
 
 
 @dataclass
@@ -54,6 +59,8 @@ class Parcel:
     parcel_id: str
     tasks: List[TaskSpec]
     payload: Dict[str, Any] = field(default_factory=dict)
+    return_artifacts: Optional[List[str]] = None
+    upload_targets: Optional[Dict[str, str]] = None
 
     @classmethod
     def tts_pipeline(
@@ -73,6 +80,8 @@ class Parcel:
         ref_codes: Optional[List[int]] = None,
         ref_frames: int = 0,
         ref_text: Optional[str] = None,
+        return_artifacts: Optional[List[str]] = None,
+        upload_targets: Optional[Dict[str, str]] = None,
         parcel_id: Optional[str] = None
     ) -> 'Parcel':
         """Constructs a standard long-form text-to-speech production pipeline Parcel."""
@@ -85,6 +94,8 @@ class Parcel:
             tasks.append(TaskSpec(TaskType.MASTER, {"preset": "optionA_rich_bass"}))
         if srt:
             tasks.append(TaskSpec(TaskType.ASR, {"output_format": "all"}))
+        if upload_targets:
+            tasks.append(TaskSpec(TaskType.UPLOAD))
 
         payload = {
             "script_text": script_text,
@@ -98,50 +109,90 @@ class Parcel:
             "max_words": int(max_words),
             "ref_codes": ref_codes,
             "ref_frames": int(ref_frames),
-            "ref_text": ref_text
+            "ref_text": ref_text,
+            "upload_targets": upload_targets
         }
-        return cls(parcel_id=p_id, tasks=tasks, payload=payload)
+        return cls(
+            parcel_id=p_id,
+            tasks=tasks,
+            payload=payload,
+            return_artifacts=return_artifacts,
+            upload_targets=upload_targets
+        )
 
     @classmethod
     def voice_registration(
         cls,
-        audio_input: Union[str, np.ndarray, List[float]],
+        audio_input: Union[str, bytes, np.ndarray, List[float]],
         voice_name: str = "custom_voice",
+        enhance: bool = True,
+        max_duration_s: float = 10.0,
         transcript: Optional[str] = None,
+        return_artifacts: Optional[List[str]] = None,
+        upload_targets: Optional[Dict[str, str]] = None,
         parcel_id: Optional[str] = None
     ) -> 'Parcel':
-        """Constructs a Voice Persona Registration parcel [ASR (if needed), VOICE_REGISTER]."""
+        """
+        Constructs a modular Voice Persona Registration parcel:
+          [Clip <= 10s] -> [Optional Enhance on GPU 1] -> [Whisper Turbo ASR on GPU 0] -> [Breeze Acoustic Encode on GPU 0] -> [Optional Upload / Return]
+        Guarantees:
+          - Zero manual human transcription required (transcribed automatically).
+          - Strict max_duration_s ceiling enforced at ingress so Enhancer, ASR, and Encoder all process identical audio slice.
+        """
         p_id = parcel_id or f"parcel_vreg_{int(time.time() * 1000)}"
         tasks = []
-        if not transcript or not transcript.strip():
-            tasks.append(TaskSpec(TaskType.ASR, {"output_format": "txt"}))
+        if enhance:
+            tasks.append(TaskSpec(TaskType.ENHANCE, {"chunk_seconds": 10.0}))
+        tasks.append(TaskSpec(TaskType.ASR, {"output_format": "txt"}))
         tasks.append(TaskSpec(TaskType.VOICE_REGISTER, {"voice_name": voice_name}))
+        if upload_targets:
+            tasks.append(TaskSpec(TaskType.UPLOAD))
 
         payload = {
             "audio_input": audio_input,
             "voice_name": voice_name,
-            "transcript": transcript
+            "transcript": transcript,
+            "max_duration_s": max_duration_s,
+            "upload_targets": upload_targets
         }
-        return cls(parcel_id=p_id, tasks=tasks, payload=payload)
+        return cls(
+            parcel_id=p_id,
+            tasks=tasks,
+            payload=payload,
+            return_artifacts=return_artifacts or (["voice_breeze"] if not upload_targets else None),
+            upload_targets=upload_targets
+        )
 
     @classmethod
     def standalone_asr(
         cls,
-        audio_input: Union[str, np.ndarray, List[float]],
+        audio_input: Union[str, bytes, np.ndarray, List[float]],
         output_format: str = "all",
+        upload_targets: Optional[Dict[str, str]] = None,
+        return_artifacts: Optional[List[str]] = None,
         parcel_id: Optional[str] = None
     ) -> 'Parcel':
         """Constructs a standalone ASR transcription parcel."""
         p_id = parcel_id or f"parcel_asr_{int(time.time() * 1000)}"
         tasks = [TaskSpec(TaskType.ASR, {"output_format": output_format})]
-        return cls(parcel_id=p_id, tasks=tasks, payload={"audio_input": audio_input})
+        if upload_targets:
+            tasks.append(TaskSpec(TaskType.UPLOAD))
+        return cls(
+            parcel_id=p_id,
+            tasks=tasks,
+            payload={"audio_input": audio_input, "upload_targets": upload_targets},
+            return_artifacts=return_artifacts,
+            upload_targets=upload_targets
+        )
 
     @classmethod
     def standalone_enhance(
         cls,
-        audio_input: Union[str, np.ndarray, List[float]],
+        audio_input: Union[str, bytes, np.ndarray, List[float]],
         chunk_seconds: float = 10.0,
         master: bool = True,
+        upload_targets: Optional[Dict[str, str]] = None,
+        return_artifacts: Optional[List[str]] = None,
         parcel_id: Optional[str] = None
     ) -> 'Parcel':
         """Constructs a standalone Enhancer parcel."""
@@ -149,7 +200,15 @@ class Parcel:
         tasks = [TaskSpec(TaskType.ENHANCE, {"chunk_seconds": chunk_seconds})]
         if master:
             tasks.append(TaskSpec(TaskType.MASTER, {"preset": "optionA_rich_bass"}))
-        return cls(parcel_id=p_id, tasks=tasks, payload={"audio_input": audio_input})
+        if upload_targets:
+            tasks.append(TaskSpec(TaskType.UPLOAD))
+        return cls(
+            parcel_id=p_id,
+            tasks=tasks,
+            payload={"audio_input": audio_input, "upload_targets": upload_targets},
+            return_artifacts=return_artifacts,
+            upload_targets=upload_targets
+        )
 
 
 @dataclass
@@ -165,6 +224,8 @@ class ParcelResult:
     subtitles_srt: Optional[str] = None
     segments: Optional[List[dict]] = None
     voice_bytes: Optional[bytes] = None             # Serialized .breeze container bytes
+    artifact_bytes: Dict[str, bytes] = field(default_factory=dict)       # Requested or fallback deliverable files in memory
+    upload_results: Dict[str, Dict[str, Any]] = field(default_factory=dict) # Direct cloud bucket upload status
     chunks_count: int = 1
     stage_timings: Dict[str, float] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -200,6 +261,20 @@ class EngineCapabilities:
             raise ValueError(
                 "TaskType.VOICE_REGISTER requires verbatim reference text when ASR Micro-Service is disabled."
             )
+        if TaskType.UPLOAD in task_types:
+            upload_targets = parcel.payload.get("upload_targets") or parcel.upload_targets
+            if not upload_targets or not isinstance(upload_targets, dict):
+                raise ValueError("TaskType.UPLOAD requires a valid dictionary of upload_targets in parcel payload.")
+            valid_keys = {"audio_mp3", "audio_wav", "subtitles_srt", "transcript_txt", "voice_breeze", "raw_audio_wav"}
+            for k, url in upload_targets.items():
+                if k not in valid_keys:
+                    raise ValueError(f"Invalid upload target '{k}'. Must be one of {valid_keys}.")
+                if not isinstance(url, str) or not (url.startswith("http://") or url.startswith("https://")):
+                    raise ValueError(f"Upload target URL for '{k}' must be a valid HTTP/HTTPS URL.")
+                if k in ("subtitles_srt", "transcript_txt") and TaskType.ASR not in task_types and not parcel.payload.get("transcript"):
+                    raise ValueError(f"Upload target '{k}' requested but ASR task is missing from parcel.")
+                if k == "voice_breeze" and TaskType.VOICE_REGISTER not in task_types:
+                    raise ValueError(f"Upload target '{k}' requested but VOICE_REGISTER task is missing from parcel.")
 
 
 class EngineOrchestrator:
@@ -256,19 +331,17 @@ class EngineOrchestrator:
             current_pcm: Optional[np.ndarray] = None
             current_sr: int = self.cluster.sample_rate
 
-            # If payload provides an initial audio input, pre-load it into memory
+            # If payload provides an initial audio input, pre-load it into memory with strict 10s ceiling for voice registration
             if "audio_input" in parcel.payload and parcel.payload["audio_input"] is not None:
                 inp = parcel.payload["audio_input"]
-                if isinstance(inp, np.ndarray):
-                    current_pcm = inp.astype(np.float32)
-                elif isinstance(inp, list):
-                    current_pcm = np.array(inp, dtype=np.float32)
-                elif isinstance(inp, str):
-                    data, sr = sf.read(inp, dtype="float32")
-                    if data.ndim > 1:
-                        data = data.mean(axis=1)
-                    current_pcm = data
-                    current_sr = sr
+                task_types = [t.task_type for t in parcel.tasks]
+                max_dur = parcel.payload.get("max_duration_s")
+                if max_dur is None and TaskType.VOICE_REGISTER in task_types:
+                    max_dur = 10.0
+
+                report("audio_ingest", 0.02, f"Ingesting audio input (Max ceiling: {max_dur or 'Unlimited'}s)...")
+                current_pcm, current_sr = load_any_audio(inp, target_sr=None, max_duration_s=max_dur)
+                report("audio_ingest", 0.04, f"Ingested {len(current_pcm)/float(current_sr):.2f}s audio @ {current_sr} Hz.")
 
             # -------------------------------------------------------------
             # STAGE 1: TASK EXECUTION LOOP
@@ -470,14 +543,114 @@ class EngineOrchestrator:
                     metadata["conversion_stats"] = stats
                     stage_timings["voice_convert"] = time.time() - task_t0
 
+                # ------------------- 8. DIRECT CLOUD BUCKET UPLOAD -------------------
+                elif t_type == TaskType.UPLOAD:
+                    upload_targets = parcel.payload.get("upload_targets") or parcel.upload_targets or {}
+                    if not upload_targets:
+                        report("upload", 0.95, "No upload targets specified in parcel; skipping upload.")
+                        continue
+
+                    report("upload", 0.95, f"Uploading {len(upload_targets)} artifact(s) directly to cloud storage...")
+                    upload_results: Dict[str, Dict[str, Any]] = {}
+                    any_upload_failed = False
+
+                    def get_artifact(name: str) -> Tuple[Optional[bytes], str]:
+                        if name == "audio_mp3" and current_pcm is not None:
+                            return encode_pcm_to_mp3_bytes(current_pcm, current_sr), "audio/mpeg"
+                        elif name == "audio_wav" and current_pcm is not None:
+                            return encode_pcm_to_wav_bytes(current_pcm, current_sr), "audio/wav"
+                        elif name == "subtitles_srt" and result.subtitles_srt:
+                            return result.subtitles_srt.encode("utf-8"), "application/x-subrip"
+                        elif name == "transcript_txt" and result.transcript:
+                            return result.transcript.encode("utf-8"), "text/plain; charset=utf-8"
+                        elif name == "voice_breeze" and result.voice_bytes:
+                            return result.voice_bytes, "application/octet-stream"
+                        elif name == "raw_audio_wav" and result.raw_audio_pcm is not None:
+                            return encode_pcm_to_wav_bytes(result.raw_audio_pcm, 24000), "audio/wav"
+                        return None, "application/octet-stream"
+
+                    for art_name, target_url in upload_targets.items():
+                        art_bytes, mime = get_artifact(art_name)
+                        if art_bytes is None:
+                            upload_results[art_name] = {
+                                "success": False,
+                                "error": f"Artifact '{art_name}' was not produced by parcel tasks."
+                            }
+                            any_upload_failed = True
+                            continue
+
+                        report("upload", 0.97, f"PUT {art_name} ({len(art_bytes)/1024:.1f} KB) -> {target_url[:50]}...")
+                        try:
+                            req = urllib.request.Request(
+                                target_url,
+                                data=art_bytes,
+                                headers={
+                                    "Content-Type": mime,
+                                    "Content-Length": str(len(art_bytes))
+                                },
+                                method="PUT"
+                            )
+                            with urllib.request.urlopen(req, timeout=30.0) as resp:
+                                status = resp.status
+                                if status in (200, 201, 204):
+                                    upload_results[art_name] = {
+                                        "success": True,
+                                        "status": status,
+                                        "bytes": len(art_bytes)
+                                    }
+                                else:
+                                    upload_results[art_name] = {
+                                        "success": False,
+                                        "status": status,
+                                        "error": f"HTTP {status}"
+                                    }
+                                    any_upload_failed = True
+                        except Exception as up_err:
+                            upload_results[art_name] = {
+                                "success": False,
+                                "error": str(up_err)
+                            }
+                            any_upload_failed = True
+
+                    result.upload_results = upload_results
+                    metadata["upload_results"] = upload_results
+                    stage_timings["upload"] = time.time() - task_t0
+
+                    # Transactional Fallback: If ANY upload failed, attach all artifact bytes to result
+                    if any_upload_failed:
+                        report("upload", 0.99, "⚠️ One or more uploads failed. Triggering transactional fallback (attaching raw artifact bytes)...")
+                        for art_name in upload_targets.keys():
+                            art_bytes, _ = get_artifact(art_name)
+                            if art_bytes:
+                                result.artifact_bytes[art_name] = art_bytes
+
             # -------------------------------------------------------------
-            # FINAL RESULT ASSEMBLY (STRICTLY IN-MEMORY)
+            # FINAL RESULT ASSEMBLY (DYNAMIC ARTIFACTS & IN-MEMORY BUFFERS)
             # -------------------------------------------------------------
             result.audio_pcm = current_pcm
             result.sample_rate = current_sr
             result.duration_s = round(len(current_pcm) / float(current_sr), 2) if current_pcm is not None else 0.0
             result.stage_timings = stage_timings
             result.metadata = metadata
+
+            # Populate requested in-memory artifacts if return_artifacts was specified
+            requested_artifacts = parcel.return_artifacts or []
+            if requested_artifacts:
+                for art_name in requested_artifacts:
+                    if art_name not in result.artifact_bytes:
+                        if art_name == "audio_mp3" and current_pcm is not None:
+                            result.artifact_bytes["audio_mp3"] = encode_pcm_to_mp3_bytes(current_pcm, current_sr)
+                        elif art_name == "audio_wav" and current_pcm is not None:
+                            result.artifact_bytes["audio_wav"] = encode_pcm_to_wav_bytes(current_pcm, current_sr)
+                        elif art_name == "subtitles_srt" and result.subtitles_srt:
+                            result.artifact_bytes["subtitles_srt"] = result.subtitles_srt.encode("utf-8")
+                        elif art_name == "transcript_txt" and result.transcript:
+                            result.artifact_bytes["transcript_txt"] = result.transcript.encode("utf-8")
+                        elif art_name == "voice_breeze" and result.voice_bytes:
+                            result.artifact_bytes["voice_breeze"] = result.voice_bytes
+                        elif art_name == "raw_audio_wav" and result.raw_audio_pcm is not None:
+                            result.artifact_bytes["raw_audio_wav"] = encode_pcm_to_wav_bytes(result.raw_audio_pcm, 24000)
+
             report("completed", 1.0, f"Parcel {parcel.parcel_id} processed successfully in {time.time()-t_start_total:.2f}s!")
             return result
 

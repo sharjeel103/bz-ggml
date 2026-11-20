@@ -232,11 +232,12 @@ def transcribe_subtitles_tool(audio_path: Optional[str]) -> Tuple[str, str]:
 def register_voice_file(
     voice_name: str,
     audio_path: Optional[str],
-    transcript: str
+    enhance: bool = True
 ) -> Tuple[Optional[str], str, Any, Any, Any]:
     """
-    Submits a Voice Persona Registration parcel [ASR (if needed), VOICE_REGISTER]
+    Submits a Voice Persona Registration parcel [TRIM <= 10s, ENHANCE (if checked), ASR, VOICE_REGISTER]
     to the Engine Orchestrator, receives in-memory .breeze bytes, saves to voices_dir, and updates UI dropdowns.
+    Zero manual transcript required (Whisper Turbo v3 automatically transcribes).
     """
     if not voice_name.strip():
         return None, "❌ Error: Voice name is required.", gr.update(), gr.update(), gr.update()
@@ -248,7 +249,8 @@ def register_voice_file(
         parcel = Parcel.voice_registration(
             audio_input=audio_path,
             voice_name=voice_name.strip(),
-            transcript=transcript.strip() if transcript else None
+            enhance=bool(enhance),
+            max_duration_s=10.0
         )
         t0 = time.time()
         res = orchestrator.dispatch(parcel)
@@ -280,8 +282,9 @@ def register_voice_file(
         msg = (
             f"✅ **Voice Registered Successfully!**\n\n"
             f"• **Voice Persona**: `{voice_name.strip()}`\n"
-            f"• **Transcript**: \"{res.transcript or transcript.strip()}\"\n"
-            f"• **Acoustic Frames**: {meta['frames']} ({meta['frames'] * 0.08:.2f}s reference audio)\n"
+            f"• **Auto-Transcribed Text**: \"{res.transcript}\"\n"
+            f"• **Enhanced on GPU 1**: {'Yes (Resemble 44.1 kHz)' if enhance else 'No (Direct 24 kHz)'}\n"
+            f"• **Acoustic Frames**: {meta['frames']} ({meta['frames'] * 0.08:.2f}s reference audio - strictly capped <= 10s)\n"
             f"• **Discrete Tokens**: {len(meta['codes'])} tokens (16 codebooks @ 12.5 Hz)\n"
             f"• **Encode Time**: {enc_time:.2f}s (Pinned to GPU 0 Reference Encoder Pool)\n"
             f"• **Saved In Registry**: `{breeze_path}` ({file_kb:.1f} KB)\n"
@@ -324,107 +327,46 @@ def tts_generate(
         ref_frames = v_data["frames"]
         ref_text = v_data["text"]
 
-    stream_pcm = (delivery_mode != "Studio Master (Full Single-Pass, Zero Clicks)")
-    out_dir = tempfile.mkdtemp(prefix="breeze_tts_")
+    voice_label = selected_voice if voice_path else "Default Native Speaker"
+    orchestrator = get_orchestrator()
 
-    try:
-        cluster = get_cluster()
-        task = UserTask(
-            id=int(time.time() * 1000) % 100000,
-            text=text,
-            instruction=instruction,
-            ref_text=ref_text,
-            ref_codes=ref_codes,
-            ref_frames=ref_frames,
-            cfg_scale=float(cfg_scale),
-            seed=int(seed),
-            max_steps=int(max_steps),
-            stream_pcm=stream_pcm,
-            client_has_vocoder=False
-        )
+    parcel = Parcel.tts_pipeline(
+        script_text=text.strip(),
+        voice_name=selected_voice,
+        instruction=instruction,
+        cfg_scale=float(cfg_scale),
+        temperature=float(temperature),
+        seed=int(seed),
+        enhance=False,
+        master=True,
+        srt=False,
+        ref_codes=ref_codes,
+        ref_frames=ref_frames,
+        ref_text=ref_text,
+        parcel_id=f"tts_single_{int(time.time()*1000)}"
+    )
 
-        audio_queue = queue.Queue()
+    yield gr.skip(), None, gr.update(visible=False), f"⏳ Synthesizing audio on Dual GPU Islands ({voice_label})..."
 
-        def on_chunk(task_id: int, chunk_pcm: np.ndarray, is_eos: bool):
-            if is_eos:
-                audio_queue.put(("EOS", None, None))
-            elif len(chunk_pcm) > 0:
-                audio_queue.put(("CHUNK", chunk_pcm, None))
+    t0 = time.time()
+    res = orchestrator.dispatch(parcel)
+    wall = time.time() - t0
 
-        def worker_thread():
-            try:
-                results = cluster.run_workload([task], out_dir=out_dir, on_pcm_chunk=on_chunk)
-                res = results[0] if results else None
-                audio_queue.put(("DONE", None, res))
-            except Exception as e:
-                audio_queue.put(("ERROR", None, e))
+    if not res.success or res.audio_pcm is None:
+        yield gr.skip(), None, gr.update(visible=False), f"❌ Synthesis failed: {res.error_message}"
+        return
 
-        t0 = time.time()
-        w_thread = threading.Thread(target=worker_thread, daemon=True)
-        w_thread.start()
+    out_wav = os.path.join(tempfile.gettempdir(), f"{parcel.parcel_id}.wav")
+    save_pcm_to_wav(res.audio_pcm, res.sample_rate, out_wav)
 
-        mode_label = "Studio Master (Full Single-Pass)" if not stream_pcm else "Real-Time Stateful Streaming (32-Frame Chunks)"
-        voice_label = selected_voice if voice_path else "Default Native Speaker"
-
-        total_samples = 0
-        chunk_count = 0
-
-        yield gr.skip(), None, gr.update(visible=False), f"⏳ Synthesizing audio on Dual GPU Islands ({mode_label})..."
-
-        while True:
-            try:
-                msg_type, data, extra = audio_queue.get(timeout=0.1)
-            except queue.Empty:
-                if not w_thread.is_alive():
-                    break
-                continue
-
-            if msg_type == "CHUNK":
-                chunk_pcm = data
-                total_samples += len(chunk_pcm)
-                chunk_count += 1
-                audio_sec = total_samples / 24000.0
-                elapsed = time.time() - t0
-                pcm_i16 = (np.clip(chunk_pcm, -1.0, 1.0) * 32767.0).astype(np.int16)
-                status_text = (
-                    f"🔊 **Streaming Live Audio** | {mode_label}\n\n"
-                    f"• **Voice Persona**: `{voice_label}`\n"
-                    f"• **Live Audio Emitted**: {audio_sec:.2f}s ({total_samples:,} samples)\n"
-                    f"• **Chunk #{chunk_count}**: {len(pcm_i16)} samples (32 frames @ 24 kHz)\n"
-                    f"• **Elapsed Time**: {elapsed:.2f}s"
-                )
-                yield (24000, pcm_i16), gr.skip(), gr.skip(), status_text
-
-            elif msg_type == "EOS":
-                pass
-
-            elif msg_type == "DONE":
-                res = extra
-                wall = time.time() - t0
-                if res and res.wav_path and os.path.exists(res.wav_path):
-                    master_wav = os.path.join(tempfile.gettempdir(), f"master_tts_{task.id}.wav")
-                    shutil.copyfile(res.wav_path, master_wav)
-
-                    stats_msg = (
-                        f"✅ **Synthesis Complete** | {mode_label}\n\n"
-                        f"• **Voice Persona**: `{voice_label}`\n"
-                        f"• **Audio Length**: {res.audio_s:.2f}s ({int(res.audio_s * 24000):,} samples @ 24 kHz)\n"
-                        f"• **Compute Time**: {res.compute_wall_s:.2f}s (Total Turnaround: {wall:.2f}s)\n"
-                        f"• **Real-Time Speedup**: {res.rtf:.2f}x\n"
-                        f"• **Worker Island**: {res.worker}\n"
-                        f"• **Master File**: `{os.path.basename(master_wav)}` ({os.path.getsize(master_wav)/1024:.1f} KB)"
-                    )
-                    yield gr.skip(), master_wav, gr.update(value=master_wav, visible=True), stats_msg
-                else:
-                    yield gr.skip(), None, gr.update(visible=False), "❌ Error: Generation returned no audio."
-                break
-
-            elif msg_type == "ERROR":
-                yield gr.skip(), None, gr.update(visible=False), f"❌ Error during synthesis: {str(extra)}"
-                break
-
-    except Exception as e:
-        yield gr.skip(), None, gr.update(visible=False), f"❌ Error during synthesis: {str(e)}"
+    stats_msg = (
+        f"✅ **Synthesis Complete** | Studio Master\n\n"
+        f"• **Voice Persona**: `{voice_label}`\n"
+        f"• **Audio Length**: {res.duration_s:.2f}s ({len(res.audio_pcm):,} samples @ {res.sample_rate} Hz)\n"
+        f"• **Compute Time**: {wall:.2f}s\n"
+        f"• **Master File**: `{os.path.basename(out_wav)}` ({os.path.getsize(out_wav)/1024:.1f} KB)"
+    )
+    yield gr.skip(), out_wav, gr.update(value=out_wav, visible=True), stats_msg
 
 
 def voice_clone_generate(
@@ -441,7 +383,6 @@ def voice_clone_generate(
         yield gr.skip(), None, gr.update(visible=False), "❌ Error: Target text is empty."
         return
 
-    # Look up selected voice from pre-registered dropdown
     voice_path = get_voice_file_path(selected_voice)
     if not voice_path:
         yield gr.skip(), None, gr.update(visible=False), f"❌ Error: Voice persona '{selected_voice}' not found in registry."
@@ -451,111 +392,49 @@ def voice_clone_generate(
         v_data = load_breeze_voice(voice_path)
         ref_codes = v_data["codes"]
         ref_frames = v_data["frames"]
-        final_ref_text = v_data["text"]
-        source_desc = f"Pre-registered Voice (`{selected_voice}`)"
+        ref_text = v_data["text"]
     except Exception as e:
         yield gr.skip(), None, gr.update(visible=False), f"❌ Error loading voice container: {str(e)}"
         return
 
-    stream_pcm = (delivery_mode != "Studio Master (Full Single-Pass, Zero Clicks)")
-    out_dir = tempfile.mkdtemp(prefix="breeze_clone_")
+    orchestrator = get_orchestrator()
+    parcel = Parcel.tts_pipeline(
+        script_text=text.strip(),
+        voice_name=selected_voice,
+        instruction=instruction,
+        cfg_scale=float(cfg_scale),
+        temperature=float(temperature),
+        seed=int(seed),
+        enhance=False,
+        master=True,
+        srt=False,
+        ref_codes=ref_codes,
+        ref_frames=ref_frames,
+        ref_text=ref_text,
+        parcel_id=f"clone_{int(time.time()*1000)}"
+    )
 
-    try:
-        cluster = get_cluster()
-        task = UserTask(
-            id=int(time.time() * 1000) % 100000,
-            text=text,
-            instruction=instruction,
-            ref_text=final_ref_text,
-            ref_codes=ref_codes,
-            ref_frames=ref_frames,
-            cfg_scale=float(cfg_scale),
-            seed=int(seed),
-            max_steps=int(max_steps),
-            stream_pcm=stream_pcm,
-            client_has_vocoder=False
-        )
+    yield gr.skip(), None, gr.update(visible=False), f"⏳ Synthesizing cloned voice on Dual GPU Islands (`{selected_voice}`)..."
 
-        audio_queue = queue.Queue()
+    t0 = time.time()
+    res = orchestrator.dispatch(parcel)
+    wall = time.time() - t0
 
-        def on_chunk(task_id: int, chunk_pcm: np.ndarray, is_eos: bool):
-            if is_eos:
-                audio_queue.put(("EOS", None, None))
-            elif len(chunk_pcm) > 0:
-                audio_queue.put(("CHUNK", chunk_pcm, None))
+    if not res.success or res.audio_pcm is None:
+        yield gr.skip(), None, gr.update(visible=False), f"❌ Synthesis failed: {res.error_message}"
+        return
 
-        def worker_thread():
-            try:
-                results = cluster.run_workload([task], out_dir=out_dir, on_pcm_chunk=on_chunk)
-                res = results[0] if results else None
-                audio_queue.put(("DONE", None, res))
-            except Exception as e:
-                audio_queue.put(("ERROR", None, e))
+    out_wav = os.path.join(tempfile.gettempdir(), f"{parcel.parcel_id}.wav")
+    save_pcm_to_wav(res.audio_pcm, res.sample_rate, out_wav)
 
-        t0 = time.time()
-        w_thread = threading.Thread(target=worker_thread, daemon=True)
-        w_thread.start()
-
-        mode_label = "Studio Master (Full Single-Pass)" if not stream_pcm else "Real-Time Stateful Streaming (32-Frame Chunks)"
-        total_samples = 0
-        chunk_count = 0
-
-        yield gr.skip(), None, gr.update(visible=False), f"⏳ Synthesizing cloned voice on Dual GPU Islands ({mode_label})..."
-
-        while True:
-            try:
-                msg_type, data, extra = audio_queue.get(timeout=0.1)
-            except queue.Empty:
-                if not w_thread.is_alive():
-                    break
-                continue
-
-            if msg_type == "CHUNK":
-                chunk_pcm = data
-                total_samples += len(chunk_pcm)
-                chunk_count += 1
-                audio_sec = total_samples / 24000.0
-                elapsed = time.time() - t0
-                pcm_i16 = (np.clip(chunk_pcm, -1.0, 1.0) * 32767.0).astype(np.int16)
-                status_text = (
-                    f"🔊 **Streaming Live Cloned Audio** | {mode_label}\n\n"
-                    f"• **Reference Voice**: {source_desc}\n"
-                    f"• **Live Audio Emitted**: {audio_sec:.2f}s ({total_samples:,} samples)\n"
-                    f"• **Chunk #{chunk_count}**: {len(pcm_i16)} samples (32 frames @ 24 kHz)\n"
-                    f"• **Elapsed Time**: {elapsed:.2f}s"
-                )
-                yield (24000, pcm_i16), gr.skip(), gr.skip(), status_text
-
-            elif msg_type == "EOS":
-                pass
-
-            elif msg_type == "DONE":
-                res = extra
-                wall = time.time() - t0
-                if res and res.wav_path and os.path.exists(res.wav_path):
-                    master_wav = os.path.join(tempfile.gettempdir(), f"master_clone_{task.id}.wav")
-                    shutil.copyfile(res.wav_path, master_wav)
-
-                    stats_msg = (
-                        f"✅ **Cloned Successfully** | {mode_label}\n\n"
-                        f"• **Reference Voice**: {source_desc}\n"
-                        f"• **Audio Length**: {res.audio_s:.2f}s ({int(res.audio_s * 24000):,} samples @ 24 kHz)\n"
-                        f"• **Compute Time**: {res.compute_wall_s:.2f}s (Total Turnaround: {wall:.2f}s)\n"
-                        f"• **Real-Time Speedup**: {res.rtf:.2f}x\n"
-                        f"• **Worker Island**: {res.worker}\n"
-                        f"• **Master File**: `{os.path.basename(master_wav)}` ({os.path.getsize(master_wav)/1024:.1f} KB)"
-                    )
-                    yield gr.skip(), master_wav, gr.update(value=master_wav, visible=True), stats_msg
-                else:
-                    yield gr.skip(), None, gr.update(visible=False), "❌ Error: Voice cloning returned no audio."
-                break
-
-            elif msg_type == "ERROR":
-                yield gr.skip(), None, gr.update(visible=False), f"❌ Error during voice cloning: {str(extra)}"
-                break
-
-    except Exception as e:
-        yield gr.skip(), None, gr.update(visible=False), f"❌ Error during voice cloning: {str(e)}"
+    stats_msg = (
+        f"✅ **Cloning Complete** | Studio Master\n\n"
+        f"• **Cloned Persona**: `{selected_voice}`\n"
+        f"• **Audio Length**: {res.duration_s:.2f}s ({len(res.audio_pcm):,} samples @ {res.sample_rate} Hz)\n"
+        f"• **Compute Time**: {wall:.2f}s\n"
+        f"• **Master File**: `{os.path.basename(out_wav)}` ({os.path.getsize(out_wav)/1024:.1f} KB)"
+    )
+    yield gr.skip(), out_wav, gr.update(value=out_wav, visible=True), stats_msg
 
 
 def voice_convert_generate(
@@ -1102,21 +981,14 @@ def build_app() -> gr.Blocks:
                             value="My Speaker"
                         )
                         reg_audio = gr.Audio(
-                            label="Speaker Audio Sample (WAV / MP3, max 10s)",
+                            label="Speaker Audio Sample (WAV / MP3 / M4A - Auto-Trimmed to <= 10s)",
                             type="filepath"
                         )
-                        with gr.Row():
-                            reg_asr_btn = gr.Button("🎙️ Auto-Transcribe Sample (GPU 1 Whisper ASR)", variant="secondary")
-                        reg_transcript = gr.Textbox(
-                            label="Verbatim Transcript (Human in the Loop Review & Edit)",
-                            placeholder="Transcript will appear here. Edit for any mistakes...",
-                            lines=3
+                        reg_chk_enhance = gr.Checkbox(
+                            label="✨ Enhance & Denoise Voice Persona (Resemble Enhancer on GPU 1)",
+                            value=True
                         )
-                        reg_asr_btn.click(
-                            fn=transcribe_audio_sample,
-                            inputs=[reg_audio],
-                            outputs=[reg_transcript]
-                        )
+                        gr.Markdown("ℹ️ *Ingested audio is automatically hard-trimmed to the first 10.0 seconds and transcribed automatically via Faster-Whisper Turbo v3 on GPU 0. Zero manual transcription required.*")
 
                         reg_btn = gr.Button("💾 Register Voice (.breeze)", variant="primary", size="lg")
 
@@ -1126,7 +998,7 @@ def build_app() -> gr.Blocks:
 
                 reg_btn.click(
                     fn=register_voice_file,
-                    inputs=[reg_name, reg_audio, reg_transcript],
+                    inputs=[reg_name, reg_audio, reg_chk_enhance],
                     outputs=[reg_file, reg_stats, tts_voice_dropdown, clone_voice_dropdown, lf_voice_dropdown]
                 )
 

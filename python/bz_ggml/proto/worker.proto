@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package workerpb;
+
+enum JobType {
+  UNKNOWN       = 0;
+  REGISTER      = 1;
+  REGISTER_ACK  = 2;
+  DISPATCH      = 3;
+  ACK           = 4;
+  DENY          = 5;
+  CHUNK         = 6;
+  STATUS        = 7;
+  CANCEL        = 8;
+  CANCEL_ACK    = 9;
+  SYNC_REQUEST  = 10;
+  SYNC_RESPONSE = 11;
+}
+
+message Envelope {
+  string  job_id     = 1;
+  int32   attempt    = 2;
+  JobType type       = 3;
+  bytes   payload    = 4;   // marshalled bytes of whichever message matches `type`
+  int64   ts_unix_ms = 5;
+}
+
+message RegisterRequest {
+  int32 gpu_count                      = 1;
+  int32 vram_gb                        = 2;
+  repeated JobTypeCapability job_types = 3;
+  int32 global_max_concurrent          = 4;
+  int64 declared_lease_seconds         = 5;
+}
+
+message JobTypeCapability {
+  string job_type_name            = 1;  // "tts_clone", "tts_clone_edit", "tts_voice_description"
+  repeated string quality_tiers   = 2;
+  int32   max_concurrent          = 3;
+  double  throughput_unit_per_sec = 4;
+}
+
+message RegisterAck { string worker_id = 1; }
+
+message DispatchJob {
+  string job_type_name = 1;
+  string quality       = 2;
+  bytes  params         = 3;
+  int32  priority        = 4;
+}
+
+message AckJob { double eta_seconds = 1; }
+message DenyJob { string reason = 1; }
+
+message Chunk {
+  int64 seq      = 1;
+  bytes data     = 2;
+  bool  is_final = 3;
+}
+
+message JobStatus {
+  enum State { RUNNING = 0; COMPLETED = 1; FAILED = 2; }
+  State  state = 1;
+  string error = 2;
+}
+
+message CancelJob {}
+message CancelAck { bool found = 1; }
+
+message SyncRequest {
+  repeated string believed_running_job_ids = 1;
+}
+
+message SyncResponse {
+  message RunningJob { string job_id = 1; int32 attempt = 2; }
+  repeated RunningJob actual_running = 1;
+  int32   free_capacity             = 2;
+  double  gpu_util_pct              = 3;
+  double  vram_used_gb              = 4;
+  int64   remaining_lease_seconds   = 5;
+}

@@ -1,0 +1,137 @@
+Worker Integration — Shared Plan
+This is the current plan for how your worker connects to and talks with our platform — not a spec handed down, but what's been worked out on the control-plane side so far. Two different kinds of things live in here, and it matters which is which: the message shapes and connection mechanics are a genuine wire contract — the platform side is being built independently, so these need to match exactly or nothing talks to anything. Everything about how you manage your own job queue, GPU scheduling, and inference internals is entirely yours; nothing here should override your own judgment there. Where anything below doesn't fit well with how you're building things, that's useful to say, not something to quietly work around.
+
+Not covered here, deliberately: how a request gets authenticated, how credits/billing work, how a job gets validated and costed before it reaches you, how results get delivered to the end user after they leave you, and where things get stored long-term. None of that changes what you need to build — you'd just be carrying context you can't act on. If something here ever seems to depend on one of those, ask rather than guessing.
+
+Connecting
+You'll dial in over WebSocket with mutual TLS — your client certificate is checked during the TLS handshake itself, before any application data is exchanged. If your certificate isn't valid, the connection is refused at that layer; there's no application-level error to parse, just a failed handshake. Once it succeeds, the connection stays open indefinitely — this isn't a request/response API. Either side sends messages on it whenever it has something to say, for as long as it's open.
+
+Registering
+The first message you send, immediately after connecting, is REGISTER. Report your real capacity honestly:
+
+GPU count and VRAM
+for each job type you support: which quality tiers, your max concurrent jobs at that quality, and your throughput (some unit like audio-minutes/sec)
+your overall max concurrent across everything
+declared_lease_seconds — how long you expect to stay connected, if you know (e.g. a spot instance nearing eviction). This is only for graceful draindown, not how we detect a crash. Omit it or send a large number if it doesn't apply.
+This is what decides who gets which job — the more accurate it is, the better jobs land on you correctly the first time. You'll get REGISTER_ACK back with a worker_id.
+
+The message format
+Every message, both directions, is wrapped in the same envelope — this is the one part that has to match exactly. It's protobuf, so it's language-agnostic: whatever language you're building in has an equivalent codegen tool that reads the same .proto file.
+
+syntax = "proto3";
+package workerpb;
+
+enum JobType {
+  UNKNOWN       = 0;
+  REGISTER      = 1;
+  REGISTER_ACK  = 2;
+  DISPATCH      = 3;
+  ACK           = 4;
+  DENY          = 5;
+  CHUNK         = 6;
+  STATUS        = 7;
+  CANCEL        = 8;
+  CANCEL_ACK    = 9;
+  SYNC_REQUEST  = 10;
+  SYNC_RESPONSE = 11;
+}
+
+message Envelope {
+  string  job_id     = 1;
+  int32   attempt    = 2;
+  JobType type       = 3;
+  bytes   payload    = 4;   // marshalled bytes of whichever message matches `type`
+  int64   ts_unix_ms = 5;
+}
+
+message RegisterRequest {
+  int32 gpu_count                      = 1;
+  int32 vram_gb                        = 2;
+  repeated JobTypeCapability job_types = 3;
+  int32 global_max_concurrent          = 4;
+  int64 declared_lease_seconds         = 5;
+}
+
+message JobTypeCapability {
+  string job_type_name            = 1;  // "tts_clone", "tts_clone_edit", "tts_voice_description"
+  repeated string quality_tiers   = 2;
+  int32   max_concurrent          = 3;
+  double  throughput_unit_per_sec = 4;
+}
+
+message RegisterAck { string worker_id = 1; }
+
+message DispatchJob {
+  string job_type_name = 1;
+  string quality       = 2;
+  bytes  params         = 3;
+  int32  priority        = 4;
+}
+
+message AckJob { double eta_seconds = 1; }
+message DenyJob { string reason = 1; }
+
+message Chunk {
+  int64 seq      = 1;
+  bytes data     = 2;
+  bool  is_final = 3;
+}
+
+message JobStatus {
+  enum State { RUNNING = 0; COMPLETED = 1; FAILED = 2; }
+  State  state = 1;
+  string error = 2;
+}
+
+message CancelJob {}
+message CancelAck { bool found = 1; }
+
+message SyncRequest {
+  repeated string believed_running_job_ids = 1;
+}
+
+message SyncResponse {
+  message RunningJob { string job_id = 1; int32 attempt = 2; }
+  repeated RunningJob actual_running = 1;
+  int32   free_capacity             = 2;
+  double  gpu_util_pct              = 3;
+  double  vram_used_gb              = 4;
+  int64   remaining_lease_seconds   = 5;
+}
+job_id/attempt are blank for messages not about a specific job (REGISTER, SYNC_REQUEST/SYNC_RESPONSE). payload is a two-step unwrap: read the envelope, then, based on type, parse payload as that specific message.
+
+Receiving a job
+A job arrives as DISPATCH, carrying job_id, attempt, job_type_name, quality, params, priority.
+
+Always echo attempt back exactly as received, in every STATUS and CHUNK you send for that job. If we lose contact with you mid-job, we reassign the same job_id to another worker with a higher attempt, and we only accept a completion for whichever attempt is current. If you finish anyway after being presumed dead and tag your result with the old attempt, it's silently discarded on our end — that's intentional, but only works if the number is actually there and correct. Treat it as an opaque value to carry, not something to interpret: it won't always start at 1 for a job_id you've never seen — if another worker was tried first, your very first DISPATCH for that job could already say attempt 2 or 3.
+
+Reply ACK or DENY, always, quickly. Dispatch happens assuming you'll say yes, based on the capacity you last reported — a fast reply either way lets that get corrected immediately if it was wrong. Silence is effectively a slow, messy DENY (we time out and reassign anyway), so an honest, immediate DENY when you can't take a job is strictly better than staying quiet or accepting something you're not sure you can deliver. ACK carries your real estimated completion time, not a placeholder.
+
+Feasibility note: there's no hard number nailed down yet for how long we wait before treating silence as DENY — a few seconds is the current thinking, but that depends on real latency once workers are actually connecting from varied locations. Treat "reply fast" as the actual instruction, not any specific figure.
+
+While a job runs
+Send CHUNK as audio is actually generated — don't accumulate a batch before sending. The person on the other end is listening live, so how fast the first chunk arrives matters more than almost anything else about how this feels; get that one out the moment you have it. Some natural batching after that is fine and probably unavoidable depending on your model.
+
+Feasibility note: if your model naturally produces output in larger native segments, send it in those — don't slice smaller to hit some target window. There's no specific millisecond figure that's more correct than what your model actually does; the guidance is "don't hold chunks back artificially."
+
+Finishing
+Send STATUS — COMPLETED or FAILED with an error message — tagged with the same attempt. This is what releases the job on our side; nothing further happens for it on yours.
+
+Cancellation
+CANCEL can arrive for a job you're currently running. Stop generating and stop sending further CHUNKs once you've acted on it — cooperative cancellation (checking a flag/context between steps) is fine, you don't need to stop instantly if that's not realistic for your inference loop. Reply CANCEL_ACK. If the job already finished right before the cancel arrived, say so (found: false) rather than treating it as an error.
+
+The separate check-in
+Independent of everything above, expect a periodic SYNC_REQUEST — not tied to any job, just a periodic "what's your actual state." Reply SYNC_RESPONSE with which jobs you're actually running (with their job_id/attempt), your real free capacity, GPU/VRAM utilization, and remaining lease.
+
+This exists because messages occasionally get lost and because either side might restart — it's how the system re-establishes ground truth without either of us assuming the other is still in the state we last knew. It isn't redundant with STATUS: STATUS is you telling us something just happened; this is us periodically asking what's actually true right now, regardless of whether anything just happened. Answer honestly even if it contradicts what we'd expect — that mismatch is the useful part.
+
+Your own capacity management
+Everything about how you queue, schedule across your own GPUs, and manage concurrent jobs internally is your call — none of this reaches into that. The one expectation from our side: if you genuinely can't deliver a job in reasonable time, DENY it rather than accepting and letting it stall. An honest, immediate no is better for the system than a yes you can't back up.
+
+Where this might still need adjusting
+Being direct about what's solid versus a starting guess:
+
+The wire contract — the schema, the envelope, the message flow — is the part I'd treat as fixed. Changing it means changing both sides, so flag friction with it rather than working around it silently.
+Specific numbers (the ACK/DENY timeout, chunk batching) are informed guesses, not measured values, and will need tuning once real traffic exists. Worth building as configurable, not hardcoded.
+attempt/fencing is a newer pattern than most simple job queues need — if honoring it is awkward given how you've structured job handling internally, that's worth a conversation, not a workaround, since it's the one thing standing between a worker crash and a user getting notified or billed twice.
+If you're building in something other than Go, the schema carries over exactly — that's what protobuf is for. Only the codegen command changes.
