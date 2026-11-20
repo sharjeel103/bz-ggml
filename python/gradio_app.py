@@ -21,14 +21,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bz_ggml import (
     DualInstanceCluster, UserTask, VoiceConversionTask,
     load_breeze_voice, save_breeze_voice,
-    serialize_breeze_voice, deserialize_breeze_voice
+    serialize_breeze_voice, deserialize_breeze_voice,
+    EngineOrchestrator, EngineCapabilities,
+    TaskType, TaskSpec, Parcel, ParcelResult,
+    save_pcm_to_mp3, save_pcm_to_wav
 )
 from bz_ggml.asr import ASRService
 from bz_ggml.audio_pipeline import (
     split_text_into_smart_chunks, stitch_audio_chunks,
     apply_resemble_enhancer, apply_studio_normalization,
     convert_to_mp3_256k, generate_1word_srt_file,
-    PipelineJob, PipelineJobDispatcher, JobStage,
     format_chunk_preview_markdown
 )
 
@@ -42,25 +44,34 @@ APP_CONFIG: Dict[str, Any] = {
     "enable_q4_burst": False,
     "q4_threshold": 10,
     "vocoder_mode": "on",
+    "precision": "int8",
+    "enable_enhancer": True,
+    "enable_asr": True,
+    "enhancer_chunk_sec": 10.0,
+    "asr_model": "turbo",
+    "asr_device": 0,
+    "enhancer_device": 1,
     "voices_dir": "data/voices",
     "outputs_dir": "/kaggle/working/data/outputs" if os.path.exists("/kaggle/working") else "data/outputs",
-    "asr_device": 1,
-    "asr_model": "base.en"
 }
 
 cluster_instance: Optional[DualInstanceCluster] = None
 asr_service_instance: Optional[ASRService] = None
-dispatcher_instance: Optional[PipelineJobDispatcher] = None
+orchestrator_instance: Optional[EngineOrchestrator] = None
 
 
-def get_dispatcher() -> PipelineJobDispatcher:
-    """Initializes or returns the singleton PipelineJobDispatcher."""
-    global dispatcher_instance
-    if dispatcher_instance is None:
-        out_dir = APP_CONFIG.get("outputs_dir", "data/outputs")
-        os.makedirs(out_dir, exist_ok=True)
-        dispatcher_instance = PipelineJobDispatcher(output_dir=out_dir)
-    return dispatcher_instance
+def list_deliverable_files() -> List[str]:
+    """Returns sorted list of saved deliverable files (.mp3, .srt, .wav) from client outputs directory."""
+    out_dir = APP_CONFIG.get("outputs_dir", "data/outputs")
+    if not os.path.exists(out_dir):
+        return []
+    files = [
+        os.path.join(out_dir, f)
+        for f in os.listdir(out_dir)
+        if f.endswith(".mp3") or f.endswith(".srt") or f.endswith(".wav")
+    ]
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files
 
 
 def get_cluster() -> DualInstanceCluster:
@@ -71,7 +82,7 @@ def get_cluster() -> DualInstanceCluster:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found at: {model_path}")
         print(f"[Gradio Studio] Initializing DualInstanceCluster with Model: {model_path}")
-        print(f"  • Vocoder Mode: {APP_CONFIG['vocoder_mode']} | Q4 Burst: {APP_CONFIG['enable_q4_burst']}")
+        print(f"  • Precision: {APP_CONFIG.get('precision', 'int8')} | Vocoder Mode: {APP_CONFIG['vocoder_mode']} | Q4 Burst: {APP_CONFIG['enable_q4_burst']}")
         cluster_instance = DualInstanceCluster(
             model_path=model_path,
             lib_path=APP_CONFIG["lib_path"],
@@ -79,14 +90,19 @@ def get_cluster() -> DualInstanceCluster:
             enable_q4_burst=APP_CONFIG["enable_q4_burst"],
             q4_threshold=APP_CONFIG["q4_threshold"],
             enable_vocoder=True,
-            vocoder_mode=APP_CONFIG["vocoder_mode"]
+            vocoder_mode=APP_CONFIG["vocoder_mode"],
+            precision=APP_CONFIG.get("precision", "int8"),
+            enable_enhancer=APP_CONFIG.get("enable_enhancer", True),
+            enable_asr=APP_CONFIG.get("enable_asr", True)
         )
     return cluster_instance
 
 
-def get_asr_service() -> ASRService:
+def get_asr_service() -> Optional[ASRService]:
     """Initializes or returns the singleton ASRService pinned to configured GPU."""
     global asr_service_instance
+    if not APP_CONFIG.get("enable_asr", True):
+        return None
     if asr_service_instance is None:
         asr_service_instance = ASRService(
             model_size=APP_CONFIG["asr_model"],
@@ -94,6 +110,31 @@ def get_asr_service() -> ASRService:
             compute_type="float16"
         )
     return asr_service_instance
+
+
+def get_orchestrator() -> EngineOrchestrator:
+    """Initializes or returns the singleton EngineOrchestrator."""
+    global orchestrator_instance
+    if orchestrator_instance is None:
+        cluster = get_cluster()
+        asr = get_asr_service()
+        caps = EngineCapabilities(
+            precision=APP_CONFIG.get("precision", "int8"),
+            enable_q4_surge=APP_CONFIG.get("enable_q4_burst", False),
+            vocoder_mode=APP_CONFIG.get("vocoder_mode", "on"),
+            enable_enhancer=APP_CONFIG.get("enable_enhancer", True),
+            enable_asr=APP_CONFIG.get("enable_asr", True),
+            chunk_seconds_enhancer=APP_CONFIG.get("enhancer_chunk_sec", 10.0),
+            asr_model_size=APP_CONFIG.get("asr_model", "turbo"),
+            asr_device_index=APP_CONFIG.get("asr_device", 0),
+            enhancer_device_index=APP_CONFIG.get("enhancer_device", 1)
+        )
+        orchestrator_instance = EngineOrchestrator(
+            cluster=cluster,
+            asr_service=asr,
+            capabilities=caps
+        )
+    return orchestrator_instance
 
 
 def load_audio_24k(audio_path: str) -> List[float]:
@@ -192,24 +233,29 @@ def register_voice_file(
     voice_name: str,
     audio_path: Optional[str],
     transcript: str
-) -> Tuple[Optional[str], str, gr.Dropdown, gr.Dropdown]:
+) -> Tuple[Optional[str], str, Any, Any, Any]:
     """
-    Encodes reference audio via engine's encode_voice_container() on GPU 0,
-    receives in-memory bytes, saves to voices_dir, and updates UI dropdowns.
+    Submits a Voice Persona Registration parcel [ASR (if needed), VOICE_REGISTER]
+    to the Engine Orchestrator, receives in-memory .breeze bytes, saves to voices_dir, and updates UI dropdowns.
     """
     if not voice_name.strip():
-        return None, "❌ Error: Voice name is required.", gr.update(), gr.update()
+        return None, "❌ Error: Voice name is required.", gr.update(), gr.update(), gr.update()
     if not audio_path or not os.path.exists(audio_path):
-        return None, "❌ Error: Audio sample file is required.", gr.update(), gr.update()
-    if not transcript.strip():
-        return None, "❌ Error: Exact verbatim transcript is required.", gr.update(), gr.update()
+        return None, "❌ Error: Audio sample file is required.", gr.update(), gr.update(), gr.update()
 
     try:
-        cluster = get_cluster()
-        pcm = load_audio_24k(audio_path)
+        orchestrator = get_orchestrator()
+        parcel = Parcel.voice_registration(
+            audio_input=audio_path,
+            voice_name=voice_name.strip(),
+            transcript=transcript.strip() if transcript else None
+        )
         t0 = time.time()
-        # Engine contract: encode_voice_container returns in-memory .breeze bytes
-        container_bytes = cluster.encode_voice_container(pcm, transcript.strip(), gpu_id=0)
+        res = orchestrator.dispatch(parcel)
+        if not res.success or res.voice_bytes is None:
+            raise RuntimeError(res.error_message or "Failed to encode voice container")
+
+        container_bytes = res.voice_bytes
         enc_time = time.time() - t0
 
         # Client-side storage: save bytes to configured voices_dir
@@ -234,6 +280,7 @@ def register_voice_file(
         msg = (
             f"✅ **Voice Registered Successfully!**\n\n"
             f"• **Voice Persona**: `{voice_name.strip()}`\n"
+            f"• **Transcript**: \"{res.transcript or transcript.strip()}\"\n"
             f"• **Acoustic Frames**: {meta['frames']} ({meta['frames'] * 0.08:.2f}s reference audio)\n"
             f"• **Discrete Tokens**: {len(meta['codes'])} tokens (16 codebooks @ 12.5 Hz)\n"
             f"• **Encode Time**: {enc_time:.2f}s (Pinned to GPU 0 Reference Encoder Pool)\n"
@@ -605,12 +652,11 @@ def run_longform_pipeline_ui(
     apply_srt: bool
 ) -> Generator[Tuple[str, Optional[str], Optional[str], Optional[str], Any, Any, Any, Any], None, None]:
     if not script_text.strip():
-        yield "❌ Error: Script text is empty.", None, None, "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.skip()
+        yield "❌ Error: Script text is empty.", None, None, "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), list_deliverable_files()
         return
 
-    dispatcher = get_dispatcher()
-    cluster = get_cluster()
-    asr = get_asr_service() if apply_srt else None
+    out_dir = APP_CONFIG["outputs_dir"]
+    os.makedirs(out_dir, exist_ok=True)
 
     ref_codes = None
     ref_frames = 0
@@ -623,8 +669,7 @@ def run_longform_pipeline_ui(
         ref_text = v_data["text"]
 
     job_id = f"prod_{int(time.time() * 1000)}"
-    job = PipelineJob(
-        job_id=job_id,
+    parcel = Parcel.tts_pipeline(
         script_text=script_text.strip(),
         voice_name=selected_voice,
         instruction=instruction,
@@ -634,46 +679,37 @@ def run_longform_pipeline_ui(
         pause_ms=int(pause_ms),
         target_words=int(target_words),
         max_words=int(max_words),
-        apply_enhance=bool(apply_enhance),
-        apply_master=bool(apply_master),
-        apply_srt=bool(apply_srt)
+        enhance=bool(apply_enhance),
+        master=bool(apply_master),
+        srt=bool(apply_srt),
+        ref_codes=ref_codes,
+        ref_frames=ref_frames,
+        ref_text=ref_text,
+        parcel_id=job_id
     )
 
     update_queue = queue.Queue()
 
-    def progress_callback(updated_job: PipelineJob):
-        update_queue.put({
-            "stage": updated_job.stage.value,
-            "progress": updated_job.progress,
-            "log": updated_job.status_log,
-            "raw_mp3": updated_job.raw_mp3_path,
-            "enhanced_mp3": updated_job.enhanced_mp3_path,
-            "srt_path": updated_job.srt_path,
-            "job": updated_job
-        })
+    def progress_callback(stage: str, progress: float, msg: str):
+        update_queue.put({"stage": stage, "progress": progress, "msg": msg})
+
+    orchestrator = get_orchestrator()
 
     def worker_thread():
         try:
-            dispatcher.run_pipeline(
-                job=job,
-                cluster=cluster,
-                asr_service=asr,
-                ref_text=ref_text,
-                ref_codes=ref_codes,
-                ref_frames=ref_frames,
-                update_callback=progress_callback
-            )
-            update_queue.put({"stage": "completed", "job": job})
+            res = orchestrator.dispatch(parcel, progress_callback=progress_callback)
+            update_queue.put({"stage": "completed", "result": res})
         except Exception as e:
-            update_queue.put({"stage": "failed", "error": str(e), "job": job})
+            update_queue.put({"stage": "failed", "error": str(e)})
 
     thread = threading.Thread(target=worker_thread, daemon=True)
     thread.start()
 
-    last_log = "🚀 Dispatching Long-Form Production Pipeline..."
-    raw_mp3_val = None
-    enh_mp3_val = None
-    srt_text_val = ""
+    last_log = "🚀 Dispatching Parcel to Engine Orchestrator..."
+    raw_mp3_path = None
+    mastered_mp3_path = None
+    srt_content = ""
+    srt_file_path = None
 
     while True:
         try:
@@ -681,66 +717,79 @@ def run_longform_pipeline_ui(
             stage = item.get("stage")
 
             if stage == "completed":
-                done_job = item.get("job", job)
-                saved_files = dispatcher.get_saved_files()
-                final_srt_content = ""
-                if done_job.srt_path and os.path.exists(done_job.srt_path):
-                    with open(done_job.srt_path, "r", encoding="utf-8") as f:
-                        final_srt_content = f.read()
+                res: ParcelResult = item["result"]
+                if not res.success:
+                    yield (
+                        f"❌ **Engine Error**: {res.error_message}",
+                        None, None, "",
+                        gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
+                        list_deliverable_files()
+                    )
+                    break
 
-                mins = int(done_job.total_audio_s // 60)
-                secs = int(done_job.total_audio_s % 60)
+                # Client-Side Persistence: Save in-memory results directly to outputs directory
+                if res.raw_audio_pcm is not None and len(res.raw_audio_pcm) > 0:
+                    raw_mp3_path = os.path.join(out_dir, f"{job_id}_raw.mp3")
+                    save_pcm_to_mp3(res.raw_audio_pcm, 24000, raw_mp3_path)
+
+                if res.audio_pcm is not None and len(res.audio_pcm) > 0:
+                    mastered_mp3_path = os.path.join(out_dir, f"{job_id}_mastered.mp3")
+                    save_pcm_to_mp3(res.audio_pcm, res.sample_rate, mastered_mp3_path)
+
+                if res.subtitles_srt:
+                    srt_content = res.subtitles_srt
+                    srt_file_path = os.path.join(out_dir, f"{job_id}_transcript_1word.srt")
+                    with open(srt_file_path, "w", encoding="utf-8") as f:
+                        f.write(srt_content)
+
+                mins = int(res.duration_s // 60)
+                secs = int(res.duration_s % 60)
                 summary = (
-                    f"🎉 **Production Pipeline Completed Successfully!**\n\n"
-                    f"• **Job ID**: `{done_job.job_id}`\n"
-                    f"• **Cohesive Chunks**: {done_job.chunks_completed} chunks synthesized concurrently across Dual GPUs\n"
-                    f"• **Total Audio**: {done_job.total_audio_s:.2f}s ({mins}m {secs}s)\n"
-                    f"• **Raw Voiceover**: `{os.path.basename(done_job.raw_mp3_path) if done_job.raw_mp3_path else 'N/A'}` (256k MP3)\n"
-                    f"• **Mastered Voiceover**: `{os.path.basename(done_job.enhanced_mp3_path) if done_job.enhanced_mp3_path else 'N/A'}` (Broadcast Standard)\n"
-                    f"• **Word Subtitles**: `{os.path.basename(done_job.srt_path) if done_job.srt_path else 'Disabled'}`"
+                    f"🎉 **Parcel Pipeline Completed Successfully!**\n\n"
+                    f"• **Parcel ID**: `{res.parcel_id}`\n"
+                    f"• **Cohesive Chunks**: {res.chunks_count} chunks synthesized symmetrically across Dual GPUs\n"
+                    f"• **Total Audio**: {res.duration_s:.2f}s ({mins}m {secs}s @ {res.sample_rate} Hz)\n"
+                    f"• **Raw Voiceover**: `{os.path.basename(raw_mp3_path) if raw_mp3_path else 'N/A'}` (256k MP3)\n"
+                    f"• **Mastered Voiceover**: `{os.path.basename(mastered_mp3_path) if mastered_mp3_path else 'N/A'}` (Broadcast Standard)\n"
+                    f"• **Word Subtitles**: `{os.path.basename(srt_file_path) if srt_file_path else 'Disabled'}`\n"
+                    f"• **Stage Timings**: {', '.join(f'{k}: {v:.2f}s' for k, v in res.stage_timings.items())}"
                 )
+
+                saved_files = list_deliverable_files()
                 yield (
                     summary,
-                    done_job.raw_mp3_path,
-                    done_job.enhanced_mp3_path,
-                    final_srt_content,
-                    gr.update(value=done_job.enhanced_mp3_path, visible=bool(done_job.enhanced_mp3_path)),
-                    gr.update(value=done_job.raw_mp3_path, visible=bool(done_job.raw_mp3_path)),
-                    gr.update(value=done_job.srt_path, visible=bool(done_job.srt_path and os.path.exists(done_job.srt_path))),
+                    raw_mp3_path,
+                    mastered_mp3_path,
+                    srt_content,
+                    gr.update(value=mastered_mp3_path, visible=bool(mastered_mp3_path)),
+                    gr.update(value=raw_mp3_path, visible=bool(raw_mp3_path)),
+                    gr.update(value=srt_file_path, visible=bool(srt_file_path)),
                     saved_files
                 )
                 break
 
             elif stage == "failed":
                 err = item.get("error", "Unknown error")
-                failed_job = item.get("job", job)
                 yield (
-                    f"❌ **Pipeline Note**: {err}",
-                    failed_job.raw_mp3_path,
-                    failed_job.enhanced_mp3_path,
+                    f"❌ **Pipeline Failure**: {err}",
+                    raw_mp3_path,
+                    mastered_mp3_path,
                     "",
-                    gr.update(value=failed_job.enhanced_mp3_path, visible=bool(failed_job.enhanced_mp3_path)),
-                    gr.update(value=failed_job.raw_mp3_path, visible=bool(failed_job.raw_mp3_path)),
                     gr.update(visible=False),
-                    dispatcher.get_saved_files()
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    list_deliverable_files()
                 )
                 break
 
             else:
-                last_log = item.get("log", last_log)
-                if item.get("raw_mp3"):
-                    raw_mp3_val = item["raw_mp3"]
-                if item.get("enhanced_mp3"):
-                    enh_mp3_val = item["enhanced_mp3"]
-                if item.get("srt_path") and os.path.exists(item["srt_path"]):
-                    with open(item["srt_path"], "r", encoding="utf-8") as f:
-                        srt_text_val = f.read()
-
+                last_log = item.get("msg", last_log)
+                pct = item.get("progress", 0.0)
                 yield (
-                    f"⏳ **Status**: {last_log}",
-                    raw_mp3_val,
-                    enh_mp3_val,
-                    srt_text_val,
+                    f"⏳ **[{stage.upper()}] ({int(pct*100)}%)**: {last_log}",
+                    raw_mp3_path,
+                    mastered_mp3_path,
+                    srt_content,
                     gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=False),
@@ -856,10 +905,10 @@ def build_app() -> gr.Blocks:
                         lf_history_files = gr.File(
                             label="Download Output Files (.mp3 / .srt)",
                             file_count="multiple",
-                            value=get_dispatcher().get_saved_files()
+                            value=list_deliverable_files()
                         )
                         lf_history_refresh.click(
-                            fn=lambda: get_dispatcher().get_saved_files(),
+                            fn=list_deliverable_files,
                             inputs=[],
                             outputs=[lf_history_files]
                         )
@@ -1179,13 +1228,18 @@ def main():
     parser = argparse.ArgumentParser(description="Breeze-TTS Studio Decoupled Web Application")
     parser.add_argument("--model", type=str, default="breeze-tts-2-q8_0.gguf", help="Path to base GGUF model")
     parser.add_argument("--lib", type=str, default=None, help="Path to libbreeze.so")
+    parser.add_argument("--precision", type=str, choices=["int8", "fp16"], default="int8", help="Engine precision mode")
     parser.add_argument("--q4-model", type=str, default=None, help="Path to modular Q4 depth decoder GGUF")
     parser.add_argument("--enable-q4", action="store_true", help="Enable modular Q4 surge tiering")
     parser.add_argument("--q4-threshold", type=int, default=10, help="Active session threshold for Q4 burst")
     parser.add_argument("--vocoder-mode", type=str, choices=["on", "dynamic", "off"], default="on", help="Vocoder mode")
+    parser.add_argument("--disable-enhancer", action="store_true", help="Disable Resemble Enhancer microservice")
+    parser.add_argument("--disable-asr", action="store_true", help="Disable Whisper ASR microservice")
+    parser.add_argument("--enhancer-chunk-sec", type=float, default=10.0, help="Sliding window chunk duration for Resemble Enhancer (10.0s saves 1.2 GB VRAM)")
+    parser.add_argument("--enhancer-device", type=int, default=1, help="CUDA device index for Resemble Enhancer")
     parser.add_argument("--voices-dir", type=str, default="data/voices", help="Local directory for .breeze voice containers")
-    parser.add_argument("--asr-device", type=int, default=1, help="CUDA device index for Whisper ASR")
-    parser.add_argument("--asr-model", type=str, default="small", help="Whisper model size")
+    parser.add_argument("--asr-device", type=int, default=0, help="CUDA device index for Whisper ASR")
+    parser.add_argument("--asr-model", type=str, default="turbo", help="Whisper model size (default: turbo)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host interface")
     parser.add_argument("--port", type=int, default=7860, help="Web port")
     parser.add_argument("--share", action="store_true", help="Create public Gradio share link")
@@ -1194,10 +1248,15 @@ def main():
     # Populate Global Configuration
     APP_CONFIG["model_path"] = args.model
     APP_CONFIG["lib_path"] = args.lib
+    APP_CONFIG["precision"] = args.precision
     APP_CONFIG["q4_model_path"] = args.q4_model
     APP_CONFIG["enable_q4_burst"] = args.enable_q4
     APP_CONFIG["q4_threshold"] = args.q4_threshold
     APP_CONFIG["vocoder_mode"] = args.vocoder_mode
+    APP_CONFIG["enable_enhancer"] = not args.disable_enhancer
+    APP_CONFIG["enable_asr"] = not args.disable_asr
+    APP_CONFIG["enhancer_chunk_sec"] = args.enhancer_chunk_sec
+    APP_CONFIG["enhancer_device"] = args.enhancer_device
     APP_CONFIG["voices_dir"] = args.voices_dir
     APP_CONFIG["asr_device"] = args.asr_device
     APP_CONFIG["asr_model"] = args.asr_model
@@ -1205,24 +1264,19 @@ def main():
     os.makedirs(APP_CONFIG["voices_dir"], exist_ok=True)
     os.makedirs(APP_CONFIG["outputs_dir"], exist_ok=True)
 
-    print("⏳ Pre-warming cluster engine & ASR service...")
+    print("⏳ Pre-warming cluster engine, orchestrator & micro-services...")
     try:
-        get_cluster()
-        print("   ✅ DualInstanceCluster initialized & ready.")
+        orch = get_orchestrator()
+        print(f"   ✅ EngineOrchestrator online & ready (Precision: {APP_CONFIG['precision'].upper()} | Enhancer: {APP_CONFIG['enable_enhancer']} | ASR: {APP_CONFIG['enable_asr']}).")
     except Exception as e:
-        print(f"   ⚠️ Cluster initialization deferred/failed: {e}")
-
-    try:
-        get_asr_service()
-        print("   ✅ Whisper ASR initialized & ready.")
-    except Exception as e:
-        print(f"   ⚠️ ASR initialization deferred/failed: {e}")
+        print(f"   ⚠️ Engine initialization deferred/failed: {e}")
 
     demo = build_app()
     print(f"\n🚀 Launching Breeze-TTS Studio on http://{args.host}:{args.port}")
-    print(f"   • Model: {APP_CONFIG['model_path']}")
+    print(f"   • Model: {APP_CONFIG['model_path']} ({APP_CONFIG['precision'].upper()})")
     print(f"   • Voices Registry: {os.path.abspath(APP_CONFIG['voices_dir'])}")
-    print(f"   • ASR Device: CUDA:{APP_CONFIG['asr_device']}")
+    print(f"   • ASR: {APP_CONFIG['asr_model']} on CUDA:{APP_CONFIG['asr_device']}")
+    print(f"   • Enhancer: CUDA:{APP_CONFIG['enhancer_device']} (Chunks: {APP_CONFIG['enhancer_chunk_sec']}s)")
 
     allowed_dirs = [
         os.path.abspath(APP_CONFIG["voices_dir"]),

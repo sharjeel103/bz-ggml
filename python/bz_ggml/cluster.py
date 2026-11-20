@@ -261,6 +261,64 @@ def select_burst_steps(active_sessions: dict, max_burst: int = 16) -> int:
         return 1
 
 
+class DynamicCapacityCoordinator:
+    """
+    Coordinates dynamic VRAM headroom between high-throughput TTS and burst auxiliary models
+    (Resemble Enhancer on GPU 1, Faster-Whisper on GPU 0).
+    Implements the 'Green Light' protocol:
+      1. When an auxiliary task arrives, it requests token headroom on target GPU:
+         - Enhancer: ~3,858 MiB active scratchpad (10s window) -> ~16,850 tokens
+         - Whisper: ~2,199 MiB active scratchpad -> ~9,600 tokens
+      2. The coordinator lowers target_gpu's admission ceiling:
+         effective_ceiling = baseline_ceiling - runtime_tokens_needed
+      3. Active TTS streams naturally finish and retire until:
+         current_active_tokens <= effective_ceiling
+      4. Once satisfied (or timeout), the coordinator grants the 'Green Light' to run the auxiliary job.
+      5. Auxiliary task runs while TTS continues running within the remaining headroom!
+      6. When auxiliary task completes, it releases the headroom reservation, restoring the admission ceiling.
+    """
+    def __init__(self, cluster: 'DualInstanceCluster'):
+        self.cluster = cluster
+        self.lock = threading.Lock()
+        self.cv = threading.Condition(self.lock)
+        self.reserved_headroom = {0: 0, 1: 0}
+        self.active_tokens = {0: 0, 1: 0}
+
+    def get_admission_ceiling(self, gpu_id: int) -> int:
+        with self.lock:
+            budget = getattr(self.cluster, "active_token_budget", 50000)
+            reserved = self.reserved_headroom.get(gpu_id, 0)
+            return max(2000, budget - reserved)
+
+    def update_active_tokens(self, gpu_id: int, current_tokens: int):
+        with self.lock:
+            self.active_tokens[gpu_id] = current_tokens
+            self.cv.notify_all()
+
+    def request_headroom(self, gpu_id: int, tokens_needed: int, timeout: float = 30.0) -> bool:
+        with self.lock:
+            self.reserved_headroom[gpu_id] = self.reserved_headroom.get(gpu_id, 0) + tokens_needed
+            target_ceiling = self.get_admission_ceiling(gpu_id)
+            print(f"[DynamicCapacityCoordinator] Headroom requested on GPU {gpu_id}: {tokens_needed} tokens. Target ceiling: {target_ceiling}. Current active tokens: {self.active_tokens.get(gpu_id, 0)}")
+
+            start = time.time()
+            while self.active_tokens.get(gpu_id, 0) > target_ceiling:
+                remaining = timeout - (time.time() - start)
+                if remaining <= 0:
+                    print(f"[DynamicCapacityCoordinator] Warning: Headroom drain timed out after {timeout}s. Proceeding with caution.")
+                    return False
+                self.cv.wait(timeout=min(0.2, remaining))
+
+            print(f"[DynamicCapacityCoordinator] Green Light granted on GPU {gpu_id}! Active tokens: {self.active_tokens.get(gpu_id, 0)} <= Ceiling: {target_ceiling}")
+            return True
+
+    def release_headroom(self, gpu_id: int, tokens_needed: int):
+        with self.lock:
+            self.reserved_headroom[gpu_id] = max(0, self.reserved_headroom.get(gpu_id, 0) - tokens_needed)
+            print(f"[DynamicCapacityCoordinator] Headroom released on GPU {gpu_id}: -{tokens_needed} tokens. Restored ceiling: {self.get_admission_ceiling(gpu_id)}")
+            self.cv.notify_all()
+
+
 class DualInstanceCluster:
     """
     Symmetric Autonomous Dual-Island Architecture (10/10 Design).
@@ -274,21 +332,32 @@ class DualInstanceCluster:
     def calculate_token_budget(
         base_max_tokens: int = 50000,
         enable_q4_burst: bool = False,
-        vocoder_mode: str = "dynamic"
+        vocoder_mode: str = "dynamic",
+        precision: str = "int8",
+        enable_enhancer: bool = True,
+        enable_asr: bool = True
     ) -> int:
         """
         Calculates exact active token capacity based on component VRAM footprint:
-          - Baseline (Tokens-Only, No Q4): 50,000 active tokens (14.20 GiB safe ceiling).
-          - Modular INT4 Depth Piece (310 MiB): -1,400 tokens (4.367 tokens/MiB).
+          - Baseline (Tokens-Only, Tesla T4 15.3 GB): 50,000 active tokens (14.20 GiB safe ceiling).
+          - Precision: FP16 weights consume +1,700 MiB -> -7,420 tokens (4.367 tokens/MiB).
+          - Modular INT4 Depth Piece (310 MiB): -1,400 tokens.
           - Server Vocoder Decoder + Scratchpad (820 MiB): -3,600 tokens (when 'on' or 'dynamic').
-          - Combined Full Hybrid Suite: -5,000 tokens -> 45,000 active tokens per GPU.
+          - Resemble Enhancer Static Weights (1,477 MiB on GPU 1): -6,450 tokens.
+          - Faster-Whisper Turbo Static Weights (2,199 MiB on GPU 0): -9,600 tokens.
         """
         budget = base_max_tokens
+        if precision.lower() in ("fp16", "float16"):
+            budget -= 7420
         if enable_q4_burst:
             budget -= 1400
         if vocoder_mode in ("on", "dynamic"):
             budget -= 3600
-        return budget
+        if enable_enhancer:
+            budget -= 6450
+        if enable_asr:
+            budget -= 9600
+        return max(5000, budget)
 
     def __init__(
         self,
@@ -299,12 +368,20 @@ class DualInstanceCluster:
         q4_threshold: int = 10,
         enable_vocoder: Optional[bool] = None,
         vocoder_mode: str = "dynamic",
+        precision: str = "int8",
+        enable_enhancer: bool = True,
+        enable_asr: bool = True,
         base_max_tokens: int = 50000
     ):
         self.model_path = model_path
         self.q4_model_path = q4_model_path
         self.enable_q4_burst = enable_q4_burst
         self.q4_threshold = q4_threshold
+        self.precision = precision
+        self.enable_enhancer = enable_enhancer
+        self.enable_asr = enable_asr
+        self.sample_rate = 24000
+
         if enable_vocoder is not None:
             self.vocoder_mode = "on" if enable_vocoder else "off"
         else:
@@ -314,8 +391,12 @@ class DualInstanceCluster:
         self.active_token_budget = self.calculate_token_budget(
             base_max_tokens=self.base_max_tokens,
             enable_q4_burst=self.enable_q4_burst,
-            vocoder_mode=self.vocoder_mode
+            vocoder_mode=self.vocoder_mode,
+            precision=self.precision,
+            enable_enhancer=self.enable_enhancer,
+            enable_asr=self.enable_asr
         )
+        self.dynamic_coord = DynamicCapacityCoordinator(self)
         self.lib = BreezeLib(lib_path)
 
         # Autonomous Island 0 (GPU 0)
@@ -651,8 +732,12 @@ class DualInstanceCluster:
             slot_pool = TieredSlotPool(short_slots=16, standard_slots=24, long_slots=56)
 
             while not workers_stopping:
+                # Dynamic capacity admission ceiling
+                max_active_tokens = self.dynamic_coord.get_admission_ceiling(gpu_id)
+
                 # A. Admit waiting tasks governed by TieredSlotPool, max_slots, and max_active_tokens budget
                 while not workers_stopping:
+                    max_active_tokens = self.dynamic_coord.get_admission_ceiling(gpu_id)
                     if max_slots is not None and len(active_sessions) >= max_slots:
                         break
 
@@ -730,6 +815,7 @@ class DualInstanceCluster:
                         break
 
                     current_active_tokens += allocated_tokens
+                    self.dynamic_coord.update_active_tokens(gpu_id, current_active_tokens)
                     client_has_voc = return_tokens_mode or getattr(task_item, "client_has_vocoder", False)
 
                     active_sessions[sid] = {
@@ -910,6 +996,7 @@ class DualInstanceCluster:
 
                     # Free session slot immediately in local VRAM and return slot to pool
                     current_active_tokens -= s["tokens"]
+                    self.dynamic_coord.update_active_tokens(gpu_id, current_active_tokens)
                     slot_pool.release(s["slot_id"])
                     gen_default.session_free(sid)
                     del active_sessions[sid]

@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Generator, Tuple, Callable
+from typing import Optional, List, Dict, Any, Generator, Tuple, Callable, Union
 import numpy as np
 import soundfile as sf
 
@@ -55,7 +55,6 @@ def split_text_into_smart_chunks(
             atomic_units.append(p)
         else:
             # Paragraph is oversized: split into sentence units protecting abbreviations
-            # Protect abbreviations with temporary placeholder
             p_safe = p
             abbrev_matches = list(re.finditer(_ABBREVIATIONS, p_safe, re.IGNORECASE))
             placeholders = {}
@@ -221,23 +220,48 @@ def stitch_audio_chunks(
 # 3. RESEMBLE ENHANCE (DENOISE & 44.1k UPSAMPLING)
 # =====================================================================
 
-def apply_resemble_enhancer(
-    input_wav_path: str,
-    output_wav_path: str,
-    chunk_sec: float = 15.0,
-    device: Optional[str] = None
-) -> str:
+_RESEMBLE_MODEL_CACHE: Dict[str, Any] = {}
+_RESEMBLE_LOCK = threading.Lock()
+
+def get_resemble_enhancer_model(device: str = "cuda:1"):
     """
-    Enhances audio, removes noise, and upsamples to 44.1 kHz using Resemble Enhance.
-    Uses 15s chunking and explicit memory cleanup to prevent GPU VRAM exhaustion.
+    Singleton cache for Resemble Enhancer model weights in GPU VRAM.
+    Keeps model resident permanently to eliminate reload overhead.
+    """
+    global _RESEMBLE_MODEL_CACHE
+    with _RESEMBLE_LOCK:
+        if device in _RESEMBLE_MODEL_CACHE:
+            return _RESEMBLE_MODEL_CACHE[device]
+        try:
+            import torch
+            from resemble_enhance.enhancer.inference import load_enhancer
+            print(f"[Resemble Enhancer] Loading permanent model weights on {device} (~1,477 MiB VRAM)...")
+            t0 = time.time()
+            model = load_enhancer(device=device)
+            _RESEMBLE_MODEL_CACHE[device] = model
+            print(f"   -> Resemble Enhancer Online on {device} in {time.time()-t0:.2f}s!")
+            return model
+        except Exception as e:
+            print(f"[Resemble Enhancer] Failed to load model on {device}: {e}")
+            return None
+
+
+def enhance_audio_array(
+    pcm: np.ndarray,
+    sr: int = 24000,
+    chunk_seconds: float = 10.0,
+    device: Optional[str] = None
+) -> Tuple[np.ndarray, int]:
+    """
+    Enhances in-memory float32 audio, removes noise, and upsamples to 44.1 kHz.
+    Uses configurable chunk_seconds (default: 10.0s saves 1.2 GB active VRAM) and 1.0s overlap.
     """
     try:
         import torch
-        from resemble_enhance.enhancer.inference import enhance
+        from resemble_enhance.enhancer.inference import inference
     except ImportError:
-        print("[Enhancer Warning] resemble-enhance is not installed. Copying raw audio...")
-        shutil.copyfile(input_wav_path, output_wav_path)
-        return output_wav_path
+        print("[Enhancer Warning] resemble-enhance is not installed. Returning raw audio...")
+        return pcm, sr
 
     if device is None:
         if torch.cuda.is_available():
@@ -245,27 +269,25 @@ def apply_resemble_enhancer(
         else:
             device = "cpu"
 
-    print(f"[Resemble Enhancer] Processing {os.path.basename(input_wav_path)} on {device} (Chunks: {chunk_sec}s)...")
-    t0 = time.time()
+    model = get_resemble_enhancer_model(device)
+    if model is None:
+        return pcm, sr
 
+    t0 = time.time()
     try:
-        data, sr = sf.read(input_wav_path, dtype="float32")
-        dwav = torch.from_numpy(data)
+        dwav = torch.from_numpy(pcm.astype(np.float32))
         if dwav.dim() > 1:
             dwav = dwav.mean(dim=-1)
 
         if "cuda" in device:
             torch.cuda.empty_cache()
 
-        hwav, out_sr = enhance(
+        hwav, out_sr = inference(
+            model=model,
             dwav=dwav,
             sr=sr,
             device=device,
-            nfe=16,
-            solver="midpoint",
-            lambd=0.5,
-            tau=0.5,
-            chunk_seconds=chunk_sec,
+            chunk_seconds=chunk_seconds,
             overlap_seconds=1.0,
         )
 
@@ -274,19 +296,70 @@ def apply_resemble_enhancer(
         if max_val > 1.0:
             out_np = out_np / max_val * 0.99
 
-        os.makedirs(os.path.dirname(output_wav_path), exist_ok=True)
-        sf.write(output_wav_path, out_np, out_sr, subtype="PCM_16")
-        print(f"[Resemble Enhancer] Completed in {time.time()-t0:.2f}s -> {output_wav_path}")
-        return output_wav_path
+        print(f"[Resemble Enhancer] In-memory enhanced {len(pcm)/sr:.1f}s audio in {time.time()-t0:.2f}s (Out SR: {out_sr})")
+        return out_np.astype(np.float32), int(out_sr)
     finally:
         if "cuda" in device and torch.cuda.is_available():
             torch.cuda.empty_cache()
             gc.collect()
 
 
+def apply_resemble_enhancer(
+    input_wav_path: str,
+    output_wav_path: str,
+    chunk_sec: float = 10.0,
+    device: Optional[str] = None
+) -> str:
+    """
+    Enhances audio file on disk via Resemble Enhance.
+    Calls enhance_audio_array for model caching and memory safety.
+    """
+    data, sr = sf.read(input_wav_path, dtype="float32")
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+
+    out_pcm, out_sr = enhance_audio_array(data, sr=sr, chunk_seconds=chunk_sec, device=device)
+    os.makedirs(os.path.dirname(output_wav_path), exist_ok=True)
+    sf.write(output_wav_path, out_pcm, out_sr, subtype="PCM_16")
+    return output_wav_path
+
+
 # =====================================================================
 # 4. GENTLE STUDIO MASTERING & NORMALIZATION (SWIFT_HISTORY PRESET)
 # =====================================================================
+
+def master_audio_array(
+    pcm: np.ndarray,
+    sr: int = 24000,
+    preset: str = "optionA_rich_bass"
+) -> Tuple[np.ndarray, int]:
+    """
+    Applies broadcast-grade studio mastering in-memory via FFmpeg:
+      - 70 Hz highpass filter (removes sub-bass rumble)
+      - EBU R128 gentle loudnorm (-16 LUFS broadcast target, -3 dB TruePeak)
+      - 135 Hz parametric bass warmth boost (+3.5 dB)
+      - True peak limiter ceiling (0.85) to guarantee 0 clipping.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as in_f:
+        in_path = in_f.name
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out_f:
+        out_path = out_f.name
+
+    try:
+        sf.write(in_path, pcm, sr, subtype="PCM_16")
+        apply_studio_normalization(in_path, out_path, preset=preset)
+        out_pcm, out_sr = sf.read(out_path, dtype="float32")
+        if out_pcm.ndim > 1:
+            out_pcm = out_pcm.mean(axis=1)
+        return out_pcm.astype(np.float32), int(out_sr)
+    finally:
+        for p in (in_path, out_path):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
 
 def apply_studio_normalization(
     input_wav: str,
@@ -330,7 +403,7 @@ def apply_studio_normalization(
 
 
 # =====================================================================
-# 5. MP3 256K ENCODER
+# 5. MP3 & WAV ENCODERS
 # =====================================================================
 
 def convert_to_mp3_256k(wav_path: str, mp3_path: str) -> str:
@@ -351,6 +424,41 @@ def convert_to_mp3_256k(wav_path: str, mp3_path: str) -> str:
     return mp3_path
 
 
+def save_pcm_to_mp3(pcm: np.ndarray, sr: int, mp3_path: str, bitrate: str = "256k") -> str:
+    """Saves in-memory float32 PCM directly as high-bitrate MP3."""
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+        wav_file = tmp_wav.name
+    try:
+        sf.write(wav_file, pcm, sr, subtype="PCM_16")
+        os.makedirs(os.path.dirname(mp3_path), exist_ok=True)
+        cmd = [
+            FFMPEG_EXE,
+            "-v", "error",
+            "-i", str(wav_file),
+            "-acodec", "libmp3lame",
+            "-b:a", bitrate,
+            "-y",
+            str(mp3_path)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"FFmpeg MP3 encoding failed: {res.stderr.strip()}")
+        return mp3_path
+    finally:
+        if os.path.exists(wav_file):
+            try:
+                os.remove(wav_file)
+            except Exception:
+                pass
+
+
+def save_pcm_to_wav(pcm: np.ndarray, sr: int, wav_path: str) -> str:
+    """Saves in-memory float32 PCM directly as standard PCM_16 WAV."""
+    os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+    sf.write(wav_path, pcm, sr, subtype="PCM_16")
+    return wav_path
+
+
 # =====================================================================
 # 6. 1-WORD PER LINE SRT GENERATOR
 # =====================================================================
@@ -362,15 +470,19 @@ def generate_1word_srt_file(
 ) -> str:
     """
     Generates word-level timestamps via Faster-Whisper and formats into
-    a clean 1-word-per-line SRT subtitle file for Shorts, Reels, and Explainers.
+    a clean 1-word-per-line SRT subtitle file.
     """
     res = asr_service.transcribe(
         audio=audio_path,
         vad_filter=True,
         word_timestamps=True,
-        return_1word_srt=True
+        return_1word_srt=True,
+        output_format="srt"
     )
-    transcript, srt_content, word_list = res
+    if isinstance(res, tuple):
+        _, srt_content, _ = res
+    else:
+        srt_content = str(res)
 
     os.makedirs(os.path.dirname(output_srt_path), exist_ok=True)
     with open(output_srt_path, "w", encoding="utf-8") as f:
@@ -379,7 +491,7 @@ def generate_1word_srt_file(
 
 
 # =====================================================================
-# 7. TYPED JOB QUEUES & PIPELINE DISPATCHER
+# 7. TYPED JOB QUEUES & PIPELINE DISPATCHER (LEGACY COMPATIBILITY)
 # =====================================================================
 
 class JobStage(str, Enum):
@@ -425,26 +537,18 @@ class PipelineJob:
 
 class PipelineJobDispatcher:
     """
-    Orchestrates the entire multi-stage long-form production pipeline using
-    strictly decoupled Job Queues with independent concurrency and VRAM bounds:
-      - Queue 1 (TTS): Continuous batching across GPU 0 & GPU 1 via DualInstanceCluster.
-      - Queue 2 (Stitch): CPU in-memory array ops with 200ms breath gap.
-      - Queue 3 (Enhance): Resemble Enhance with semaphore(1) and memory cleanup.
-      - Queue 4 (Master): FFmpeg broadcast mastering on CPU.
-      - Queue 5 (ASR): Faster-Whisper with semaphore(2) on GPU 1.
+    Legacy dispatcher for Gradio backward compatibility.
+    New code should dispatch Parcels to EngineOrchestrator.
     """
     def __init__(self, output_dir: str = "data/outputs"):
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         self.active_jobs: Dict[str, PipelineJob] = {}
         self.lock = threading.Lock()
-
-        # Concurrency Guards
         self.enhance_semaphore = threading.BoundedSemaphore(1)
         self.master_semaphore = threading.BoundedSemaphore(4)
 
     def get_saved_files(self) -> List[str]:
-        """Returns sorted list of saved deliverable files (.mp3, .srt, .wav)."""
         if not os.path.exists(self.output_dir):
             return []
         files = [
@@ -454,166 +558,3 @@ class PipelineJobDispatcher:
         ]
         files.sort(key=os.path.getmtime, reverse=True)
         return files
-
-    def run_pipeline(
-        self,
-        job: PipelineJob,
-        cluster,
-        asr_service,
-        ref_text: Optional[str] = None,
-        ref_codes: Optional[List[int]] = None,
-        ref_frames: int = 0,
-        update_callback: Optional[Callable[[PipelineJob], None]] = None
-    ):
-        """Executes the full pipeline sequentially through typed job stages."""
-        from bz_ggml import UserTask
-
-        def notify(stage: JobStage, progress: float, msg: str):
-            job.stage = stage
-            job.progress = progress
-            job.status_log = msg
-            print(f"[{job.job_id}] [{stage.value.upper()}] {msg}")
-            if update_callback:
-                update_callback(job)
-
-        with self.lock:
-            self.active_jobs[job.job_id] = job
-
-        job_dir = os.path.join(self.output_dir, job.job_id)
-        os.makedirs(job_dir, exist_ok=True)
-
-        try:
-            # ---------------- STAGE 1: SEMANTIC CHUNKING ----------------
-            notify(JobStage.TTS_CHUNKING, 0.05, f"Intelligently chunking script into semantic blocks (Target: {job.target_words}w, Max: {job.max_words}w)...")
-            chunks = split_text_into_smart_chunks(job.script_text, target_words=job.target_words, max_words=job.max_words)
-            if not chunks:
-                raise ValueError("Script text contains no valid words.")
-
-            job.chunks_count = len(chunks)
-            words_total = sum(len(c.split()) for c in chunks)
-            notify(JobStage.TTS_CHUNKING, 0.10, f"Script partitioned into {len(chunks)} cohesive chunks ({words_total} words total).")
-
-            # ---------------- STAGE 2: PARALLEL DUAL-GPU TTS ----------------
-            notify(JobStage.TTS_PARALLEL, 0.15, f"Dispatching {len(chunks)} parallel TTS jobs to DualInstanceCluster (GPU 0 & GPU 1)...")
-
-            tts_tasks = []
-            for idx, chunk_text in enumerate(chunks):
-                t = UserTask(
-                    id=idx,
-                    text=chunk_text,
-                    instruction=job.instruction,
-                    ref_text=ref_text,
-                    ref_codes=ref_codes,
-                    ref_frames=ref_frames,
-                    cfg_scale=job.cfg_scale,
-                    temperature=job.temperature,
-                    seed=job.seed + idx,
-                    max_steps=2040,  # Full 2,040 token context headroom to guarantee zero cutoffs
-                    stream_pcm=False,
-                    client_has_vocoder=False
-                )
-                tts_tasks.append(t)
-
-            chunks_completed = 0
-            def on_chunk_done(res):
-                nonlocal chunks_completed
-                chunks_completed += 1
-                job.chunks_completed = chunks_completed
-                pct = 0.15 + (chunks_completed / len(chunks)) * 0.40
-                notify(JobStage.TTS_PARALLEL, pct, f"TTS Synthesis: Completed chunk {chunks_completed}/{len(chunks)} ({res.worker}).")
-
-            tts_results = cluster.run_workload(
-                tts_tasks,
-                out_dir=os.path.join(job_dir, "chunks"),
-                on_progress=on_chunk_done
-            )
-
-            # Sort strictly by chronological chunk index
-            tts_results_sorted = sorted(tts_results, key=lambda r: r.id)
-
-            # Load PCM buffers for all completed chunks
-            chunks_pcm = []
-            total_dur = 0.0
-            for r in tts_results_sorted:
-                data, sr = sf.read(r.wav_path, dtype="float32")
-                if data.ndim > 1:
-                    data = data.mean(axis=1)
-                chunks_pcm.append(data)
-                total_dur += r.audio_s
-
-            job.total_audio_s = round(total_dur, 2)
-
-            # ---------------- STAGE 3: STITCHING WITH 200ms BREATH GAP ----------------
-            notify(JobStage.STITCHING, 0.60, f"Stitching {len(chunks_pcm)} chunks with {job.pause_ms}ms breath pause & click-free micro-fades...")
-            stitched_pcm = stitch_audio_chunks(chunks_pcm, sample_rate=24000, pause_ms=job.pause_ms)
-
-            raw_wav = os.path.join(job_dir, f"{job.job_id}_raw.wav")
-            raw_mp3 = os.path.join(self.output_dir, f"{job.job_id}_raw.mp3")
-            sf.write(raw_wav, stitched_pcm, 24000, subtype="PCM_16")
-            convert_to_mp3_256k(raw_wav, raw_mp3)
-
-            job.raw_wav_path = raw_wav
-            job.raw_mp3_path = raw_mp3
-            notify(JobStage.STITCHING, 0.65, f"Raw voiceover stitched ({len(stitched_pcm)/24000:.1f}s audio) -> Saved: {os.path.basename(raw_mp3)}")
-
-            # ---------------- STAGE 4: RESEMBLE ENHANCE (OPTIONAL) ----------------
-            current_master_wav = raw_wav
-            if job.apply_enhance:
-                notify(JobStage.ENHANCING, 0.70, "Acquiring Enhancer queue lock & running Resemble Enhance (15s sliding windows, 44.1 kHz)...")
-                with self.enhance_semaphore:
-                    enhanced_wav = os.path.join(job_dir, f"{job.job_id}_enhanced_tmp.wav")
-                    apply_resemble_enhancer(raw_wav, enhanced_wav, chunk_sec=15.0)
-                    current_master_wav = enhanced_wav
-                notify(JobStage.ENHANCING, 0.80, "Resemble Enhance completed successfully.")
-            else:
-                notify(JobStage.ENHANCING, 0.80, "Resemble Enhance bypassed by user.")
-
-            # ---------------- STAGE 5: GENTLE STUDIO MASTERING (OPTIONAL) ----------------
-            final_enhanced_mp3 = os.path.join(self.output_dir, f"{job.job_id}_mastered.mp3")
-            if job.apply_master:
-                notify(JobStage.MASTERING, 0.82, "Applying studio broadcast mastering (70Hz Highpass + EQ 135Hz + Loudnorm -16 LUFS)...")
-                with self.master_semaphore:
-                    mastered_wav = os.path.join(job_dir, f"{job.job_id}_mastered.wav")
-                    apply_studio_normalization(current_master_wav, mastered_wav, preset="optionA_rich_bass")
-                    convert_to_mp3_256k(mastered_wav, final_enhanced_mp3)
-                    job.enhanced_wav_path = mastered_wav
-                    job.enhanced_mp3_path = final_enhanced_mp3
-                notify(JobStage.MASTERING, 0.88, f"Studio mastering completed -> Saved: {os.path.basename(final_enhanced_mp3)}")
-            else:
-                if current_master_wav != raw_wav:
-                    convert_to_mp3_256k(current_master_wav, final_enhanced_mp3)
-                    job.enhanced_wav_path = current_master_wav
-                    job.enhanced_mp3_path = final_enhanced_mp3
-                else:
-                    job.enhanced_wav_path = raw_wav
-                    job.enhanced_mp3_path = raw_mp3
-
-            # ---------------- STAGE 6: 1-WORD PER LINE SRT SUBTITLES (OPTIONAL) ----------------
-            if job.apply_srt and asr_service is not None:
-                notify(JobStage.TRANSCRIBING, 0.90, "Transcribing mastered audio with Whisper on GPU 1 (generating 1-word-per-line SRT)...")
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    import gc; gc.collect()
-
-                    srt_path = os.path.join(self.output_dir, f"{job.job_id}_transcript_1word.srt")
-                    target_audio_for_srt = job.enhanced_wav_path if job.enhanced_wav_path else raw_wav
-                    generate_1word_srt_file(target_audio_for_srt, srt_path, asr_service=asr_service)
-                    job.srt_path = srt_path
-                    notify(JobStage.TRANSCRIBING, 0.98, f"1-Word per line SRT generated -> Saved: {os.path.basename(srt_path)}")
-                except Exception as asr_err:
-                    print(f"[{job.job_id}] [ASR Warning] Subtitle generation failed: {asr_err}")
-                    job.srt_path = None
-                    notify(JobStage.TRANSCRIBING, 0.98, f"Subtitle note: {asr_err} (Audio generation succeeded)")
-            else:
-                notify(JobStage.TRANSCRIBING, 0.98, "Subtitles bypassed by user.")
-
-            notify(JobStage.COMPLETED, 1.0, f"Production Pipeline Complete! Generated all deliverables ({job.total_audio_s}s audio).")
-            return job
-
-        except Exception as e:
-            job.stage = JobStage.FAILED
-            job.error = str(e)
-            notify(JobStage.FAILED, 1.0, f"Pipeline Error: {str(e)}")
-            raise e

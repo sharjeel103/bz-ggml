@@ -1,13 +1,14 @@
+import gc
 import os
-import threading
 import queue
+import threading
 import time
-from typing import Optional, Union, List, Tuple
+from typing import Optional, Union, List, Tuple, Dict, Any
 import numpy as np
 
 class ASRWorkerPool:
     """
-    Strict concurrency limiter for ASR transcription micro-service on GPU 1.
+    Strict concurrency limiter for ASR transcription micro-service on GPU 0.
     Prevents concurrent transcription jobs from causing GPU VRAM spikes.
     """
     def __init__(self, max_concurrent: int = 2):
@@ -29,19 +30,38 @@ class ASRWorkerPool:
         self.semaphore.release()
 
 
-def load_audio_16k(audio_path: str) -> np.ndarray:
+def load_audio_16k(audio_input: Union[str, np.ndarray, List[float]], sample_rate: int = 24000) -> np.ndarray:
     """
-    Loads an audio file and converts to 16 kHz mono float32 in [-1.0, 1.0].
+    Loads an audio file or array and converts to 16 kHz mono float32 in [-1.0, 1.0].
     Directly bypasses PyAV / av.open to prevent 'metadata_errors' version incompatibility.
     """
+    if isinstance(audio_input, np.ndarray):
+        data = audio_input.astype(np.float32)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if sample_rate != 16000 and len(data) > 0:
+            import scipy.signal
+            num_samples = int(round(len(data) * 16000.0 / float(sample_rate)))
+            data = scipy.signal.resample(data, num_samples).astype(np.float32)
+        return data
+
+    if isinstance(audio_input, list):
+        data = np.array(audio_input, dtype=np.float32)
+        if sample_rate != 16000 and len(data) > 0:
+            import scipy.signal
+            num_samples = int(round(len(data) * 16000.0 / float(sample_rate)))
+            data = scipy.signal.resample(data, num_samples).astype(np.float32)
+        return data
+
+    audio_path = str(audio_input)
     try:
         import soundfile as sf
         data, sr = sf.read(audio_path, dtype="float32")
         if data.ndim > 1:
             data = data.mean(axis=1)
-        if sr != 16000:
+        if sr != 16000 and len(data) > 0:
             import scipy.signal
-            num_samples = int(len(data) * 16000 / sr)
+            num_samples = int(round(len(data) * 16000.0 / float(sr)))
             data = scipy.signal.resample(data, num_samples).astype(np.float32)
         return data
     except Exception:
@@ -72,35 +92,41 @@ def load_audio_16k(audio_path: str) -> np.ndarray:
             data = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
         if n_ch > 1:
             data = data.reshape(-1, n_ch).mean(axis=1)
-        if sr != 16000:
+        if sr != 16000 and len(data) > 0:
             import scipy.signal
-            num_samples = int(len(data) * 16000 / sr)
+            num_samples = int(round(len(data) * 16000.0 / float(sr)))
             data = scipy.signal.resample(data, num_samples).astype(np.float32)
         return data
 
 
 def format_srt_time(seconds: float) -> str:
-    millis = int(round((seconds - int(seconds)) * 1000))
-    s = int(seconds) % 60
-    m = (int(seconds) // 60) % 60
-    h = int(seconds) // 3600
+    """
+    Formats seconds into standard SRT timestamp HH:MM:SS,mmm.
+    Uses pure modulo integer arithmetic to guarantee zero rollover or overflow bugs.
+    """
+    total_ms = max(0, int(round(seconds * 1000.0)))
+    millis = total_ms % 1000
+    total_s = total_ms // 1000
+    s = total_s % 60
+    m = (total_s // 60) % 60
+    h = total_s // 3600
     return f"{h:02d}:{m:02d}:{s:02d},{millis:03d}"
 
 
 class ASRService:
     """
     Dedicated Speech-to-Text Micro-Service using faster-whisper.
-    Pinned strictly to GPU 1 (or CPU fallback) with bounded concurrency.
-    Memory Footprint: ~288 MiB weights + ~106 MiB scratchpad (small int8_float16).
-    Constant VRAM scaling across 5-second to 2-hour audio via 30s sliding window.
+    Pinned strictly to GPU 0 (or CPU fallback) with bounded concurrency.
+    Default Model: 'turbo' (large-v3-turbo, ~2,199 MiB resident VRAM in float16).
+    Produces word-level SRT timestamps, plain text, or structured sentence segments.
     """
     def __init__(
         self,
-        model_size: str = "small",
+        model_size: str = "turbo",
         device: str = "cuda",
-        device_index: int = 1,
+        device_index: int = 0,
         cuda_device: Optional[int] = None,
-        compute_type: str = "int8_float16",
+        compute_type: str = "float16",
         max_concurrent: int = 2
     ):
         if cuda_device is not None:
@@ -119,6 +145,12 @@ class ASRService:
         with self._init_lock:
             if self._model is not None:
                 return
+            import torch
+            if not torch.cuda.is_available() and self.device == "cuda":
+                print(f"[ASR Service] CUDA unavailable; falling back to CPU.")
+                self.device = "cpu"
+                self.compute_type = "int8"
+
             from faster_whisper import WhisperModel
             print(f"[ASR Service] Initializing {self.model_size} ({self.compute_type}) on {self.device}:{self.device_index}...")
             t0 = time.time()
@@ -128,23 +160,25 @@ class ASRService:
                 device_index=self.device_index,
                 compute_type=self.compute_type
             )
-            print(f"   -> ASR Model Online in {time.time()-t0:.2f}s (~288 MiB resident VRAM)")
+            print(f"   -> ASR Model Online in {time.time()-t0:.2f}s (~2,199 MiB resident VRAM)")
 
     def transcribe(
         self,
         audio: Union[str, np.ndarray, List[float]],
+        sample_rate: int = 24000,
         language: str = "en",
         beam_size: int = 1,
         vad_filter: bool = True,
-        word_timestamps: bool = False,
-        return_subtitles: bool = False,
-        return_1word_srt: bool = False,
+        word_timestamps: bool = True,
+        return_subtitles: bool = True,
+        return_1word_srt: bool = True,
+        output_format: Optional[str] = None,
         timeout: Optional[float] = 60.0
-    ) -> Union[str, Tuple[str, str, List[dict]]]:
+    ) -> Union[str, Tuple[str, str, List[dict]], List[dict]]:
         """
         Transcribes speech audio into verified text with optional timestamped subtitles.
-        Acquires semaphore before execution to strictly guarantee max 2 concurrent jobs on GPU 1.
-        Bypasses PyAV by pre-decoding file paths into 16 kHz float32 numpy arrays.
+        Acquires semaphore before execution to strictly guarantee bounded concurrency on GPU 0.
+        Bypasses PyAV by pre-decoding input into 16 kHz float32 numpy arrays.
         """
         self._ensure_model_loaded()
 
@@ -154,18 +188,15 @@ class ASRService:
 
         t0 = time.time()
         try:
-            if isinstance(audio, str):
-                audio = load_audio_16k(audio)
-            elif isinstance(audio, list):
-                audio = np.array(audio, dtype=np.float32)
+            audio_16k = load_audio_16k(audio, sample_rate=sample_rate)
 
             segments, info = self._model.transcribe(
-                audio,
+                audio_16k,
                 beam_size=beam_size,
                 language=language,
                 temperature=0.0,
                 vad_filter=vad_filter,
-                word_timestamps=word_timestamps or return_1word_srt
+                word_timestamps=True
             )
 
             seg_list = []
@@ -178,7 +209,7 @@ class ASRService:
                 if clean_text:
                     text_segments.append(clean_text)
 
-                if return_1word_srt and hasattr(s, "words") and s.words:
+                if hasattr(s, "words") and s.words:
                     for w in s.words:
                         w_text = w.word.strip()
                         if not w_text:
@@ -191,7 +222,7 @@ class ASRService:
                         })
                         srt_lines.append(f"{word_idx}\n{format_srt_time(w.start)} --> {format_srt_time(w.end)}\n{w_text}\n")
                         word_idx += 1
-                elif return_subtitles:
+                else:
                     seg_list.append({
                         "id": s_idx,
                         "start": round(s.start, 3),
@@ -206,7 +237,13 @@ class ASRService:
             dur = info.duration if hasattr(info, "duration") else 0.0
             print(f"[ASR Service] Transcribed {dur:.1f}s audio in {(time.time()-t0)*1000:.1f}ms: \"{transcript[:60]}...\"")
 
-            if return_subtitles or return_1word_srt:
+            if output_format == "srt":
+                return srt_content
+            elif output_format == "txt":
+                return transcript
+            elif output_format == "segments":
+                return seg_list
+            elif output_format == "all" or return_subtitles or return_1word_srt:
                 return transcript, srt_content, seg_list
             return transcript
         finally:
