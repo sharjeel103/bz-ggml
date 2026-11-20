@@ -347,7 +347,7 @@ def master_audio_array(
 
     try:
         sf.write(in_path, pcm, sr, subtype="PCM_16")
-        apply_studio_normalization(in_path, out_path, preset=preset)
+        apply_studio_normalization(in_path, out_path, preset=preset, target_sr=sr)
         out_pcm, out_sr = sf.read(out_path, dtype="float32")
         if out_pcm.ndim > 1:
             out_pcm = out_pcm.mean(axis=1)
@@ -364,7 +364,8 @@ def master_audio_array(
 def apply_studio_normalization(
     input_wav: str,
     output_wav: str,
-    preset: str = "optionA_rich_bass"
+    preset: str = "optionA_rich_bass",
+    target_sr: Optional[int] = None
 ) -> str:
     """
     Applies broadcast-grade studio mastering from swift_history via FFmpeg:
@@ -392,9 +393,10 @@ def apply_studio_normalization(
         "-i", str(input_wav),
         "-af", filter_str,
         "-c:a", "pcm_s16le",
-        "-y",
-        str(output_wav)
     ]
+    if target_sr:
+        cmd.extend(["-ar", str(target_sr)])
+    cmd.extend(["-y", str(output_wav)])
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         print(f"[FFmpeg Warning] Studio normalization failed: {res.stderr}. Copying unmastered file.")
