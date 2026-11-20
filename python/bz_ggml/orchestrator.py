@@ -299,6 +299,10 @@ class EngineOrchestrator:
         self.lock = threading.Lock()
         print(f"[EngineOrchestrator] Online with Precision: {self.capabilities.precision.upper()} | Enhancer: {self.capabilities.enable_enhancer} | ASR: {self.capabilities.enable_asr}")
 
+    def validate_parcel(self, parcel: Parcel) -> None:
+        """Validates that all requested tasks can be fulfilled by the running engine instance."""
+        self.capabilities.validate_parcel(parcel)
+
     def dispatch(
         self,
         parcel: Parcel,

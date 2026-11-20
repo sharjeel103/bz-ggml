@@ -865,8 +865,7 @@ def build_app() -> gr.Blocks:
                         )
                         tts_master_audio = gr.Audio(
                             label="🎵 Complete Master Audio Recording (Seekable Waveform & Replay)",
-                            type="filepath",
-                            show_download_button=True
+                            type="filepath"
                         )
                         tts_download_file = gr.File(
                             label="Download Master WAV (Single-File)",
@@ -943,8 +942,7 @@ def build_app() -> gr.Blocks:
                         )
                         clone_master_audio = gr.Audio(
                             label="🎵 Complete Master Audio Recording (Seekable Waveform & Replay)",
-                            type="filepath",
-                            show_download_button=True
+                            type="filepath"
                         )
                         clone_download_file = gr.File(
                             label="Download Master Cloned WAV (Single-File)",
