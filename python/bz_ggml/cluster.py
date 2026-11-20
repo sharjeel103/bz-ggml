@@ -279,7 +279,7 @@ class DynamicCapacityCoordinator:
     """
     def __init__(self, cluster: 'DualInstanceCluster'):
         self.cluster = cluster
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.cv = threading.Condition(self.lock)
         self.reserved_headroom = {0: 0, 1: 0}
         self.active_tokens = {0: 0, 1: 0}
