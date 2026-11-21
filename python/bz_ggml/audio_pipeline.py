@@ -28,6 +28,51 @@ _ABBREVIATIONS = (
     r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|U\.S|U\.K|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\."
 )
 
+
+def _split_oversized_clause(
+    text: str,
+    max_words_limit: int = 280,
+    target_words_limit: int = 200
+) -> List[str]:
+    """
+    Emergency fallback for runaway unpunctuated text (e.g. raw ASR/STT transcripts):
+    Tier 1: Splits at natural coordinating conjunctions (and, but, or, because, so, while, since).
+    Tier 2: Clean hard word slicing on space boundary if no conjunctions exist.
+    Guarantees no unit exceeds max_words_limit, preventing GPU KV cache step-truncation.
+    """
+    words = text.split()
+    if len(words) <= max_words_limit:
+        return [text]
+
+    # Tier 1: Split at natural coordinating conjunctions
+    parts = re.split(r'\s+(?=(?:and|but|or|because|so|while|since)\b)', text, flags=re.IGNORECASE)
+    result = []
+    curr = []
+    curr_len = 0
+
+    for part in parts:
+        p_len = len(part.split())
+        if p_len > max_words_limit:
+            if curr:
+                result.append(" ".join(curr).strip())
+                curr, curr_len = [], 0
+            # Tier 2: Hard word slice
+            sub_words = part.split()
+            for j in range(0, len(sub_words), target_words_limit):
+                result.append(" ".join(sub_words[j:j + target_words_limit]))
+        elif curr_len + p_len > max_words_limit and curr:
+            result.append(" ".join(curr).strip())
+            curr = [part]
+            curr_len = p_len
+        else:
+            curr.append(part)
+            curr_len += p_len
+
+    if curr:
+        result.append(" ".join(curr).strip())
+    return result
+
+
 def split_text_into_smart_chunks(
     text: str,
     target_words: int = 200,
@@ -39,7 +84,9 @@ def split_text_into_smart_chunks(
       - Never cuts below 280 words if text fits within GPU context (zero chunking overhead).
       - For text > 280 words, calculates optimal balanced chunk count K = ceil(total_words / target_words).
       - Prioritizes paragraph breaks (\\n\\n+) over sentence ends, keeping thoughts intact.
-      - Protects common abbreviations (Dr., Mr., etc.) and decimal numbers (3.14) from split artifacts.
+      - Protects common abbreviations (Dr., Mr., etc.), decimals (3.14), and numbered lists (1. Item).
+      - Handles quotes and closing punctuation without orphan fragments.
+      - Emergency conjunction and word-level fallback for runaway unpunctuated text.
       - Guarantees balanced, cohesive speech chunks with natural cadence.
     """
     cleaned_text = text.strip()
@@ -68,8 +115,10 @@ def split_text_into_smart_chunks(
         else:
             # Paragraph is oversized: split into protected sentence units
             p_safe = p
-            abbrev_matches = list(re.finditer(_ABBREVIATIONS, p_safe, re.IGNORECASE))
             placeholders = {}
+
+            # Protect abbreviations
+            abbrev_matches = list(re.finditer(_ABBREVIATIONS, p_safe, re.IGNORECASE))
             for i, match in enumerate(reversed(abbrev_matches)):
                 key = f"__ABBR_{i}__"
                 placeholders[key] = match.group(0)
@@ -82,8 +131,15 @@ def split_text_into_smart_chunks(
                 placeholders[key] = match.group(0)
                 p_safe = p_safe[:match.start()] + key + p_safe[match.end():]
 
-            # Split by sentence-ending punctuation
-            sentences = re.split(r'(?<=[.!?])\s+', p_safe)
+            # Protect numbered lists (e.g. 1. Item)
+            list_matches = list(re.finditer(r'(?:(?<=^)|(?<=\s))\d+\.', p_safe))
+            for i, match in enumerate(reversed(list_matches)):
+                key = f"__LIST_{i}__"
+                placeholders[key] = match.group(0)
+                p_safe = p_safe[:match.start()] + key + p_safe[match.end():]
+
+            # Split by sentence-ending punctuation (handling quotes and closing parens)
+            sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?]["\'\u201d\u2019\)])\s+', p_safe)
             restored_sentences = []
             for s in sentences:
                 s_str = s.strip()
@@ -104,15 +160,17 @@ def split_text_into_smart_chunks(
                     curr_clause = []
                     curr_len = 0
                     for c_idx, c in enumerate(clauses):
-                        c_w = len(c.split())
-                        is_clause_p_end = is_p_end and (c_idx == len(clauses) - 1)
-                        if curr_len + c_w > max_words and curr_clause:
-                            units.append((" ".join(curr_clause).strip(), curr_len, False))
-                            curr_clause = [c]
-                            curr_len = c_w
-                        else:
-                            curr_clause.append(c)
-                            curr_len += c_w
+                        # Safeguard: if a clause still exceeds max_words, split via conjunctions/words
+                        c_sub_pieces = _split_oversized_clause(c, max_words_limit=max_words, target_words_limit=target_words)
+                        for sp in c_sub_pieces:
+                            sp_w = len(sp.split())
+                            if curr_len + sp_w > max_words and curr_clause:
+                                units.append((" ".join(curr_clause).strip(), curr_len, False))
+                                curr_clause = [sp]
+                                curr_len = sp_w
+                            else:
+                                curr_clause.append(sp)
+                                curr_len += sp_w
                     if curr_clause:
                         units.append((" ".join(curr_clause).strip(), curr_len, is_p_end))
 
@@ -180,7 +238,6 @@ def preview_chunks_info(text: str, target_words: int = 200, max_words: int = 280
 def format_chunk_preview_markdown(text: str, target_words: int = 200, max_words: int = 280, min_words: int = 80) -> str:
     """Formats chunk breakdown into clean Markdown for the Gradio UI."""
     info = preview_chunks_info(text, target_words, max_words, min_words)
-    info = preview_chunks_info(text, target_words, max_words)
     if info["chunks_count"] == 0:
         return "⚠️ *Script is empty. Paste your text above to see chunk distribution.*"
 
