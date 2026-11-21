@@ -26,33 +26,23 @@ def get_gpu_vram(gpu_id=1):
 
 def main():
     print("=" * 80)
-    print("  ASR MICROSERVICE MEMORY FOOTPRINT & LATENCY TEST (GPU 0)")
+    print("  ASR MICROSERVICE MEMORY FOOTPRINT & LATENCY TEST (GPU 1)")
     print("=" * 80)
 
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            print("CUDA not available on this host. Skipping GPU VRAM benchmark.")
-            return
-    except ImportError:
-        print("PyTorch / CUDA not installed locally. Skipping GPU VRAM benchmark.")
-        return
-
-    gpu_id = 0
     # 1. Baseline GPU VRAM
-    used_pre, total_vram = get_gpu_vram(gpu_id)
-    print(f"Pre-Load GPU {gpu_id} VRAM: {used_pre:.1f} MB / {total_vram:.1f} MB")
+    used_pre, total_vram = get_gpu_vram(1)
+    print(f"Pre-Load GPU 1 VRAM: {used_pre:.1f} MB / {total_vram:.1f} MB")
 
-    # 2. Initialize ASR Service on GPU 0
+    # 2. Initialize ASR Service on GPU 1
     t0 = time.time()
     from bz_ggml.asr import ASRService
-    asr = ASRService(cuda_device=gpu_id, model_size="turbo", compute_type="int8_float16")
+    asr = ASRService(cuda_device=1, model_size="small", compute_type="int8_float16")
     load_time = time.time() - t0
 
-    used_post, _ = get_gpu_vram(gpu_id)
+    used_post, _ = get_gpu_vram(1)
     vram_delta = used_post - used_pre
     print(f"ASR Service Loaded in {load_time:.2f}s")
-    print(f"Post-Load GPU {gpu_id} VRAM: {used_post:.1f} MB (Delta: +{vram_delta:.1f} MB)")
+    print(f"Post-Load GPU 1 VRAM: {used_post:.1f} MB (Delta: +{vram_delta:.1f} MB)")
 
     # Assert resident memory footprint is under 350 MiB
     assert vram_delta < 400.0, f"ASR resident memory too high: {vram_delta:.1f} MB (expected < 350 MB)"
