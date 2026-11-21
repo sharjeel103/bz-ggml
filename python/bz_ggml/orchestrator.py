@@ -600,11 +600,11 @@ class EngineOrchestrator:
                 self.completion_queue.put(JobDoneEvent(request_id=req.request_id, task_type=t_type, success=True))
 
     def _prepare_tts_chunks(self, script: str) -> List[str]:
-        """Applies the 2-minute / 300-word autonomous chunking rule."""
+        """Applies Elastic Semantic Chunking with balanced lookahead partitioning."""
         words = script.split()
-        if len(words) <= 300:
+        if len(words) <= 280:
             return [script]
-        return split_text_into_smart_chunks(script, target_words=100, max_words=150)
+        return split_text_into_smart_chunks(script, target_words=200, max_words=280, min_words=80)
 
     def _handle_tts_dispatch(self, req: RequestContext, job: StageJob):
         """Autonomous TTS Chunker & Dispatcher (2-Minute Rule)."""

@@ -30,32 +30,43 @@ _ABBREVIATIONS = (
 
 def split_text_into_smart_chunks(
     text: str,
-    target_words: int = 80,
-    max_words: int = 120
+    target_words: int = 200,
+    max_words: int = 280,
+    min_words: int = 80
 ) -> List[str]:
     """
-    Intelligently splits arbitrarily large text into cohesive speech chunks:
-      - Hierarchical splitting: Paragraphs (\\n\\n+) -> Sentences ([.!?]) -> Clauses ([,;:]).
-      - Never cuts a word or cohesive sentence in half.
-      - Protects common abbreviations and numbers from accidental splits.
-      - Default 80-120 words per chunk guarantees zero context overflow or truncation.
+    Elastic Semantic Chunking with Balanced Lookahead Partitioning:
+      - Never cuts below 280 words if text fits within GPU context (zero chunking overhead).
+      - For text > 280 words, calculates optimal balanced chunk count K = ceil(total_words / target_words).
+      - Prioritizes paragraph breaks (\\n\\n+) over sentence ends, keeping thoughts intact.
+      - Protects common abbreviations (Dr., Mr., etc.) and decimal numbers (3.14) from split artifacts.
+      - Guarantees balanced, cohesive speech chunks with natural cadence.
     """
     cleaned_text = text.strip()
     if not cleaned_text:
         return []
 
-    # 1. Break into paragraph blocks
+    words = cleaned_text.split()
+    total_words = len(words)
+    if total_words <= max_words:
+        return [cleaned_text]
+
+    # Calculate optimal balanced chunk target
+    k_chunks = max(2, math.ceil(total_words / float(target_words)))
+    ideal_words = total_words / float(k_chunks)
+
+    # 1. Break into raw paragraphs
     raw_paragraphs = [p.strip() for p in re.split(r'\n\s*\n+', cleaned_text) if p.strip()]
 
-    # 2. Decompose oversized paragraphs into sentence units
-    atomic_units = []
+    # 2. Decompose oversized paragraphs into sentence / clause units with boundary tags
+    units: List[Tuple[str, int, bool]] = []  # (text, word_count, is_paragraph_end)
+
     for p in raw_paragraphs:
-        words = p.split()
-        if len(words) <= max_words:
-            # Paragraph is already within safe size; keep it together
-            atomic_units.append(p)
+        p_words = p.split()
+        if len(p_words) <= max_words:
+            units.append((p, len(p_words), True))
         else:
-            # Paragraph is oversized: split into sentence units protecting abbreviations
+            # Paragraph is oversized: split into protected sentence units
             p_safe = p
             abbrev_matches = list(re.finditer(_ABBREVIATIONS, p_safe, re.IGNORECASE))
             placeholders = {}
@@ -64,17 +75,15 @@ def split_text_into_smart_chunks(
                 placeholders[key] = match.group(0)
                 p_safe = p_safe[:match.start()] + key + p_safe[match.end():]
 
-            # Protect decimal numbers (e.g., 3.14, 1.5)
+            # Protect decimal numbers (e.g. 3.14)
             dec_matches = list(re.finditer(r'\b\d+\.\d+\b', p_safe))
             for i, match in enumerate(reversed(dec_matches)):
                 key = f"__DEC_{i}__"
                 placeholders[key] = match.group(0)
                 p_safe = p_safe[:match.start()] + key + p_safe[match.end():]
 
-            # Split by sentence-ending punctuation followed by whitespace
+            # Split by sentence-ending punctuation
             sentences = re.split(r'(?<=[.!?])\s+', p_safe)
-
-            # Restore placeholders
             restored_sentences = []
             for s in sentences:
                 s_str = s.strip()
@@ -84,46 +93,63 @@ def split_text_into_smart_chunks(
                     s_str = s_str.replace(key, original)
                 restored_sentences.append(s_str)
 
-            for s_str in restored_sentences:
+            for s_idx, s_str in enumerate(restored_sentences):
+                is_p_end = (s_idx == len(restored_sentences) - 1)
                 s_words = s_str.split()
                 if len(s_words) <= max_words:
-                    atomic_units.append(s_str)
+                    units.append((s_str, len(s_words), is_p_end))
                 else:
                     # Single sentence exceeds max_words: split at natural clause pauses
                     clauses = re.split(r'(?<=[,;:\u2014])\s+', s_str)
                     curr_clause = []
                     curr_len = 0
-                    for c in clauses:
+                    for c_idx, c in enumerate(clauses):
                         c_w = len(c.split())
+                        is_clause_p_end = is_p_end and (c_idx == len(clauses) - 1)
                         if curr_len + c_w > max_words and curr_clause:
-                            atomic_units.append(" ".join(curr_clause).strip())
+                            units.append((" ".join(curr_clause).strip(), curr_len, False))
                             curr_clause = [c]
                             curr_len = c_w
                         else:
                             curr_clause.append(c)
                             curr_len += c_w
                     if curr_clause:
-                        atomic_units.append(" ".join(curr_clause).strip())
+                        units.append((" ".join(curr_clause).strip(), curr_len, is_p_end))
 
-    # 3. Greedily aggregate atomic units into balanced chunks
-    chunks = []
-    current_chunk = []
-    current_word_count = 0
+    # 3. Assemble atomic units using Elastic Lookahead Partitioning
+    chunks: List[str] = []
+    current_chunk: List[str] = []
+    current_words = 0
 
-    for unit in atomic_units:
-        unit_words = len(unit.split())
-        if current_word_count + unit_words > max_words and current_chunk:
+    total_units = len(units)
+    for i, (unit_text, unit_w, is_p_end) in enumerate(units):
+        remaining_units = units[i:]
+        remaining_words = sum(u[1] for u in remaining_units)
+
+        # Hard guard: if adding next unit exceeds max_words, cut now
+        if current_words + unit_w > max_words and current_chunk:
             chunks.append("\n\n".join(current_chunk).strip())
-            current_chunk = [unit]
-            current_word_count = unit_words
-        elif current_word_count + unit_words >= target_words:
-            current_chunk.append(unit)
-            chunks.append("\n\n".join(current_chunk).strip())
-            current_chunk = []
-            current_word_count = 0
-        else:
-            current_chunk.append(unit)
-            current_word_count += unit_words
+            current_chunk = [unit_text]
+            current_words = unit_w
+            continue
+
+        current_chunk.append(unit_text)
+        current_words += unit_w
+
+        rem_after = remaining_words - unit_w
+
+        # Elastic decision: cut at natural boundary if both current and remaining meet min_words
+        if current_words >= min_words and rem_after >= min_words:
+            # Paragraph boundary preference (highest priority)
+            if is_p_end and current_words >= (ideal_words * 0.75):
+                chunks.append("\n\n".join(current_chunk).strip())
+                current_chunk = []
+                current_words = 0
+            # Sentence boundary when approaching ideal target
+            elif current_words >= ideal_words:
+                chunks.append("\n\n".join(current_chunk).strip())
+                current_chunk = []
+                current_words = 0
 
     if current_chunk:
         chunks.append("\n\n".join(current_chunk).strip())
@@ -131,9 +157,9 @@ def split_text_into_smart_chunks(
     return chunks
 
 
-def preview_chunks_info(text: str, target_words: int = 80, max_words: int = 120) -> Dict[str, Any]:
+def preview_chunks_info(text: str, target_words: int = 200, max_words: int = 280, min_words: int = 80) -> Dict[str, Any]:
     """Provides structured inspection of chunk breakdown for UI preview."""
-    chunks = split_text_into_smart_chunks(text, target_words=target_words, max_words=max_words)
+    chunks = split_text_into_smart_chunks(text, target_words=target_words, max_words=max_words, min_words=min_words)
     total_words = len(text.strip().split()) if text.strip() else 0
     return {
         "total_words": total_words,
@@ -151,8 +177,9 @@ def preview_chunks_info(text: str, target_words: int = 80, max_words: int = 120)
     }
 
 
-def format_chunk_preview_markdown(text: str, target_words: int = 80, max_words: int = 120) -> str:
+def format_chunk_preview_markdown(text: str, target_words: int = 200, max_words: int = 280, min_words: int = 80) -> str:
     """Formats chunk breakdown into clean Markdown for the Gradio UI."""
+    info = preview_chunks_info(text, target_words, max_words, min_words)
     info = preview_chunks_info(text, target_words, max_words)
     if info["chunks_count"] == 0:
         return "⚠️ *Script is empty. Paste your text above to see chunk distribution.*"
