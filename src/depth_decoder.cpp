@@ -1,6 +1,7 @@
 #include "breeze/depth_decoder.h"
 #include "breeze/sampling.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -215,7 +216,7 @@ std::vector<std::vector<int>> DepthRunner::run_batched(BreezeModel & m, const st
         for (size_t i = 0; i < items.size(); i++) {
             const auto & it = items[i];
             SampleParams sp;
-            sp.temperature = m.cfg.depth_temperature;
+            sp.temperature = it.depth_temperature;
             sp.top_k = m.cfg.depth_top_k;
             sp.top_p = m.cfg.depth_top_p;
             if (it.sp) sp = *it.sp;
@@ -225,8 +226,12 @@ std::vector<std::vector<int>> DepthRunner::run_batched(BreezeModel & m, const st
                 const float * lc = out.data() + b_idx * vocab;
                 const float * lu = out.data() + (b_idx + 1) * vocab;
                 std::vector<float> comb_logits(vocab);
-                for (int v = 0; v < vocab; v++) {
-                    comb_logits[v] = lu[v] + it.cfg_scale * (lc[v] - lu[v]);
+                if (j <= it.depth_cfg_codebooks) {
+                    for (int v = 0; v < vocab; v++) {
+                        comb_logits[v] = lu[v] + it.cfg_scale * (lc[v] - lu[v]);
+                    }
+                } else {
+                    comb_logits.assign(lc, lc + vocab);
                 }
                 sampled = sample_token(comb_logits, sp, *it.rng);
                 cur_audio_codes[b_idx] = sampled + j * vs;
@@ -246,20 +251,118 @@ std::vector<std::vector<int>> DepthRunner::run_batched(BreezeModel & m, const st
     return results;
 }
 
+// Helper: applies per-item on-GPU CFG blending (when use_cfg && j <= depth_cfg_codebooks),
+// runs on-GPU argmax across the N items, and broadcasts each selected token back to nb branches.
+static void gpu_cfg_argmax_step(
+    ggml_context * ctx,
+    ggml_tensor * logits_j,       // [vocab, nb]
+    const std::vector<DepthRunner::BatchItem> & items,
+    const std::vector<int> & cond_b,
+    const std::vector<int> & uncond_b,
+    bool has_any_cfg,
+    int j,
+    ggml_tensor * & out_item_codes,  // [N], GGML_TYPE_I32
+    ggml_tensor * & out_branch_codes // [nb], GGML_TYPE_I32
+) {
+    const int N = (int) items.size();
+    if (!has_any_cfg) {
+        // Fast path: 1-to-1 item-to-branch mapping, single argmax directly on logits_j
+        ggml_tensor * s = ggml_argmax(ctx, logits_j); // [N]
+        out_item_codes = s;
+        out_branch_codes = s;
+        return;
+    }
+
+    const int64_t vocab = logits_j->ne[0];
+    ggml_tensor * eff_logits = nullptr;
+    for (int i = 0; i < N; i++) {
+        const auto & it = items[i];
+        ggml_tensor * lc = ggml_view_2d(ctx, logits_j, vocab, 1, logits_j->nb[1],
+                                        (size_t) cond_b[i] * logits_j->nb[1]);
+        ggml_tensor * l_i = lc;
+        if (it.use_cfg && j <= it.depth_cfg_codebooks) {
+            ggml_tensor * lu = ggml_view_2d(ctx, logits_j, vocab, 1, logits_j->nb[1],
+                                            (size_t) uncond_b[i] * logits_j->nb[1]);
+            ggml_tensor * diff = ggml_sub(ctx, lc, lu);
+            l_i = ggml_add(ctx, lu, ggml_scale(ctx, diff, it.cfg_scale));
+        }
+        eff_logits = eff_logits ? ggml_concat(ctx, eff_logits, l_i, 1) : l_i;
+    }
+
+    // On-GPU Argmax across all N items simultaneously
+    ggml_tensor * sampled_items = ggml_argmax(ctx, eff_logits); // [N], GGML_TYPE_I32
+    out_item_codes = sampled_items;
+
+    // Broadcast [N] -> [nb] so both cond and uncond branches receive the identical selected token
+    ggml_tensor * branch_codes = nullptr;
+    for (int i = 0; i < N; i++) {
+        ggml_tensor * v_i = ggml_view_1d(ctx, sampled_items, 1, (size_t) i * sampled_items->nb[0]);
+        branch_codes = branch_codes ? ggml_concat(ctx, branch_codes, v_i, 0) : v_i;
+        if (items[i].use_cfg) {
+            branch_codes = ggml_concat(ctx, branch_codes, v_i, 0);
+        }
+    }
+    out_branch_codes = branch_codes;
+}
+
 std::vector<std::vector<int>> DepthRunner::run_batched_unified_gpu(BreezeModel & m, const std::vector<BatchItem> & items) {
     if (items.empty()) return {};
 
-    // If any item uses CFG, gracefully fallback to run_batched to preserve complex multi-branch interpolation
-    for (const auto & it : items) {
-        if (it.use_cfg) {
-            return run_batched(m, items);
+    // Split stochastic-depth items (depth_temperature > 0) from greedy/CFG-greedy items (depth_temperature <= 0)
+    // so a single stochastic item never forces greedy items onto the slow 15-round-trip CPU path.
+    std::vector<BatchItem> greedy_items;
+    std::vector<size_t> greedy_map;
+    std::vector<BatchItem> sampled_items;
+    std::vector<size_t> sampled_map;
+
+    for (size_t i = 0; i < items.size(); i++) {
+        float dt = items[i].sp ? items[i].sp->temperature : items[i].depth_temperature;
+        if (dt > 0.0f) {
+            sampled_items.push_back(items[i]);
+            sampled_map.push_back(i);
+        } else {
+            greedy_items.push_back(items[i]);
+            greedy_map.push_back(i);
+        }
+    }
+
+    if (greedy_items.empty()) {
+        return run_batched(m, items);
+    }
+
+    std::vector<std::vector<int>> final_results(items.size());
+    if (!sampled_items.empty()) {
+        auto sampled_res = run_batched(m, sampled_items);
+        for (size_t k = 0; k < sampled_map.size(); k++) {
+            final_results[sampled_map[k]] = std::move(sampled_res[k]);
         }
     }
 
     const int nc = m.cfg.num_codebooks;
     const int vs = m.cfg.audio_vocab_size;
     const DepthConfig & c = m.cfg.dd;
-    const int nb = (int) items.size();
+    const int N = (int) greedy_items.size();
+
+    // Build branch layout (1 branch for cfg==1.0, 2 adjacent branches for cfg!=1.0)
+    std::vector<int> cond_b(N, 0);
+    std::vector<int> uncond_b(N, -1);
+    std::vector<int32_t> cb0_idx;
+    std::vector<float> flat_hiddens;
+    bool has_any_cfg = false;
+
+    for (int i = 0; i < N; i++) {
+        const auto & it = greedy_items[i];
+        cond_b[i] = (int) cb0_idx.size();
+        cb0_idx.push_back(it.cb0);
+        flat_hiddens.insert(flat_hiddens.end(), it.hidden_c.begin(), it.hidden_c.end());
+        if (it.use_cfg) {
+            has_any_cfg = true;
+            uncond_b[i] = (int) cb0_idx.size();
+            cb0_idx.push_back(it.cb0);
+            flat_hiddens.insert(flat_hiddens.end(), it.hidden_u.begin(), it.hidden_u.end());
+        }
+    }
+    const int nb = (int) cb0_idx.size();
 
     if (nb > n_branch) {
         kv.free();
@@ -267,18 +370,9 @@ std::vector<std::vector<int>> DepthRunner::run_batched_unified_gpu(BreezeModel &
     }
     kv.reset();
 
-    // Allocate single unified forward graph for all 15 depth steps (~2,500 nodes)
-    Graph g(16384);
-
-    // Initial inputs: cb0 and hiddens for step 1
-    std::vector<int32_t> cb0_idx(nb);
-    std::vector<float> flat_hiddens;
-    flat_hiddens.reserve((size_t) nb * m.cfg.hidden_size);
-
-    for (int i = 0; i < nb; i++) {
-        cb0_idx[i] = items[i].cb0;
-        flat_hiddens.insert(flat_hiddens.end(), items[i].hidden_c.begin(), items[i].hidden_c.end());
-    }
+    // Allocate single unified forward graph for all 15 depth steps
+    const size_t graph_nodes = has_any_cfg ? std::max((size_t) 32768, (size_t) N * 512 + 16384) : 16384;
+    Graph g(graph_nodes);
 
     ggml_tensor * aud_cb0 = g.input_i32(cb0_idx, nb);
     ggml_tensor * embed = ggml_get_rows(g.ctx, m.w("audio_embd.weight"), aud_cb0); // [2048, nb]
@@ -305,20 +399,19 @@ std::vector<std::vector<int>> DepthRunner::run_batched_unified_gpu(BreezeModel &
     ggml_tensor * hw0 = ggml_view_2d(g.ctx, head, head->ne[0], head->ne[1], head->nb[1], 0);
     ggml_tensor * logits1 = ggml_mul_mat(g.ctx, hw0, last); // [vocab, nb]
 
-    // Step 1: On-GPU Argmax (Zero PCIe Copy!)
-    ggml_tensor * sampled1 = ggml_argmax(g.ctx, logits1); // [nb], GGML_TYPE_I32
-    ggml_tensor * all_codes = ggml_reshape_2d(g.ctx, sampled1, nb, 1); // [nb, 1]
+    // Step 1: On-GPU CFG + Argmax (Zero PCIe Copy!)
+    ggml_tensor * item_codes1 = nullptr;
+    ggml_tensor * prev_sampled = nullptr;
+    gpu_cfg_argmax_step(g.ctx, logits1, greedy_items, cond_b, uncond_b, has_any_cfg, 1, item_codes1, prev_sampled);
+    ggml_tensor * all_codes = ggml_reshape_2d(g.ctx, item_codes1, N, 1); // [N, 1]
 
-    ggml_tensor * prev_sampled = sampled1;
-
-    // Steps 2 to 15: Chained continuously on the GPU with zero CPU round-trips
+    // Steps 2 to 15: Chained continuously on GPU with zero CPU round-trips
     for (int j = 2; j < nc; j++) {
-        const int prev_cb = j - 1; // codebook from previous step
-        const int cur_head = j - 1; // head for current step
+        const int prev_cb = j - 1;
+        const int cur_head = j - 1;
         const int start = j;
         const int total = (start + 1) * nb;
 
-        // In-VRAM lookup: view audio_embd.weight for codebook prev_cb
         size_t emb_offset = (size_t) (prev_cb * vs) * m.w("audio_embd.weight")->nb[1];
         ggml_tensor * emb_table = ggml_view_2d(g.ctx, m.w("audio_embd.weight"), m.cfg.hidden_size, vs,
                                                m.w("audio_embd.weight")->nb[1], emb_offset);
@@ -339,30 +432,28 @@ std::vector<std::vector<int>> DepthRunner::run_batched_unified_gpu(BreezeModel &
                                           (size_t) cur_head * head->nb[2]);
         ggml_tensor * logits_j = ggml_mul_mat(g.ctx, hw_j, x_j); // [vocab, nb]
 
-        // On-GPU Argmax
-        ggml_tensor * sampled_j = ggml_argmax(g.ctx, logits_j); // [nb]
-        ggml_tensor * s_2d = ggml_reshape_2d(g.ctx, sampled_j, nb, 1);
-        all_codes = ggml_concat(g.ctx, all_codes, s_2d, 1); // shape becomes [nb, j]
-
-        prev_sampled = sampled_j;
+        ggml_tensor * item_codes_j = nullptr;
+        gpu_cfg_argmax_step(g.ctx, logits_j, greedy_items, cond_b, uncond_b, has_any_cfg, j, item_codes_j, prev_sampled);
+        ggml_tensor * s_2d = ggml_reshape_2d(g.ctx, item_codes_j, N, 1);
+        all_codes = ggml_concat(g.ctx, all_codes, s_2d, 1); // [N, j]
     }
 
     // Single uninterrupted GPU execution for all 15 codebooks!
     g.compute(m.backend, all_codes);
 
-    // Read back the final 15 codebooks in one single contiguous 2.4 KB transfer
-    std::vector<int32_t> flat_codes((size_t) nb * (nc - 1));
+    // Read back the final 15 codebooks in one single contiguous transfer
+    std::vector<int32_t> flat_codes((size_t) N * (nc - 1));
     ggml_backend_tensor_get(all_codes, flat_codes.data(), 0, flat_codes.size() * sizeof(int32_t));
 
-    std::vector<std::vector<int>> results(nb, std::vector<int>(nc - 1));
-    for (int k = 0; k < nc - 1; k++) {
-        for (int i = 0; i < nb; i++) {
-            results[i][k] = flat_codes[(size_t) k * nb + i];
+    for (int i = 0; i < N; i++) {
+        std::vector<int> row(nc - 1);
+        for (int k = 0; k < nc - 1; k++) {
+            row[k] = flat_codes[(size_t) k * N + i];
         }
+        final_results[greedy_map[i]] = std::move(row);
     }
 
-    return results;
+    return final_results;
 }
 
 }
-

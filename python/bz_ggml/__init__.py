@@ -16,6 +16,7 @@ from .telemetry import TelemetryProfiler
 from .asr import ASRService, format_srt_time, load_audio_16k
 from .audio_pipeline import (
     split_text_into_smart_chunks,
+    split_text_with_anchor,
     stitch_audio_chunks,
     apply_resemble_enhancer,
     enhance_audio_array,
@@ -65,6 +66,7 @@ __all__ = [
     "serialize_breeze_voice",
     "deserialize_breeze_voice",
     "split_text_into_smart_chunks",
+    "split_text_with_anchor",
     "stitch_audio_chunks",
     "apply_resemble_enhancer",
     "enhance_audio_array",

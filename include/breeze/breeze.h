@@ -102,6 +102,15 @@ BREEZE_API int breeze_vocoder_stream_decode_batch(breeze_vocoder * voc, int batc
                                                  float * flat_pcm, const int * pcm_offsets,
                                                  int * out_n_samples);
 
+// Non-streaming VRAM-bounded tiled vocoder decode:
+// Walks arbitrary-length token streams in overlapping tiles (default ctx_frames=80, step_frames=240)
+// so peak activation VRAM stays <= ~1.2 GB with seamless 72-frame sliding-window continuity.
+// Returns total float32 PCM samples written (total_frames * 1920), or <= 0 on error.
+BREEZE_API int breeze_vocoder_decode_tiled(breeze_vocoder * voc,
+                                           const int * frames, int total_frames,
+                                           int ctx_frames, int step_frames,
+                                           float * out_pcm);
+
 // --- Multi-Session Continuous Batching / Dynamic Interleaved Scheduling C API ---
 // Create and prefill an independent session slot inside the generator's local GPU memory
 BREEZE_API int breeze_generator_session_create(breeze_generator * gen, int session_id, 
@@ -114,6 +123,17 @@ BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int s
                                                    const char * ref_text, const int * ref_codes, int ref_frames,
                                                    float cfg_scale, unsigned int seed, int max_new_tokens,
                                                    int * out_cb0, int * out_allocated_tokens);
+
+// Full-control session creation with decoupled Backbone vs Depth sampling parameters and timbre-lock CFG.
+// depth_temperature <= 0.0f selects fast on-GPU CFG + argmax (recommended for cross-chunk voice consistency).
+// depth_cfg_codebooks controls how many acoustic codebooks (1..15) apply CFG (default 15; e.g. 3 locks fine timbre).
+BREEZE_API int breeze_generator_session_create_v2(breeze_generator * gen, int session_id,
+                                                  const char * text, const char * instruction,
+                                                  const char * ref_text, const int * ref_codes, int ref_frames,
+                                                  float cfg_scale, float temperature, float top_p, int top_k,
+                                                  float repetition_penalty, float depth_temperature,
+                                                  int depth_cfg_codebooks, unsigned int seed, int max_new_tokens,
+                                                  int * out_cb0, int * out_allocated_tokens);
 
 
 // Step 1 frame for a specific active session. Returns next cb0 (or -1 if EOS reached)

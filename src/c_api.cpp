@@ -127,6 +127,8 @@ struct BreezeSession {
     int last_cb0 = -1;
     std::mt19937 rng;
     breeze::SampleParams bp;
+    breeze::SampleParams depth_sp;
+    int depth_cfg_codebooks = 15;
     std::vector<int> suppress;
     bool active = false;
     bool use_q4 = false;
@@ -322,11 +324,13 @@ int breeze_generator_step_frame(breeze_generator * gen, int cb0,
 }
 
 // --- Multi-Session Dynamic Batching & Interleaved Round-Robin Implementation ---
-BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int session_id, 
-                                                   const char * text, const char * instruction,
-                                                   const char * ref_text, const int * ref_codes, int ref_frames,
-                                                   float cfg_scale, unsigned int seed, int max_new_tokens,
-                                                   int * out_cb0, int * out_allocated_tokens) {
+BREEZE_API int breeze_generator_session_create_v2(breeze_generator * gen, int session_id,
+                                                  const char * text, const char * instruction,
+                                                  const char * ref_text, const int * ref_codes, int ref_frames,
+                                                  float cfg_scale, float temperature, float top_p, int top_k,
+                                                  float repetition_penalty, float depth_temperature,
+                                                  int depth_cfg_codebooks, unsigned int seed, int max_new_tokens,
+                                                  int * out_cb0, int * out_allocated_tokens) {
     if (!gen || !text || !out_cb0) return -1;
     try {
         // Free existing slot if session_id is being reused
@@ -341,10 +345,15 @@ BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int s
         sess->cfg_scale = cfg_scale > 0.0f ? cfg_scale : 1.0f;
         sess->use_cfg = (sess->cfg_scale != 1.0f);
         sess->rng.seed(seed);
-        sess->bp.temperature = 0.9f;
-        sess->bp.top_k = 50;
-        sess->bp.top_p = 1.0f;
-        sess->bp.repetition_penalty = 1.1f;
+        sess->bp.temperature = temperature;
+        sess->bp.top_k = top_k > 0 ? top_k : 40;
+        sess->bp.top_p = (top_p > 0.0f && top_p <= 1.0f) ? top_p : 0.88f;
+        sess->bp.repetition_penalty = repetition_penalty > 0.0f ? repetition_penalty : 1.1f;
+        sess->depth_sp.temperature = depth_temperature;
+        sess->depth_sp.top_k = gen->model.cfg.depth_top_k;
+        sess->depth_sp.top_p = gen->model.cfg.depth_top_p;
+        sess->depth_sp.repetition_penalty = 1.0f;
+        sess->depth_cfg_codebooks = (depth_cfg_codebooks >= 0 && depth_cfg_codebooks <= 15) ? depth_cfg_codebooks : 15;
         sess->suppress.clear();
         for (int t = gen->model.cfg.codec_codebook_size; t < gen->model.cfg.audio_vocab_size; t++) {
             sess->suppress.push_back(t);
@@ -448,6 +457,18 @@ BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int s
         g_error = e.what();
         return -1;
     }
+}
+
+BREEZE_API int breeze_generator_session_create_ext(breeze_generator * gen, int session_id,
+                                                   const char * text, const char * instruction,
+                                                   const char * ref_text, const int * ref_codes, int ref_frames,
+                                                   float cfg_scale, unsigned int seed, int max_new_tokens,
+                                                   int * out_cb0, int * out_allocated_tokens) {
+    return breeze_generator_session_create_v2(
+        gen, session_id, text, instruction, ref_text, ref_codes, ref_frames,
+        cfg_scale, 0.60f, 0.88f, 40, 1.1f, 0.0f, 15,
+        seed, max_new_tokens, out_cb0, out_allocated_tokens
+    );
 }
 
 int breeze_generator_session_create(breeze_generator * gen, int session_id, 
@@ -626,11 +647,11 @@ int breeze_generator_sessions_step_batched(breeze_generator * gen,
             item.use_cfg = sess->use_cfg;
             item.hidden_c = sess->last_hidden;
             if (sess->use_cfg) item.hidden_u = sess->last_hidden_u;
+            (void) seeds;
             item.rng = &sess->rng;
-            if (seeds) {
-                sess->rng.seed(seeds[i]);
-            }
-            item.sp = nullptr;
+            item.depth_temperature = sess->depth_sp.temperature;
+            item.depth_cfg_codebooks = sess->depth_cfg_codebooks;
+            item.sp = &sess->depth_sp;
 
             if (sess->use_q4 && gen->has_q4_dd) {
                 items_q4.push_back(std::move(item));
@@ -811,11 +832,11 @@ BREEZE_API int breeze_generator_sessions_step_burst(breeze_generator * gen,
                 item.use_cfg = sess->use_cfg;
                 item.hidden_c = sess->last_hidden;
                 if (sess->use_cfg) item.hidden_u = sess->last_hidden_u;
+                (void) seeds;
                 item.rng = &sess->rng;
-                if (seeds) {
-                    sess->rng.seed(seeds[i] + step);
-                }
-                item.sp = nullptr;
+                item.depth_temperature = sess->depth_sp.temperature;
+                item.depth_cfg_codebooks = sess->depth_cfg_codebooks;
+                item.sp = &sess->depth_sp;
 
                 if (sess->use_q4 && gen->has_q4_dd) {
                     items_q4.push_back(std::move(item));
@@ -1158,6 +1179,56 @@ int breeze_vocoder_session_decode_batch(breeze_vocoder * voc, int batch_size,
     } catch (const std::exception & e) {
         g_error = e.what();
         return 0;
+    }
+}
+
+BREEZE_API int breeze_vocoder_decode_tiled(breeze_vocoder * voc,
+                                           const int * frames, int total_frames,
+                                           int ctx_frames, int step_frames,
+                                           float * out_pcm) {
+    if (!voc || !frames || total_frames <= 0 || !out_pcm) return 0;
+    std::lock_guard<std::mutex> lock(voc->voc_mutex);
+    try {
+        const int nc = voc->codec.m ? voc->codec.m->cfg.num_codebooks : 16;
+        const int spf = voc->codec.m ? voc->codec.m->cfg.samples_per_frame : 1920;
+        const int ctx = ctx_frames > 0 ? ctx_frames : 80;
+        const int step = step_frames > 0 ? step_frames : 240;
+
+        int total_written = 0;
+        for (int start = 0; start < total_frames; start += step) {
+            const int count = std::min(step, total_frames - start);
+            const int cs = start > ctx ? start - ctx : 0;
+            const int tile_T = start + count - cs;
+
+            std::vector<int> sub(
+                frames + (size_t) cs * nc,
+                frames + (size_t) (start + count) * nc
+            );
+            std::vector<float> audio = voc->codec.decode(sub, tile_T);
+
+            const size_t skip = (size_t) (start - cs) * spf;
+            const size_t want = (size_t) count * spf;
+            float * dst = out_pcm + (size_t) start * spf;
+
+            if (audio.size() >= skip + want) {
+                std::memcpy(dst, audio.data() + skip, want * sizeof(float));
+                total_written += (int) want;
+            } else if (audio.size() > skip) {
+                const size_t avail = audio.size() - skip;
+                std::memcpy(dst, audio.data() + skip, avail * sizeof(float));
+                if (avail < want) {
+                    std::memset(dst + avail, 0, (want - avail) * sizeof(float));
+                }
+                total_written += (int) want;
+            } else {
+                std::memset(dst, 0, want * sizeof(float));
+                total_written += (int) want;
+            }
+        }
+        return total_written;
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return -1;
     }
 }
 

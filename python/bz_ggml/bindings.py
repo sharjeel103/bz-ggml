@@ -100,6 +100,17 @@ class BreezeLib:
         ]
         self.lib.breeze_generator_session_create_ext.restype = ctypes.c_int
 
+        if hasattr(self.lib, "breeze_generator_session_create_v2"):
+            self.lib.breeze_generator_session_create_v2.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
+                ctypes.c_char_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int,
+                ctypes.c_float, ctypes.c_float, ctypes.c_int,
+                ctypes.c_uint32, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)
+            ]
+            self.lib.breeze_generator_session_create_v2.restype = ctypes.c_int
+
 
         self.lib.breeze_generator_session_step.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)
@@ -209,6 +220,15 @@ class BreezeLib:
         ]
         self.lib.breeze_vocoder_stream_decode_batch.restype = ctypes.c_int
 
+        if hasattr(self.lib, "breeze_vocoder_decode_tiled"):
+            self.lib.breeze_vocoder_decode_tiled.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float)
+            ]
+            self.lib.breeze_vocoder_decode_tiled.restype = ctypes.c_int
+
 
 class GeneratorHandle:
     def __init__(self, lib: BreezeLib, model_path: str, cuda_device: int = 0):
@@ -267,9 +287,12 @@ class GeneratorHandle:
         )
 
     def session_create_ext(
-        self, session_id: int, text: str, instruction: str = "Speak clearly and naturally.", 
+        self, session_id: int, text: str, instruction: str = "Speak clearly and naturally.",
         ref_text: Optional[str] = None, ref_codes: Optional[List[int]] = None, ref_frames: int = 0,
-        cfg_scale: float = 1.0, seed: int = 42, max_new_tokens: int = 0, use_q4: bool = False
+        cfg_scale: float = 1.0, seed: int = 42, max_new_tokens: int = 0, use_q4: bool = False,
+        temperature: float = 0.60, top_p: float = 0.88, top_k: int = 40,
+        repetition_penalty: float = 1.1, depth_temperature: float = 0.0,
+        depth_cfg_codebooks: int = 15
     ) -> Tuple[int, int]:
         cb0_buf = ctypes.c_int()
         alloc_buf = ctypes.c_int()
@@ -279,14 +302,27 @@ class GeneratorHandle:
             c_ref_codes = (ctypes.c_int * len(ref_codes))(*ref_codes)
         else:
             c_ref_codes = None
-        res = self.lib.lib.breeze_generator_session_create_ext(
-            self.handle, session_id, text.encode("utf-8"), c_ins,
-            c_ref_text, c_ref_codes, ref_frames,
-            ctypes.c_float(cfg_scale), ctypes.c_uint32(seed), ctypes.c_int(max_new_tokens),
-            ctypes.byref(cb0_buf), ctypes.byref(alloc_buf)
-        )
+
+        if hasattr(self.lib.lib, "breeze_generator_session_create_v2"):
+            res = self.lib.lib.breeze_generator_session_create_v2(
+                self.handle, session_id, text.encode("utf-8"), c_ins,
+                c_ref_text, c_ref_codes, ref_frames,
+                ctypes.c_float(cfg_scale), ctypes.c_float(temperature),
+                ctypes.c_float(top_p), ctypes.c_int(top_k),
+                ctypes.c_float(repetition_penalty), ctypes.c_float(depth_temperature),
+                ctypes.c_int(depth_cfg_codebooks),
+                ctypes.c_uint32(seed), ctypes.c_int(max_new_tokens),
+                ctypes.byref(cb0_buf), ctypes.byref(alloc_buf)
+            )
+        else:
+            res = self.lib.lib.breeze_generator_session_create_ext(
+                self.handle, session_id, text.encode("utf-8"), c_ins,
+                c_ref_text, c_ref_codes, ref_frames,
+                ctypes.c_float(cfg_scale), ctypes.c_uint32(seed), ctypes.c_int(max_new_tokens),
+                ctypes.byref(cb0_buf), ctypes.byref(alloc_buf)
+            )
         if res != 0:
-            raise RuntimeError(f"Session create ext failed on Generator (device {self.device}, session {session_id})")
+            raise RuntimeError(f"Session create failed on Generator (device {self.device}, session {session_id})")
         if use_q4:
             self.session_set_q4(session_id, True)
         return cb0_buf.value, alloc_buf.value
@@ -593,6 +629,48 @@ class VocoderHandle:
             cnt = c_out_samples[b]
             results.append(pcm_arr[start:start + cnt])
         return results
+
+    def decode_tiled(self, frames_tokens: List[int], ctx_frames: int = 80, step_frames: int = 240):
+        """
+        Non-streaming VRAM-bounded tiled vocoder decode returning float32 numpy PCM.
+        Caps peak vocoder VRAM at ~0.9-1.2 GB regardless of total audio duration while
+        preserving full 72-frame sliding-window continuity across every tile boundary.
+        """
+        import numpy as np
+        n_frames = len(frames_tokens) // 16
+        if n_frames <= 0:
+            return np.zeros(0, dtype=np.float32)
+
+        total_samples = n_frames * 1920
+        out_np = np.empty(total_samples, dtype=np.float32)
+        c_frames = (ctypes.c_int * (n_frames * 16))(*frames_tokens[: n_frames * 16])
+        c_out = out_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        if hasattr(self.lib.lib, "breeze_vocoder_decode_tiled"):
+            written = self.lib.lib.breeze_vocoder_decode_tiled(
+                self.handle, c_frames, n_frames, int(ctx_frames), int(step_frames), c_out
+            )
+            if written < 0:
+                raise RuntimeError(f"breeze_vocoder_decode_tiled failed on CUDA device {self.device}")
+            return out_np[:written]
+
+        # Fallback if running against an older compiled libbreeze.so
+        ctx = max(1, int(ctx_frames))
+        step = max(1, int(step_frames))
+        parts = []
+        for start in range(0, n_frames, step):
+            count = min(step, n_frames - start)
+            cs = max(0, start - ctx)
+            tile_T = start + count - cs
+            sub = frames_tokens[cs * 16 : (start + count) * 16]
+            c_sub = (ctypes.c_int * len(sub))(*sub)
+            c_buf = (ctypes.c_float * (tile_T * 1920))()
+            n_samp = self.lib.lib.breeze_vocoder_stream_decode(self.handle, c_sub, tile_T, c_buf)
+            skip = (start - cs) * 1920
+            want = count * 1920
+            arr = np.ctypeslib.as_array(c_buf, shape=(tile_T * 1920,))
+            parts.append(arr[skip : min(n_samp, skip + want)].copy())
+        return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
     def close(self):
         if self.handle:

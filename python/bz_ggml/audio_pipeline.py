@@ -77,7 +77,7 @@ def split_text_into_smart_chunks(
     text: str,
     target_words: int = 200,
     max_words: int = 280,
-    min_words: int = 80
+    min_words: Optional[int] = None
 ) -> List[str]:
     """
     Elastic Semantic Chunking with Balanced Lookahead Partitioning:
@@ -97,6 +97,11 @@ def split_text_into_smart_chunks(
     total_words = len(words)
     if total_words <= max_words:
         return [cleaned_text]
+
+    if min_words is None:
+        min_words = min(80, max(1, int(target_words * 0.4)))
+    else:
+        min_words = min(min_words, max_words)
 
     # Calculate optimal balanced chunk target
     k_chunks = max(2, math.ceil(total_words / float(target_words)))
@@ -215,7 +220,66 @@ def split_text_into_smart_chunks(
     return chunks
 
 
-def preview_chunks_info(text: str, target_words: int = 200, max_words: int = 280, min_words: int = 80) -> Dict[str, Any]:
+def split_text_with_anchor(
+    text: str,
+    anchor_target_words: int = 35,
+    anchor_max_words: int = 50,
+    target_words: int = 110,
+    max_words: int = 140
+) -> List[str]:
+    """
+    Splits a long script for Anchor-First 1 + (N-1) parallel generation:
+      - Chunk 0: short 25-50 word opening anchor (~5-8 seconds of speech) ending on a clean
+        sentence/clause boundary so it establishes the exact live voice, tone, energy, and room
+        capture without exceeding Breeze's safe reference-prompt length (~150-250 chars).
+      - Chunks 1..N-1: balanced 100-140 word chunks generated in parallel across both GPUs.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+
+    words = cleaned.split()
+    if len(words) <= anchor_max_words:
+        return [cleaned]
+
+    # Split into sentence-level units reusing the abbreviation-safe splitter
+    sentence_units = split_text_into_smart_chunks(cleaned, target_words=1, max_words=anchor_max_words)
+    if len(sentence_units) <= 1:
+        return split_text_into_smart_chunks(cleaned, target_words=target_words, max_words=max_words)
+
+    anchor_parts = []
+    anchor_wc = 0
+    idx = 0
+    while idx < len(sentence_units):
+        u = sentence_units[idx]
+        u_wc = len(u.split())
+        if anchor_parts and (anchor_wc + u_wc > anchor_max_words):
+            break
+        anchor_parts.append(u)
+        anchor_wc += u_wc
+        idx += 1
+        if anchor_wc >= anchor_target_words:
+            break
+
+    anchor_text = " ".join(anchor_parts).strip()
+    remaining_text = "\n\n".join(sentence_units[idx:]).strip()
+    if not remaining_text:
+        return [anchor_text]
+
+    follower_chunks = split_text_into_smart_chunks(
+        remaining_text,
+        target_words=target_words,
+        max_words=max_words
+    )
+    return [anchor_text] + follower_chunks
+
+
+def preview_chunks_info(
+    text: str,
+    target_words: int = 80,
+    max_words: int = 120,
+    min_words: Optional[int] = None
+) -> Dict[str, Any]:
     """Provides structured inspection of chunk breakdown for UI preview."""
     chunks = split_text_into_smart_chunks(text, target_words=target_words, max_words=max_words, min_words=min_words)
     total_words = len(text.strip().split()) if text.strip() else 0
@@ -235,7 +299,12 @@ def preview_chunks_info(text: str, target_words: int = 200, max_words: int = 280
     }
 
 
-def format_chunk_preview_markdown(text: str, target_words: int = 200, max_words: int = 280, min_words: int = 80) -> str:
+def format_chunk_preview_markdown(
+    text: str,
+    target_words: int = 80,
+    max_words: int = 120,
+    min_words: Optional[int] = None
+) -> str:
     """Formats chunk breakdown into clean Markdown for the Gradio UI."""
     info = preview_chunks_info(text, target_words, max_words, min_words)
     if info["chunks_count"] == 0:
@@ -419,31 +488,49 @@ def master_audio_array(
     preset: str = "optionA_rich_bass"
 ) -> Tuple[np.ndarray, int]:
     """
-    Applies broadcast-grade studio mastering in-memory via FFmpeg:
+    Applies broadcast-grade studio mastering purely in-memory via FFmpeg pipe:0 -> pipe:1
+    (zero disk I/O):
       - 70 Hz highpass filter (removes sub-bass rumble)
       - EBU R128 gentle loudnorm (-16 LUFS broadcast target, -3 dB TruePeak)
       - 135 Hz parametric bass warmth boost (+3.5 dB)
       - True peak limiter ceiling (0.85) to guarantee 0 clipping.
     """
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as in_f:
-        in_path = in_f.name
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out_f:
-        out_path = out_f.name
+    if pcm is None or len(pcm) == 0:
+        return np.zeros(0, dtype=np.float32), int(sr)
 
-    try:
-        sf.write(in_path, pcm, sr, subtype="PCM_16")
-        apply_studio_normalization(in_path, out_path, preset=preset, target_sr=sr)
-        out_pcm, out_sr = sf.read(out_path, dtype="float32")
-        if out_pcm.ndim > 1:
-            out_pcm = out_pcm.mean(axis=1)
-        return out_pcm.astype(np.float32), int(out_sr)
-    finally:
-        for p in (in_path, out_path):
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
+    if preset == "optionA_rich_bass":
+        filter_str = (
+            "highpass=f=70,"
+            "loudnorm=I=-16.0:TP=-3.0:LRA=10,"
+            "equalizer=f=135:t=q:w=0.8:g=3.5,"
+            "alimiter=limit=0.85:level=false:asc=0"
+        )
+    elif preset == "gentle_loudnorm":
+        filter_str = "highpass=f=70,loudnorm=I=-16.0:TP=-2.0:LRA=11,alimiter=limit=0.90:level=false:asc=0"
+    else:
+        filter_str = "loudnorm=I=-16.0:TP=-2.0:LRA=11"
+
+    pcm_f32 = np.ascontiguousarray(pcm, dtype=np.float32)
+    cmd = [
+        FFMPEG_EXE,
+        "-v", "error",
+        "-f", "f32le",
+        "-ar", str(int(sr)),
+        "-ac", "1",
+        "-i", "pipe:0",
+        "-af", filter_str,
+        "-f", "f32le",
+        "-ar", str(int(sr)),
+        "-ac", "1",
+        "pipe:1",
+    ]
+    res = subprocess.run(cmd, input=pcm_f32.tobytes(), capture_output=True)
+    if res.returncode != 0 or not res.stdout:
+        print(f"[FFmpeg Warning] In-memory studio mastering failed: {res.stderr.decode(errors='ignore').strip()}. Returning unmastered audio.")
+        return pcm_f32, int(sr)
+
+    out_pcm = np.frombuffer(res.stdout, dtype=np.float32).copy()
+    return out_pcm, int(sr)
 
 
 def apply_studio_normalization(

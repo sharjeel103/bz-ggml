@@ -1,44 +1,39 @@
 """
 Unified Engine Orchestrator, Decoupled Job Queues & Non-Blocking State Machine.
-Provides a completely decoupled, production-grade engine interface:
-  - Autonomous TTS Subsystem: Owns script chunking (<= 300w single chunk vs > 300w semantic),
-    tts_queue (150-chunk ceiling), and asynchronous out-of-order chunk assembly (TTSAssemblyManager).
-  - Dedicated Stage Queues: tts (150), enhance (8, conc=1), asr (20, conc=1), voice_reg (15, conc=1),
-    master (20, conc=4), upload (100+, conc=16).
-  - Pure Routing Orchestrator: Zero inference in orchestrator, event-driven completion_queue,
-    non-blocking microsecond routing (< 10µs), and isolated fault containment.
-  - Standalone Telemetry Snapshot: Thread-safe read-only snapshot for 1.0s telemetry daemon.
-  - Zero filesystem dependencies: In-memory return contract (ParcelResult) and direct cloud upload.
+Production non-streaming dual-T4 pipeline:
+  - Anchor-First 1 + (N-1) Parallel TTS Subsystem:
+      * <= 200 words (and <= 2,000 estimated tokens): single chunk -> tiled vocode.
+      * > 200 words: Chunk 0 (25-50 word opening anchor) establishes live voice/tone/energy
+        with full CFG -> Chunks 1..N-1 fan out in parallel across GPU 0 & GPU 1 anchored to
+        Chunk 0's tokens -> concatenated token stream decoded once via bounded tiled vocoder
+        (ctx=80, step=240, <= ~1.2 GB VRAM).
+  - Dedicated Stage Queues: persistent DualInstanceCluster TTS queue, Vocode (conc=2),
+    Enhance (8, conc=1 on GPU 1), ASR (20, conc=1 on GPU 0), Voice Reg (15, conc=1 on GPU 0),
+    Master (20, conc=4 pure in-memory FFmpeg CPU), Upload (100, conc=8 async I/O).
+  - Zero temporary WAV files on disk; full in-memory PCM/token hand-offs and real cancellation.
 """
 
-import gc
-import io
 import math
-import os
 import queue
-import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, List, Dict, Any, Tuple, Callable, Union
+from typing import Optional, List, Dict, Any, Tuple, Callable
 import numpy as np
-import soundfile as sf
 import urllib.request
 
-from .cluster import DualInstanceCluster, UserTask, VoiceConversionTask
+from .cluster import DualInstanceCluster, UserTask, estimate_speech_profile
 from .asr import ASRService
 from .audio_pipeline import (
     split_text_into_smart_chunks,
-    stitch_audio_chunks,
+    split_text_with_anchor,
     enhance_audio_array,
     master_audio_array,
-    format_chunk_preview_markdown,
     load_any_audio,
     encode_pcm_to_mp3_bytes,
-    encode_pcm_to_wav_bytes
+    encode_pcm_to_wav_bytes,
 )
-from .bindings import serialize_breeze_voice, deserialize_breeze_voice
 
 
 class TaskType(str, Enum):
@@ -73,11 +68,18 @@ class Parcel:
         voice_name: Optional[str] = None,
         instruction: str = "Speak clearly and naturally.",
         cfg_scale: float = 1.5,
-        temperature: float = 0.25,
+        follower_cfg_scale: Optional[float] = None,
+        temperature: float = 0.60,
+        top_p: float = 0.88,
+        top_k: int = 40,
+        repetition_penalty: float = 1.1,
+        depth_temperature: float = 0.0,
+        depth_cfg_codebooks: int = 15,
         seed: int = 42,
         pause_ms: int = 200,
-        target_words: int = 80,
-        max_words: int = 120,
+        anchor_words: int = 35,
+        target_words: int = 110,
+        max_words: int = 140,
         enhance: bool = True,
         master: bool = True,
         srt: bool = True,
@@ -86,9 +88,9 @@ class Parcel:
         ref_text: Optional[str] = None,
         return_artifacts: Optional[List[str]] = None,
         upload_targets: Optional[Dict[str, str]] = None,
-        parcel_id: Optional[str] = None
-    ) -> 'Parcel':
-        """Constructs a standard long-form text-to-speech production pipeline Parcel."""
+        parcel_id: Optional[str] = None,
+    ) -> "Parcel":
+        """Constructs a standard long-form non-streaming TTS production pipeline Parcel."""
         p_id = parcel_id or f"parcel_tts_{int(time.time() * 1000)}"
         tasks = [TaskSpec(TaskType.TTS)]
         if enhance:
@@ -105,22 +107,29 @@ class Parcel:
             "voice_name": voice_name,
             "instruction": instruction,
             "cfg_scale": float(cfg_scale),
+            "follower_cfg_scale": float(follower_cfg_scale) if follower_cfg_scale is not None else None,
             "temperature": float(temperature),
+            "top_p": float(top_p),
+            "top_k": int(top_k),
+            "repetition_penalty": float(repetition_penalty),
+            "depth_temperature": float(depth_temperature),
+            "depth_cfg_codebooks": int(depth_cfg_codebooks),
             "seed": int(seed),
             "pause_ms": int(pause_ms),
+            "anchor_words": int(anchor_words),
             "target_words": int(target_words),
             "max_words": int(max_words),
             "ref_codes": ref_codes,
             "ref_frames": int(ref_frames),
             "ref_text": ref_text,
-            "upload_targets": upload_targets
+            "upload_targets": upload_targets,
         }
         return cls(
             parcel_id=p_id,
             tasks=tasks,
             payload=payload,
             return_artifacts=return_artifacts,
-            upload_targets=upload_targets
+            upload_targets=upload_targets,
         )
 
     @classmethod
@@ -133,8 +142,8 @@ class Parcel:
         max_duration_s: float = 10.0,
         return_artifacts: Optional[List[str]] = None,
         upload_targets: Optional[Dict[str, str]] = None,
-        parcel_id: Optional[str] = None
-    ) -> 'Parcel':
+        parcel_id: Optional[str] = None,
+    ) -> "Parcel":
         """Constructs a Voice Persona Registration pipeline Parcel with strict <= 10s auto-trimming."""
         p_id = parcel_id or f"parcel_vreg_{int(time.time() * 1000)}"
         tasks = []
@@ -150,14 +159,14 @@ class Parcel:
             "audio_input": audio_input,
             "transcript": transcript,
             "max_duration_s": float(max_duration_s),
-            "upload_targets": upload_targets
+            "upload_targets": upload_targets,
         }
         return cls(
             parcel_id=p_id,
             tasks=tasks,
             payload=payload,
             return_artifacts=return_artifacts,
-            upload_targets=upload_targets
+            upload_targets=upload_targets,
         )
 
 
@@ -196,17 +205,14 @@ class EngineCapabilities:
     enhancer_device_index: int = 1
 
     def validate_parcel(self, parcel: Parcel) -> None:
-        """Validates that all requested tasks can be fulfilled by the running engine instance."""
         task_types = [t.task_type for t in parcel.tasks]
         if TaskType.ENHANCE in task_types and not self.enable_enhancer:
             raise ValueError(
-                "Requested TaskType.ENHANCE but Resemble Enhancer is disabled on this engine instance. "
-                "Restart engine with --enable-enhancer or omit ENHANCE task."
+                "Requested TaskType.ENHANCE but Resemble Enhancer is disabled on this engine instance."
             )
         if TaskType.ASR in task_types and not self.enable_asr:
             raise ValueError(
-                "Requested TaskType.ASR but ASR Micro-Service is disabled on this engine instance. "
-                "Restart engine with --enable-asr or omit ASR task."
+                "Requested TaskType.ASR but ASR Micro-Service is disabled on this engine instance."
             )
         if TaskType.VOICE_REGISTER in task_types and not self.enable_asr and not parcel.payload.get("transcript"):
             raise ValueError(
@@ -252,31 +258,55 @@ class JobDoneEvent:
 
 
 class RequestTTSAssembly:
-    """Tracks out-of-order completion of TTS chunks for a single request and stitches them."""
-    def __init__(self, request_id: str, total_chunks: int, sample_rate: int = 24000, pause_ms: int = 200):
+    """
+    Per-request token-level assembly state machine for Anchor-First 1 + (N-1) parallel TTS.
+    Collects 16-codebook token arrays out-of-order in memory without touching disk.
+    """
+
+    def __init__(
+        self,
+        request_id: str,
+        chunks_text: List[str],
+        sample_rate: int = 24000,
+        started_at: Optional[float] = None,
+    ):
         self.request_id = request_id
-        self.total_chunks = total_chunks
+        self.chunks_text = chunks_text
+        self.total_chunks = len(chunks_text)
         self.sample_rate = sample_rate
-        self.pause_ms = pause_ms
+        self.started_at = started_at or time.time()
         self.completed_count = 0
-        self.chunks_pcm: List[Optional[np.ndarray]] = [None] * total_chunks
+        self.failed = False
+        self.chunks_tokens: List[Optional[List[int]]] = [None] * self.total_chunks
         self.lock = threading.Lock()
 
-    def add_chunk(self, chunk_index: int, pcm_data: np.ndarray) -> Optional[np.ndarray]:
+    def record_chunk_tokens(self, chunk_index: int, tokens: List[int]) -> Optional[List[int]]:
+        """
+        Records a completed chunk's 16-codebook tokens.
+        Returns the concatenated full token stream when all chunks have arrived, else None.
+        """
         with self.lock:
-            if self.chunks_pcm[chunk_index] is None:
-                self.chunks_pcm[chunk_index] = pcm_data
+            if self.failed:
+                return None
+            if self.chunks_tokens[chunk_index] is None:
+                self.chunks_tokens[chunk_index] = tokens
                 self.completed_count += 1
 
             if self.completed_count == self.total_chunks:
-                # All chunks arrived! Stitch in exact chronological index order with 200ms breath gap
-                valid_chunks = [c for c in self.chunks_pcm if c is not None]
-                if not valid_chunks:
-                    return np.zeros(0, dtype=np.float32)
-                if len(valid_chunks) == 1:
-                    return valid_chunks[0]
-                return stitch_audio_chunks(valid_chunks, sample_rate=self.sample_rate, pause_ms=self.pause_ms)
+                merged: List[int] = []
+                for c_toks in self.chunks_tokens:
+                    if c_toks:
+                        merged.extend(c_toks)
+                return merged
         return None
+
+    def mark_failed(self) -> bool:
+        """Marks assembly failed; returns True only on the first failure to avoid duplicate events."""
+        with self.lock:
+            if self.failed:
+                return False
+            self.failed = True
+            return True
 
 
 @dataclass
@@ -300,12 +330,13 @@ class RequestContext:
     completed_stages: int = 0
     stage_progress: float = 0.0
     overall_progress: float = 0.0
-    status: str = "QUEUED"  # QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED
+    status: str = "QUEUED"
     error_message: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     stage_started_at: float = field(default_factory=time.time)
     estimated_duration_s: float = 1.0
     completion_event: threading.Event = field(default_factory=threading.Event)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
     result: Optional[ParcelResult] = None
     progress_callback: Optional[Callable[[str, float, str], None]] = None
 
@@ -313,36 +344,31 @@ class RequestContext:
 class EngineOrchestrator:
     """
     Decoupled Production Engine Orchestrator.
-    Acts as a pure DAG router and non-blocking event-driven coordinator across independent stage queues:
-      - TTS Subsystem: Chunking threshold (<= 300w single chunk), tts_queue (150 chunks),
-        asynchronous out-of-order chunk assembly (TTSAssemblyManager).
-      - Enhance: enhance_queue (Ceiling: 8, Concurrency: 1 on GPU 1).
-      - ASR: asr_queue (Ceiling: 20, Concurrency: 1 on GPU 0).
-      - Voice Reg: voice_reg_queue (Ceiling: 15, Concurrency: 1 on GPU 0).
-      - Master: master_queue (Ceiling: 20, Concurrency: 4 on CPU).
-      - Upload: upload_queue (Ceiling: 100+, Concurrency: 16 async I/O).
-      - Orchestrator Inbox: completion_queue drains completions in < 10µs, never blocking workers.
+    Routes parcels through dedicated stage queues while delegating parallel TTS execution
+    directly to the persistent DualInstanceCluster.
     """
-    # Hardware-derived queue limits
+
     MAX_QUEUE_TTS = 150
     MAX_QUEUE_ENHANCE = 8
     MAX_QUEUE_ASR = 20
     MAX_QUEUE_VOICE_REG = 15
     MAX_QUEUE_MASTER = 20
     MAX_QUEUE_UPLOAD = 100
+    SINGLE_CHUNK_MAX_WORDS = 200
+    SINGLE_CHUNK_MAX_TOKENS = 2000
 
     def __init__(
         self,
         cluster: DualInstanceCluster,
         asr_service: Optional[ASRService] = None,
-        capabilities: Optional[EngineCapabilities] = None
+        capabilities: Optional[EngineCapabilities] = None,
     ):
         self.cluster = cluster
         self.asr_service = asr_service
         self.capabilities = capabilities or EngineCapabilities()
 
         # Dedicated Stage Queues
-        self.tts_queue: queue.Queue[StageJob] = queue.Queue(maxsize=self.MAX_QUEUE_TTS)
+        self.vocode_queue: queue.Queue = queue.Queue()
         self.enhance_queue: queue.Queue[StageJob] = queue.Queue(maxsize=self.MAX_QUEUE_ENHANCE)
         self.asr_queue: queue.Queue[StageJob] = queue.Queue(maxsize=self.MAX_QUEUE_ASR)
         self.voice_reg_queue: queue.Queue[StageJob] = queue.Queue(maxsize=self.MAX_QUEUE_VOICE_REG)
@@ -355,30 +381,36 @@ class EngineOrchestrator:
         # State Registries
         self.active_requests: Dict[str, RequestContext] = {}
         self.tts_assemblies: Dict[str, RequestTTSAssembly] = {}
+        self._pending_tts_chunks = 0
         self.state_lock = threading.RLock()
         self.running = True
 
-        # Start dedicated worker loops and event router
         self._threads: List[threading.Thread] = []
         self._start_worker_pools()
 
-        print(f"[EngineOrchestrator] Online with Decoupled Queues | Precision: {self.capabilities.precision.upper()} | Enhancer: {self.capabilities.enable_enhancer} | ASR: {self.capabilities.enable_asr}")
+        print(
+            f"[EngineOrchestrator] Online (Non-Streaming Anchor-First Parallel) | "
+            f"Precision: {self.capabilities.precision.upper()} | "
+            f"Enhancer: {self.capabilities.enable_enhancer} | ASR: {self.capabilities.enable_asr}"
+        )
 
     def shutdown(self):
         self.running = False
 
     def validate_parcel(self, parcel: Parcel) -> None:
-        """Validates that all requested tasks can be fulfilled by the running engine instance."""
         self.capabilities.validate_parcel(parcel)
 
     def get_queue_depths(self) -> Dict[str, int]:
+        with self.state_lock:
+            pending_tts = self._pending_tts_chunks
         return {
-            "tts": self.tts_queue.qsize(),
+            "tts": pending_tts,
+            "vocode": self.vocode_queue.qsize(),
             "enhance": self.enhance_queue.qsize(),
             "asr": self.asr_queue.qsize(),
             "voice_reg": self.voice_reg_queue.qsize(),
             "master": self.master_queue.qsize(),
-            "upload": self.upload_queue.qsize()
+            "upload": self.upload_queue.qsize(),
         }
 
     def estimate_parcel_duration(self, parcel: Parcel) -> float:
@@ -387,13 +419,13 @@ class EngineOrchestrator:
         if TaskType.TTS in task_types:
             script = parcel.payload.get("script_text", "")
             words = len(script.split()) if script else 40
-            dur += max(1.5, (words / 80.0) * 4.5)
+            dur += max(1.5, (words / 100.0) * 3.5)
         if TaskType.ENHANCE in task_types:
             dur += 6.5
         if TaskType.ASR in task_types:
             dur += 0.25
         if TaskType.MASTER in task_types:
-            dur += 0.5
+            dur += 0.35
         if TaskType.VOICE_REGISTER in task_types:
             dur += 1.5
         if TaskType.UPLOAD in task_types:
@@ -401,65 +433,62 @@ class EngineOrchestrator:
         return round(max(0.5, dur), 2)
 
     def evaluate_admission(self, parcel: Parcel) -> Tuple[bool, str, float, float, int]:
-        """
-        Multi-Stage Capacity Evaluator.
-        Inspects each stage queue required by the parcel; rejects immediately on overflow.
-        """
+        """Multi-stage capacity admission check."""
         task_types = [t.task_type for t in parcel.tasks]
 
         with self.state_lock:
-            # Check TTS capacity
             if TaskType.TTS in task_types:
                 script = parcel.payload.get("script_text", "")
                 words = len(script.split()) if script else 40
-                chunks_needed = 1 if words <= 300 else max(1, math.ceil(words / 100))
-                if self.tts_queue.qsize() + chunks_needed > self.MAX_QUEUE_TTS:
+                chunks_needed = 1 if words <= self.SINGLE_CHUNK_MAX_WORDS else max(2, math.ceil(words / 110))
+                if self._pending_tts_chunks + chunks_needed > self.MAX_QUEUE_TTS:
                     return (
                         False,
-                        f"REJECTED_STAGE_OVERFLOW: Stage 'tts' queue capacity ({self.MAX_QUEUE_TTS} chunks) is saturated.",
-                        0.0, 0.0, self.tts_queue.qsize()
+                        f"REJECTED_STAGE_OVERFLOW: Stage 'tts' capacity ({self.MAX_QUEUE_TTS} chunks) is saturated.",
+                        0.0,
+                        0.0,
+                        self._pending_tts_chunks,
                     )
 
-            # Check Enhance capacity
-            if TaskType.ENHANCE in task_types:
-                if self.enhance_queue.qsize() >= self.MAX_QUEUE_ENHANCE:
-                    wait_s = round((self.enhance_queue.qsize() + 1) * 6.5, 1)
-                    return (
-                        False,
-                        f"REJECTED_STAGE_OVERFLOW: Stage 'enhance' queue depth ({self.MAX_QUEUE_ENHANCE}/{self.MAX_QUEUE_ENHANCE}) is saturated. Estimated wait: {wait_s}s.",
-                        0.0, 0.0, self.enhance_queue.qsize()
-                    )
+            if TaskType.ENHANCE in task_types and self.enhance_queue.qsize() >= self.MAX_QUEUE_ENHANCE:
+                wait_s = round((self.enhance_queue.qsize() + 1) * 6.5, 1)
+                return (
+                    False,
+                    f"REJECTED_STAGE_OVERFLOW: Stage 'enhance' queue ({self.MAX_QUEUE_ENHANCE}) is saturated. ETA: {wait_s}s.",
+                    0.0,
+                    0.0,
+                    self.enhance_queue.qsize(),
+                )
 
-            # Check ASR capacity
-            if TaskType.ASR in task_types:
-                if self.asr_queue.qsize() >= self.MAX_QUEUE_ASR:
-                    wait_s = round((self.asr_queue.qsize() + 1) * 0.25, 1)
-                    return (
-                        False,
-                        f"REJECTED_STAGE_OVERFLOW: Stage 'asr' queue depth ({self.MAX_QUEUE_ASR}/{self.MAX_QUEUE_ASR}) is saturated. Estimated wait: {wait_s}s.",
-                        0.0, 0.0, self.asr_queue.qsize()
-                    )
+            if TaskType.ASR in task_types and self.asr_queue.qsize() >= self.MAX_QUEUE_ASR:
+                wait_s = round((self.asr_queue.qsize() + 1) * 0.25, 1)
+                return (
+                    False,
+                    f"REJECTED_STAGE_OVERFLOW: Stage 'asr' queue ({self.MAX_QUEUE_ASR}) is saturated. ETA: {wait_s}s.",
+                    0.0,
+                    0.0,
+                    self.asr_queue.qsize(),
+                )
 
-            # Check Voice Reg capacity
-            if TaskType.VOICE_REGISTER in task_types:
-                if self.voice_reg_queue.qsize() >= self.MAX_QUEUE_VOICE_REG:
-                    wait_s = round((self.voice_reg_queue.qsize() + 1) * 1.5, 1)
-                    return (
-                        False,
-                        f"REJECTED_STAGE_OVERFLOW: Stage 'voice_register' queue depth ({self.MAX_QUEUE_VOICE_REG}/{self.MAX_QUEUE_VOICE_REG}) is saturated. Estimated wait: {wait_s}s.",
-                        0.0, 0.0, self.voice_reg_queue.qsize()
-                    )
+            if TaskType.VOICE_REGISTER in task_types and self.voice_reg_queue.qsize() >= self.MAX_QUEUE_VOICE_REG:
+                wait_s = round((self.voice_reg_queue.qsize() + 1) * 1.5, 1)
+                return (
+                    False,
+                    f"REJECTED_STAGE_OVERFLOW: Stage 'voice_register' queue ({self.MAX_QUEUE_VOICE_REG}) is saturated. ETA: {wait_s}s.",
+                    0.0,
+                    0.0,
+                    self.voice_reg_queue.qsize(),
+                )
 
-            # Check Upload capacity
-            if TaskType.UPLOAD in task_types:
-                if self.upload_queue.qsize() >= self.MAX_QUEUE_UPLOAD:
-                    return (
-                        False,
-                        f"REJECTED_STAGE_OVERFLOW: Stage 'upload' queue depth ({self.MAX_QUEUE_UPLOAD}/{self.MAX_QUEUE_UPLOAD}) is saturated.",
-                        0.0, 0.0, self.upload_queue.qsize()
-                    )
+            if TaskType.UPLOAD in task_types and self.upload_queue.qsize() >= self.MAX_QUEUE_UPLOAD:
+                return (
+                    False,
+                    f"REJECTED_STAGE_OVERFLOW: Stage 'upload' queue ({self.MAX_QUEUE_UPLOAD}) is saturated.",
+                    0.0,
+                    0.0,
+                    self.upload_queue.qsize(),
+                )
 
-            # Critical-path ETA calculation
             duration_s = self.estimate_parcel_duration(parcel)
             drain_wait_s = 0.0
             if TaskType.ENHANCE in task_types:
@@ -467,42 +496,54 @@ class EngineOrchestrator:
             if TaskType.ASR in task_types:
                 drain_wait_s = max(drain_wait_s, self.asr_queue.qsize() * 0.25)
             if TaskType.TTS in task_types:
-                drain_wait_s = max(drain_wait_s, (self.tts_queue.qsize() / 2.0) * 4.5)
+                drain_wait_s = max(drain_wait_s, (self._pending_tts_chunks / 4.0) * 3.5)
 
             total_eta_s = round(drain_wait_s + duration_s, 2)
             pos = max(1, len(self.active_requests) + 1)
             return (True, "ADMITTED", duration_s, total_eta_s, pos)
 
+    def cancel_request(self, request_id: str) -> bool:
+        """Immediately cancels an active request, aborting any queued or active GPU chunks."""
+        with self.state_lock:
+            req = self.active_requests.get(request_id)
+            if not req:
+                return False
+            req.cancel_event.set()
+            req.status = "CANCELLED"
+            req.error_message = "Request cancelled by caller."
+            assembly = self.tts_assemblies.pop(request_id, None)
+            if assembly:
+                assembly.mark_failed()
+            self._finalize_request(req)
+            return True
+
     def dispatch(
         self,
         parcel: Parcel,
-        progress_callback: Optional[Callable[[str, float, str], None]] = None
+        progress_callback: Optional[Callable[[str, float, str], None]] = None,
     ) -> ParcelResult:
-        """
-        Synchronous admission and execution entrypoint (used by Gradio and direct callers).
-        Non-blocking internal hand-off: submits request and waits on request's completion event.
-        """
         return self.submit_sync(parcel, progress_callback=progress_callback)
 
     def submit_sync(
         self,
         parcel: Parcel,
         progress_callback: Optional[Callable[[str, float, str], None]] = None,
-        timeout: float = 600.0
+        timeout: float = 600.0,
+        skip_admission: bool = False,
     ) -> ParcelResult:
         self.validate_parcel(parcel)
 
-        accepted, reason, dur_s, eta_s, pos = self.evaluate_admission(parcel)
-        if not accepted:
-            return ParcelResult(
-                parcel_id=parcel.parcel_id,
-                success=False,
-                error_message=reason
-            )
+        if not skip_admission:
+            accepted, reason, dur_s, eta_s, pos = self.evaluate_admission(parcel)
+            if not accepted:
+                return ParcelResult(
+                    parcel_id=parcel.parcel_id,
+                    success=False,
+                    error_message=reason,
+                )
 
         req = self._create_request_context(parcel, progress_callback=progress_callback)
 
-        # Trigger initial audio ingestion if audio_input was provided
         if "audio_input" in parcel.payload and parcel.payload["audio_input"] is not None:
             max_dur = parcel.payload.get("max_duration_s")
             task_types = [t.task_type for t in parcel.tasks]
@@ -514,30 +555,27 @@ class EngineOrchestrator:
             if TaskType.STITCH not in task_types and TaskType.TTS not in task_types:
                 req.raw_audio_pcm = pcm.copy()
 
-        # Enqueue first task
         self._enqueue_next_task(req)
 
-        # Wait on completion event
         finished = req.completion_event.wait(timeout=timeout)
         if not finished:
-            req.status = "TIMED_OUT"
-            req.error_message = f"Execution timed out after {timeout}s."
+            self.cancel_request(req.request_id)
             return ParcelResult(
                 parcel_id=parcel.parcel_id,
                 success=False,
-                error_message=req.error_message
+                error_message=f"Execution timed out after {timeout}s.",
             )
 
         return req.result or ParcelResult(
             parcel_id=parcel.parcel_id,
             success=req.status == "COMPLETED",
-            error_message=req.error_message
+            error_message=req.error_message,
         )
 
     def _create_request_context(
         self,
         parcel: Parcel,
-        progress_callback: Optional[Callable[[str, float, str], None]] = None
+        progress_callback: Optional[Callable[[str, float, str], None]] = None,
     ) -> RequestContext:
         req_id = parcel.parcel_id
         tasks_copy = list(parcel.tasks)
@@ -547,7 +585,7 @@ class EngineOrchestrator:
             remaining_tasks=tasks_copy,
             total_stages=max(1, len(tasks_copy)),
             progress_callback=progress_callback,
-            current_sr=self.cluster.sample_rate if hasattr(self.cluster, "sample_rate") else 24000
+            current_sr=getattr(self.cluster, "sample_rate", 24000),
         )
         with self.state_lock:
             self.active_requests[req_id] = req
@@ -555,6 +593,8 @@ class EngineOrchestrator:
 
     def _enqueue_next_task(self, req: RequestContext):
         with self.state_lock:
+            if req.cancel_event.is_set():
+                return
             if not req.remaining_tasks:
                 self._finalize_request(req)
                 return
@@ -565,7 +605,7 @@ class EngineOrchestrator:
             req.status = "RUNNING"
             req.stage_started_at = time.time()
 
-            pct = (req.completed_stages / float(req.total_stages))
+            pct = req.completed_stages / float(req.total_stages)
             req.overall_progress = round(pct, 3)
             self._report_progress(req, str(t_type.value), 0.05, f"Starting stage '{t_type.value}'...")
 
@@ -576,10 +616,9 @@ class EngineOrchestrator:
                 params=next_task.params,
                 input_pcm=req.current_pcm,
                 input_sr=req.current_sr,
-                extra=req.parcel.payload
+                extra=req.parcel.payload,
             )
 
-            # Route to dedicated stage queue
             if t_type == TaskType.TTS:
                 self._handle_tts_dispatch(req, job)
             elif t_type == TaskType.ENHANCE:
@@ -593,102 +632,241 @@ class EngineOrchestrator:
             elif t_type == TaskType.UPLOAD:
                 self.upload_queue.put(job)
             elif t_type == TaskType.STITCH:
-                # Fast in-memory stitch if standalone
                 self._handle_standalone_stitch(req, job)
             else:
-                # Unknown task type, skip
                 self.completion_queue.put(JobDoneEvent(request_id=req.request_id, task_type=t_type, success=True))
 
-    def _prepare_tts_chunks(self, script: str) -> List[str]:
-        """Applies Elastic Semantic Chunking with balanced lookahead partitioning."""
+    def _prepare_tts_chunks(self, script: str, payload: Optional[Dict[str, Any]] = None) -> List[str]:
+        """
+        Applies the 200-word AND 2,000-token single-chunk guard.
+        Scripts exceeding either limit are split using Anchor-First (Chunk 0 = 25-50w anchor,
+        Chunks 1..N-1 = target_words..max_words) honoring payload parameters.
+        """
+        if payload is None:
+            payload = {}
         words = script.split()
-        if len(words) <= 280:
+        ref_frames = int(payload.get("ref_frames", 0) or 0)
+        ref_text = payload.get("ref_text")
+        instruction = payload.get("instruction", "Speak clearly and naturally.")
+        cfg_scale = float(payload.get("cfg_scale", 1.5))
+
+        profile = estimate_speech_profile(
+            script,
+            instruction=instruction,
+            ref_frames=ref_frames,
+            cfg_scale=cfg_scale,
+            ref_text=ref_text,
+        )
+        single_branch_est = profile["prefix_tokens"] + profile["conservative_max"]
+        if len(words) <= self.SINGLE_CHUNK_MAX_WORDS and single_branch_est <= self.SINGLE_CHUNK_MAX_TOKENS:
             return [script]
-        return split_text_into_smart_chunks(script, target_words=200, max_words=280, min_words=80)
+
+        anchor_words = int(payload.get("anchor_words", 35))
+        target_words = min(140, max(40, int(payload.get("target_words", 110))))
+        max_words = min(170, max(target_words + 10, int(payload.get("max_words", 140))))
+        return split_text_with_anchor(
+            script,
+            anchor_target_words=anchor_words,
+            anchor_max_words=max(anchor_words + 15, 50),
+            target_words=target_words,
+            max_words=max_words,
+        )
 
     def _handle_tts_dispatch(self, req: RequestContext, job: StageJob):
-        """Autonomous TTS Chunker & Dispatcher (2-Minute Rule)."""
-        script = job.extra.get("script_text", "").strip()
+        """
+        Event-driven Anchor-First 1 + (N-1) Parallel TTS Dispatcher.
+          - Single chunk: submits directly to persistent DualInstanceCluster.
+          - Multi-chunk: submits Chunk 0 first; when Chunk 0 finishes, uses Chunk 0's
+            (text, tokens) as the live acoustic anchor for parallel Chunks 1..N-1 across
+            both T4 GPUs, keeping CFG active for consistent expressive speech.
+        """
+        script = (job.extra.get("script_text") or "").strip()
         if not script:
-            self.completion_queue.put(JobDoneEvent(
-                request_id=req.request_id,
-                task_type=TaskType.TTS,
-                success=False,
-                error_message="Parcel script_text is empty."
-            ))
+            self.completion_queue.put(
+                JobDoneEvent(
+                    request_id=req.request_id,
+                    task_type=TaskType.TTS,
+                    success=False,
+                    error_message="Parcel script_text is empty.",
+                )
+            )
             return
 
-        words = script.split()
-        words_count = len(words)
-        pause_ms = int(job.params.get("pause_ms", job.extra.get("pause_ms", 200)))
-
-        # 2-Minute Threshold Rule (~300 words)
-        chunks = self._prepare_tts_chunks(script)
-
+        chunks = self._prepare_tts_chunks(script, job.extra)
         total_chunks = len(chunks)
         req.metadata["chunks_count"] = total_chunks
 
-        # Initialize out-of-order chunk assembly manager for this request
         assembly = RequestTTSAssembly(
             request_id=req.request_id,
-            total_chunks=total_chunks,
+            chunks_text=chunks,
             sample_rate=req.current_sr,
-            pause_ms=pause_ms
+            started_at=time.time(),
         )
         with self.state_lock:
             self.tts_assemblies[req.request_id] = assembly
+            self._pending_tts_chunks += total_chunks
 
-        self._report_progress(req, "tts", 0.10, f"Dispatched {total_chunks} chunk(s) ({words_count} words) to TTS cluster...")
-
-        # Push each chunk into tts_queue
-        instruction = job.extra.get("instruction", "Speak clearly.")
+        instruction = job.extra.get("instruction", "Speak clearly and naturally.")
         cfg_scale = float(job.extra.get("cfg_scale", 1.5))
-        temperature = float(job.extra.get("temperature", 0.25))
+        follower_cfg = job.extra.get("follower_cfg_scale")
+        follower_cfg_scale = float(follower_cfg) if follower_cfg is not None else cfg_scale
+        temperature = float(job.extra.get("temperature", 0.60))
+        top_p = float(job.extra.get("top_p", 0.88))
+        top_k = int(job.extra.get("top_k", 40))
+        repetition_penalty = float(job.extra.get("repetition_penalty", 1.1))
+        depth_temperature = float(job.extra.get("depth_temperature", 0.0))
+        depth_cfg_codebooks = int(job.extra.get("depth_cfg_codebooks", 15))
         seed = int(job.extra.get("seed", 42))
         ref_codes = job.extra.get("ref_codes")
-        ref_frames = int(job.extra.get("ref_frames", 0))
+        ref_frames = int(job.extra.get("ref_frames", 0) or 0)
         ref_text = job.extra.get("ref_text")
 
-        for idx, chunk_text in enumerate(chunks):
-            chunk_task = UserTask(
-                id=idx,
-                text=chunk_text,
-                instruction=instruction,
-                ref_text=ref_text,
-                ref_codes=ref_codes,
-                ref_frames=ref_frames,
-                cfg_scale=cfg_scale,
-                temperature=temperature,
-                seed=seed + idx,
-                max_steps=2040,
-                stream_pcm=False,
-                client_has_vocoder=False
+        def _dec_pending(count: int = 1):
+            with self.state_lock:
+                self._pending_tts_chunks = max(0, self._pending_tts_chunks - count)
+
+        def _fail_assembly(err_msg: str, remaining_unsubmitted: int = 0):
+            if remaining_unsubmitted > 0:
+                _dec_pending(remaining_unsubmitted)
+            if assembly.mark_failed():
+                with self.state_lock:
+                    self.tts_assemblies.pop(req.request_id, None)
+                if not req.cancel_event.is_set():
+                    self.completion_queue.put(
+                        JobDoneEvent(
+                            request_id=req.request_id,
+                            task_type=TaskType.TTS,
+                            success=False,
+                            error_message=err_msg,
+                            stage_timing_s=time.time() - assembly.started_at,
+                        )
+                    )
+
+        def _on_chunk_done(chunk_idx: int, tokens: Optional[List[int]], err: Optional[str], stats: Dict[str, Any]):
+            _dec_pending(1)
+            if req.cancel_event.is_set() or err == "CANCELLED":
+                assembly.mark_failed()
+                with self.state_lock:
+                    self.tts_assemblies.pop(req.request_id, None)
+                return
+
+            if err or tokens is None:
+                rem = (total_chunks - 1) if (chunk_idx == 0 and total_chunks > 1) else 0
+                _fail_assembly(err or f"TTS chunk {chunk_idx} failed.", remaining_unsubmitted=rem)
+                return
+
+            merged_tokens = assembly.record_chunk_tokens(chunk_idx, tokens)
+            pct = 0.10 + 0.75 * (assembly.completed_count / float(total_chunks))
+            self._report_progress(
+                req,
+                "tts",
+                pct,
+                f"Generated chunk {assembly.completed_count}/{total_chunks}...",
             )
-            chunk_job = StageJob(
-                job_id=f"chunk_{req.request_id}_{idx}",
-                request_id=req.request_id,
-                task_type=TaskType.TTS,
-                params={"chunk_index": idx, "total_chunks": total_chunks},
-                extra={"user_task": chunk_task}
-            )
-            self.tts_queue.put(chunk_job)
+
+            # Anchor-First Fan-Out: Chunk 0 just completed -> launch Chunks 1..N-1 in parallel!
+            if chunk_idx == 0 and total_chunks > 1 and not assembly.failed:
+                anchor_frames = len(tokens) // 16
+                # Cap anchor reference at ~120 frames (~9.6s) so Breeze never skips follower text
+                if anchor_frames > 120:
+                    anchor_codes = tokens[: 120 * 16]
+                    anchor_frames = 120
+                else:
+                    anchor_codes = tokens
+                anchor_text = chunks[0]
+
+                self._report_progress(
+                    req,
+                    "tts",
+                    0.20,
+                    f"Anchor locked ({anchor_frames * 0.08:.1f}s); fanning out {total_chunks - 1} parallel chunks across GPU 0 & GPU 1...",
+                )
+                for f_idx in range(1, total_chunks):
+                    f_task = UserTask(
+                        id=f_idx,
+                        text=chunks[f_idx],
+                        instruction=instruction,
+                        ref_text=anchor_text,
+                        ref_codes=anchor_codes,
+                        ref_frames=anchor_frames,
+                        cfg_scale=follower_cfg_scale,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        repetition_penalty=repetition_penalty,
+                        depth_temperature=depth_temperature,
+                        depth_cfg_codebooks=depth_cfg_codebooks,
+                        seed=seed + f_idx,
+                        max_steps=2040,
+                        stream_pcm=False,
+                        client_has_vocoder=True,  # Return raw tokens for continuous tiled vocoding
+                    )
+                    self.cluster.submit_tts_chunk(
+                        f_task,
+                        on_complete=lambda tok, e, st, i=f_idx: _on_chunk_done(i, tok, e, st),
+                        cancel_event=req.cancel_event,
+                    )
+
+            # All chunks complete -> hand off merged token stream to tiled vocoder worker
+            if merged_tokens is not None:
+                with self.state_lock:
+                    self.tts_assemblies.pop(req.request_id, None)
+                self._report_progress(req, "tts", 0.88, "Running continuous tiled vocoder...")
+                self.vocode_queue.put((req.request_id, merged_tokens, assembly.started_at, req.cancel_event))
+
+        self._report_progress(
+            req,
+            "tts",
+            0.10,
+            f"Submitting {'anchor chunk 0 of ' + str(total_chunks) if total_chunks > 1 else 'single chunk'} to dual-T4 cluster...",
+        )
+
+        # Submit Chunk 0 (or the sole chunk) to persistent cluster
+        chunk0_task = UserTask(
+            id=0,
+            text=chunks[0],
+            instruction=instruction,
+            ref_text=ref_text,
+            ref_codes=ref_codes,
+            ref_frames=ref_frames,
+            cfg_scale=cfg_scale,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            depth_temperature=depth_temperature,
+            depth_cfg_codebooks=depth_cfg_codebooks,
+            seed=seed,
+            max_steps=2040,
+            stream_pcm=False,
+            client_has_vocoder=True,  # Always return tokens for continuous tiled vocoding
+        )
+        self.cluster.submit_tts_chunk(
+            chunk0_task,
+            on_complete=lambda tok, e, st: _on_chunk_done(0, tok, e, st),
+            cancel_event=req.cancel_event,
+        )
 
     def _handle_standalone_stitch(self, req: RequestContext, job: StageJob):
         if req.current_pcm is not None:
-            self.completion_queue.put(JobDoneEvent(
-                request_id=req.request_id,
-                task_type=TaskType.STITCH,
-                success=True,
-                output_pcm=req.current_pcm,
-                output_sr=req.current_sr
-            ))
+            self.completion_queue.put(
+                JobDoneEvent(
+                    request_id=req.request_id,
+                    task_type=TaskType.STITCH,
+                    success=True,
+                    output_pcm=req.current_pcm,
+                    output_sr=req.current_sr,
+                )
+            )
         else:
-            self.completion_queue.put(JobDoneEvent(
-                request_id=req.request_id,
-                task_type=TaskType.STITCH,
-                success=False,
-                error_message="STITCH requested without prior audio buffers."
-            ))
+            self.completion_queue.put(
+                JobDoneEvent(
+                    request_id=req.request_id,
+                    task_type=TaskType.STITCH,
+                    success=False,
+                    error_message="STITCH requested without prior audio buffers.",
+                )
+            )
 
     def _report_progress(self, req: RequestContext, stage: str, pct: float, msg: str):
         req.stage_progress = round(pct, 3)
@@ -700,9 +878,6 @@ class EngineOrchestrator:
             except Exception:
                 pass
 
-    # -------------------------------------------------------------
-    # EVENT-DRIVEN ORCHESTRATION INBOX LOOP (MICROSECOND ROUTING)
-    # -------------------------------------------------------------
     def _orchestration_loop(self):
         while self.running:
             try:
@@ -712,19 +887,17 @@ class EngineOrchestrator:
 
             with self.state_lock:
                 req = self.active_requests.get(event.request_id)
-                if not req:
+                if not req or req.cancel_event.is_set():
                     continue
 
                 if not event.success:
-                    # Isolated failure containment: only fail this request, engine never crashes
                     req.status = "FAILED"
                     req.error_message = event.error_message or f"Task '{event.task_type.value}' failed."
                     self._finalize_request(req)
                     continue
 
-                # Stage Succeeded: Update Request State
                 req.completed_stages += 1
-                req.stage_timings[event.task_type.value] = event.stage_timing_s
+                req.stage_timings[event.task_type.value] = round(event.stage_timing_s, 3)
 
                 if event.output_pcm is not None:
                     req.current_pcm = event.output_pcm
@@ -746,13 +919,12 @@ class EngineOrchestrator:
                         req.artifact_bytes.update(v)
 
                 self._report_progress(req, event.task_type.value, 1.0, f"Completed stage '{event.task_type.value}'.")
-
-                # Hand-off to next task in pipeline
                 self._enqueue_next_task(req)
 
     def _finalize_request(self, req: RequestContext):
         with self.state_lock:
-            req.status = "COMPLETED" if req.status != "FAILED" else "FAILED"
+            if req.status not in ("FAILED", "CANCELLED"):
+                req.status = "COMPLETED"
             req.overall_progress = 1.0
 
             result = ParcelResult(
@@ -770,11 +942,10 @@ class EngineOrchestrator:
                 upload_results=req.upload_results,
                 artifact_bytes=req.artifact_bytes,
                 stage_timings=req.stage_timings,
-                metadata=req.metadata
+                metadata=req.metadata,
             )
 
-            # Populate requested return artifacts
-            if req.parcel.return_artifacts:
+            if req.status == "COMPLETED" and req.parcel.return_artifacts:
                 for art_name in req.parcel.return_artifacts:
                     if art_name not in result.artifact_bytes:
                         if art_name == "audio_mp3" and req.current_pcm is not None:
@@ -792,24 +963,21 @@ class EngineOrchestrator:
 
             req.result = result
             req.completion_event.set()
-            self._report_progress(req, "completed", 1.0, f"Request {req.request_id} finished successfully!")
+            if req.status == "COMPLETED":
+                self._report_progress(req, "completed", 1.0, f"Request {req.request_id} finished successfully!")
 
     def get_telemetry_snapshot(self) -> Dict[str, Any]:
-        """Provides non-blocking read-only snapshot for the standalone TelemetryService."""
         now = time.time()
         with self.state_lock:
-            # Active request snapshots
             req_snapshots = []
             stale_ids = []
             for r_id, req in self.active_requests.items():
                 if req.status in ("COMPLETED", "FAILED", "CANCELLED") and (now - req.created_at > 60.0):
                     stale_ids.append(r_id)
                     continue
-
                 curr_stage = req.current_task.task_type.value if req.current_task else "idle"
                 elapsed = round(now - req.created_at, 2)
                 eta_rem = max(0.0, round(req.estimated_duration_s * (1.0 - req.overall_progress), 2))
-
                 req_snapshots.append({
                     "request_id": r_id,
                     "status": req.status,
@@ -817,118 +985,91 @@ class EngineOrchestrator:
                     "stage_progress": req.stage_progress,
                     "overall_progress": req.overall_progress,
                     "elapsed_s": elapsed,
-                    "eta_s": eta_rem
+                    "eta_s": eta_rem,
                 })
 
-            # Auto-prune stale requests (prevents memory leaks)
             for sid in stale_ids:
                 del self.active_requests[sid]
                 self.tts_assemblies.pop(sid, None)
 
             return {
                 "queue_depths": self.get_queue_depths(),
-                "active_requests": req_snapshots
+                "active_requests": req_snapshots,
             }
 
-    # -------------------------------------------------------------
-    # DEDICATED INDEPENDENT WORKER POOLS
-    # -------------------------------------------------------------
     def _start_worker_pools(self):
-        # 1. Orchestration Event Loop Thread
         t_orch = threading.Thread(target=self._orchestration_loop, daemon=True, name="OrchEventLoop")
         t_orch.start()
         self._threads.append(t_orch)
 
-        # 2. TTS Worker Loop (Consumes tts_queue, feeds DualInstanceCluster)
-        t_tts = threading.Thread(target=self._tts_worker_loop, daemon=True, name="TTSWorker")
-        t_tts.start()
-        self._threads.append(t_tts)
+        # 2 Tiled Vocoder workers (1 per GPU) so vocoding never blocks TTS generator callbacks
+        for i in range(2):
+            t_voc = threading.Thread(target=self._vocode_worker_loop, args=(i,), daemon=True, name=f"VocodeWorker-{i}")
+            t_voc.start()
+            self._threads.append(t_voc)
 
-        # 3. Enhance Worker Loop (GPU 1, Concurrency = 1)
         t_enh = threading.Thread(target=self._enhance_worker_loop, daemon=True, name="EnhanceWorker")
         t_enh.start()
         self._threads.append(t_enh)
 
-        # 4. ASR Worker Loop (GPU 0, Concurrency = 1)
         t_asr = threading.Thread(target=self._asr_worker_loop, daemon=True, name="ASRWorker")
         t_asr.start()
         self._threads.append(t_asr)
 
-        # 5. Voice Reg Worker Loop (GPU 0, Concurrency = 1)
         t_vreg = threading.Thread(target=self._voice_reg_worker_loop, daemon=True, name="VoiceRegWorker")
         t_vreg.start()
         self._threads.append(t_vreg)
 
-        # 6. Master Worker Loop (CPU, Concurrency = 4)
         for i in range(4):
             t_mas = threading.Thread(target=self._master_worker_loop, daemon=True, name=f"MasterWorker-{i}")
             t_mas.start()
             self._threads.append(t_mas)
 
-        # 7. Upload Worker Loop (Async I/O, Concurrency = 8)
         for i in range(8):
             t_upl = threading.Thread(target=self._upload_worker_loop, daemon=True, name=f"UploadWorker-{i}")
             t_upl.start()
             self._threads.append(t_upl)
 
-    def _tts_worker_loop(self):
-        """Processes chunks from tts_queue across Dual GPU Islands."""
+    def _vocode_worker_loop(self, worker_idx: int):
+        """Decodes merged 16-codebook token streams using strictly VRAM-bounded tiled vocoding."""
         while self.running:
             try:
-                job = self.tts_queue.get(timeout=0.1)
+                req_id, merged_tokens, tts_started_at, cancel_event = self.vocode_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
+            if cancel_event is not None and cancel_event.is_set():
+                continue
+
             try:
-                user_task = job.extra.get("user_task")
-                if user_task is None:
-                    continue
-
-                chunk_idx = job.params.get("chunk_index", 0)
-
-                with tempfile.TemporaryDirectory(prefix="tts_chunk_") as tmp_dir:
-                    results = self.cluster.run_workload([user_task], out_dir=tmp_dir)
-                    if results and results[0].success:
-                        data, sr = sf.read(results[0].wav_path, dtype="float32")
-                        if data.ndim > 1:
-                            data = data.mean(axis=1)
-
-                        # Slot into TTSAssemblyManager
-                        with self.state_lock:
-                            assembly = self.tts_assemblies.get(job.request_id)
-
-                        if assembly:
-                            stitched_pcm = assembly.add_chunk(chunk_idx, data)
-                            if stitched_pcm is not None:
-                                # All chunks arrived for this request!
-                                with self.state_lock:
-                                    self.tts_assemblies.pop(job.request_id, None)
-
-                                self.completion_queue.put(JobDoneEvent(
-                                    request_id=job.request_id,
-                                    task_type=TaskType.TTS,
-                                    success=True,
-                                    output_pcm=stitched_pcm,
-                                    output_sr=sr
-                                ))
-                    else:
-                        err = results[0].error_msg if results else "TTS chunk generation failed."
-                        self.completion_queue.put(JobDoneEvent(
-                            request_id=job.request_id,
-                            task_type=TaskType.TTS,
-                            success=False,
-                            error_message=err
-                        ))
+                pcm = self.cluster.decode_tokens_tiled(
+                    merged_tokens,
+                    ctx_frames=80,
+                    step_frames=240,
+                    gpu_id=worker_idx % 2,
+                )
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=req_id,
+                        task_type=TaskType.TTS,
+                        success=True,
+                        output_pcm=pcm,
+                        output_sr=getattr(self.cluster, "sample_rate", 24000),
+                        stage_timing_s=time.time() - tts_started_at,
+                    )
+                )
             except Exception as e:
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.TTS,
-                    success=False,
-                    error_message=str(e)
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=req_id,
+                        task_type=TaskType.TTS,
+                        success=False,
+                        error_message=f"Tiled vocoder failed: {e}",
+                        stage_timing_s=time.time() - tts_started_at,
+                    )
+                )
 
     def _enhance_worker_loop(self):
-        """Dedicated GPU 1 Resemble 44.1 kHz Enhancer Worker (Concurrency = 1)."""
         while self.running:
             try:
                 job = self.enhance_queue.get(timeout=0.1)
@@ -944,41 +1085,42 @@ class EngineOrchestrator:
                 chunk_sec = float(job.params.get("chunk_seconds", self.capabilities.chunk_seconds_enhancer))
                 tokens_needed = 16850 if chunk_sec <= 10.0 else 22210
 
-                # Headroom modulation on GPU 1
                 if hasattr(self.cluster, "dynamic_coord"):
                     self.cluster.dynamic_coord.request_headroom(gpu_id=1, tokens_needed=tokens_needed)
-
                 try:
                     device_tag = f"cuda:{self.capabilities.enhancer_device_index}"
                     enhanced_pcm, out_sr = enhance_audio_array(
                         pcm,
                         sr=job.input_sr,
                         chunk_seconds=chunk_sec,
-                        device=device_tag
+                        device=device_tag,
                     )
                 finally:
                     if hasattr(self.cluster, "dynamic_coord"):
                         self.cluster.dynamic_coord.release_headroom(gpu_id=1, tokens_needed=tokens_needed)
 
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.ENHANCE,
-                    success=True,
-                    output_pcm=enhanced_pcm,
-                    output_sr=out_sr,
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.ENHANCE,
+                        success=True,
+                        output_pcm=enhanced_pcm,
+                        output_sr=out_sr,
+                        stage_timing_s=time.time() - t0,
+                    )
+                )
             except Exception as e:
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.ENHANCE,
-                    success=False,
-                    error_message=str(e),
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.ENHANCE,
+                        success=False,
+                        error_message=str(e),
+                        stage_timing_s=time.time() - t0,
+                    )
+                )
 
     def _asr_worker_loop(self):
-        """Dedicated GPU 0 Faster-Whisper Turbo Worker (Concurrency = 1)."""
         while self.running:
             try:
                 job = self.asr_queue.get(timeout=0.1)
@@ -996,43 +1138,43 @@ class EngineOrchestrator:
                 tokens_needed = 9600
                 if hasattr(self.cluster, "dynamic_coord"):
                     self.cluster.dynamic_coord.request_headroom(gpu_id=0, tokens_needed=tokens_needed)
-
                 try:
-                    fmt = job.params.get("output_format", "all")
-                    res = self.asr_service.transcribe(
+                    transcript, srt_content, seg_list = self.asr_service.transcribe(
                         audio=pcm,
                         sample_rate=job.input_sr,
-                        output_format="all"
+                        output_format="all",
                     )
-                    transcript, srt_content, seg_list = res
                 finally:
                     if hasattr(self.cluster, "dynamic_coord"):
                         self.cluster.dynamic_coord.release_headroom(gpu_id=0, tokens_needed=tokens_needed)
 
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.ASR,
-                    success=True,
-                    output_pcm=pcm,
-                    output_sr=job.input_sr,
-                    artifacts={
-                        "transcript": transcript,
-                        "subtitles_srt": srt_content,
-                        "segments": seg_list
-                    },
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.ASR,
+                        success=True,
+                        output_pcm=pcm,
+                        output_sr=job.input_sr,
+                        artifacts={
+                            "transcript": transcript,
+                            "subtitles_srt": srt_content,
+                            "segments": seg_list,
+                        },
+                        stage_timing_s=time.time() - t0,
+                    )
+                )
             except Exception as e:
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.ASR,
-                    success=False,
-                    error_message=str(e),
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.ASR,
+                        success=False,
+                        error_message=str(e),
+                        stage_timing_s=time.time() - t0,
+                    )
+                )
 
     def _voice_reg_worker_loop(self):
-        """Dedicated GPU 0 Breeze Discrete Acoustic Encoder Worker (Concurrency = 1)."""
         while self.running:
             try:
                 job = self.voice_reg_queue.get(timeout=0.1)
@@ -1052,43 +1194,45 @@ class EngineOrchestrator:
                     else:
                         raise ValueError("Voice registration requires verbatim text transcript.")
 
-                # Resample to 24 kHz if needed
                 if job.input_sr != 24000:
                     import scipy.signal
-                    num_samples = int(round(len(pcm) * 24000.0 / float(job.input_sr)))
-                    pcm_24k = scipy.signal.resample(pcm, num_samples).astype(np.float32)
+                    gcd = math.gcd(int(job.input_sr), 24000)
+                    pcm_24k = scipy.signal.resample_poly(pcm, 24000 // gcd, int(job.input_sr) // gcd).astype(np.float32)
                 else:
                     pcm_24k = pcm
 
                 voice_bytes = self.cluster.encode_voice_container(
                     pcm_samples=pcm_24k.tolist(),
                     transcript=transcript.strip(),
-                    gpu_id=0
+                    gpu_id=0,
                 )
 
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.VOICE_REGISTER,
-                    success=True,
-                    output_pcm=pcm,
-                    output_sr=job.input_sr,
-                    artifacts={
-                        "voice_bytes": voice_bytes,
-                        "transcript": transcript.strip()
-                    },
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.VOICE_REGISTER,
+                        success=True,
+                        output_pcm=pcm,
+                        output_sr=job.input_sr,
+                        artifacts={
+                            "voice_bytes": voice_bytes,
+                            "transcript": transcript.strip(),
+                        },
+                        stage_timing_s=time.time() - t0,
+                    )
+                )
             except Exception as e:
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.VOICE_REGISTER,
-                    success=False,
-                    error_message=str(e),
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.VOICE_REGISTER,
+                        success=False,
+                        error_message=str(e),
+                        stage_timing_s=time.time() - t0,
+                    )
+                )
 
     def _master_worker_loop(self):
-        """Dedicated CPU Broadcast Mastering Worker Pool (Concurrency = 4)."""
         while self.running:
             try:
                 job = self.master_queue.get(timeout=0.1)
@@ -1104,25 +1248,28 @@ class EngineOrchestrator:
                 preset = job.params.get("preset", "optionA_rich_bass")
                 mastered_pcm, out_sr = master_audio_array(pcm, sr=job.input_sr, preset=preset)
 
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.MASTER,
-                    success=True,
-                    output_pcm=mastered_pcm,
-                    output_sr=out_sr,
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.MASTER,
+                        success=True,
+                        output_pcm=mastered_pcm,
+                        output_sr=out_sr,
+                        stage_timing_s=time.time() - t0,
+                    )
+                )
             except Exception as e:
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.MASTER,
-                    success=False,
-                    error_message=str(e),
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.MASTER,
+                        success=False,
+                        error_message=str(e),
+                        stage_timing_s=time.time() - t0,
+                    )
+                )
 
     def _upload_worker_loop(self):
-        """Dedicated Async Cloud Bucket Upload Worker Pool (Concurrency = 16)."""
         while self.running:
             try:
                 job = self.upload_queue.get(timeout=0.1)
@@ -1133,12 +1280,14 @@ class EngineOrchestrator:
             try:
                 upload_targets = job.extra.get("upload_targets") or {}
                 if not upload_targets:
-                    self.completion_queue.put(JobDoneEvent(
-                        request_id=job.request_id,
-                        task_type=TaskType.UPLOAD,
-                        success=True,
-                        stage_timing_s=time.time() - t0
-                    ))
+                    self.completion_queue.put(
+                        JobDoneEvent(
+                            request_id=job.request_id,
+                            task_type=TaskType.UPLOAD,
+                            success=True,
+                            stage_timing_s=time.time() - t0,
+                        )
+                    )
                     continue
 
                 upload_results = {}
@@ -1181,7 +1330,7 @@ class EngineOrchestrator:
                             target_url,
                             data=art_bytes,
                             headers={"Content-Type": mime, "Content-Length": str(len(art_bytes))},
-                            method="PUT"
+                            method="PUT",
                         )
                         with urllib.request.urlopen(req_http, timeout=30.0) as resp:
                             if resp.status in (200, 201, 204):
@@ -1193,30 +1342,33 @@ class EngineOrchestrator:
                         upload_results[art_name] = {"success": False, "error": str(up_err)}
                         any_failed = True
 
-                # Transactional fallback: if any upload failed, retain raw bytes so compute is never lost
                 if any_failed:
                     for art_name in upload_targets.keys():
                         b, _ = get_bytes(art_name)
                         if b:
                             fallback_bytes[art_name] = b
 
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.UPLOAD,
-                    success=True,
-                    output_pcm=current_pcm,
-                    output_sr=current_sr,
-                    artifacts={
-                        "upload_results": upload_results,
-                        "fallback_artifact_bytes": fallback_bytes
-                    },
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.UPLOAD,
+                        success=True,
+                        output_pcm=current_pcm,
+                        output_sr=current_sr,
+                        artifacts={
+                            "upload_results": upload_results,
+                            "fallback_artifact_bytes": fallback_bytes,
+                        },
+                        stage_timing_s=time.time() - t0,
+                    )
+                )
             except Exception as e:
-                self.completion_queue.put(JobDoneEvent(
-                    request_id=job.request_id,
-                    task_type=TaskType.UPLOAD,
-                    success=False,
-                    error_message=str(e),
-                    stage_timing_s=time.time() - t0
-                ))
+                self.completion_queue.put(
+                    JobDoneEvent(
+                        request_id=job.request_id,
+                        task_type=TaskType.UPLOAD,
+                        success=False,
+                        error_message=str(e),
+                        stage_timing_s=time.time() - t0,
+                    )
+                )

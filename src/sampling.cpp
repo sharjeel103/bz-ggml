@@ -22,7 +22,20 @@ int sample_token(std::vector<float> & logits, const SampleParams & p, std::mt199
         }
     }
 
-    const float temp = p.temperature > 0 ? p.temperature : 1.0f;
+    // Greedy argmax when temperature <= 0
+    if (p.temperature <= 0.0f) {
+        int best = 0;
+        float best_val = logits[0];
+        for (int i = 1; i < n; i++) {
+            if (logits[i] > best_val) {
+                best_val = logits[i];
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    const float temp = p.temperature;
 
     std::vector<int> idx(n);
     for (int i = 0; i < n; i++) idx[i] = i;

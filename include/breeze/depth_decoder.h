@@ -31,6 +31,8 @@ struct DepthRunner {
         int cb0 = 0;
         float cfg_scale = 1.0f;
         bool use_cfg = false;
+        float depth_temperature = 0.0f;   // <= 0 uses on-GPU argmax (fast + consistent)
+        int depth_cfg_codebooks = 15;     // apply CFG to cb1..cb_{depth_cfg_codebooks}; > this uses cond only
         std::vector<float> hidden_c;
         std::vector<float> hidden_u;
         std::mt19937 * rng = nullptr;
@@ -40,9 +42,10 @@ struct DepthRunner {
     std::vector<std::vector<int>> run_batched(BreezeModel & m, const std::vector<BatchItem> & items);
 
     // Unified 15-step on-GPU unrolled graph: executes all 15 codebook decodes in a single GPU pass
-    // using On-GPU Argmax and in-VRAM embedding lookups, completely eliminating PCIe round-trips.
+    // using On-GPU CFG blending + On-GPU Argmax and in-VRAM embedding lookups, eliminating PCIe round-trips.
+    // Any items requesting stochastic sampling (depth_temperature > 0) are split out to run_batched()
+    // without downgrading the greedy/CFG-greedy items in the same batch.
     std::vector<std::vector<int>> run_batched_unified_gpu(BreezeModel & m, const std::vector<BatchItem> & items);
 };
 
 }
-
