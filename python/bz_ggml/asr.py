@@ -126,6 +126,13 @@ class ASRService:
         compute_type: str = "float16",
         max_concurrent: int = 2
     ):
+        if ":" in str(device):
+            dev_parts = str(device).split(":")
+            device = dev_parts[0]
+            try:
+                device_index = int(dev_parts[1])
+            except ValueError:
+                pass
         if cuda_device is not None:
             device_index = cuda_device
         self.model_size = model_size
@@ -163,10 +170,12 @@ class ASRService:
         self,
         audio: Union[str, np.ndarray, List[float]],
         sample_rate: int = 24000,
-        language: str = "en",
+        task: str = "transcribe",
+        language: Optional[str] = "en",
         beam_size: int = 1,
         vad_filter: bool = True,
         word_timestamps: bool = True,
+        words_per_line: Optional[int] = 1,
         return_subtitles: bool = True,
         return_1word_srt: bool = True,
         output_format: Optional[str] = None,
@@ -174,6 +183,11 @@ class ASRService:
     ) -> Union[str, Tuple[str, str, List[dict]], List[dict]]:
         """
         Transcribes speech audio into verified text with optional timestamped subtitles.
+        Supports task='transcribe' or task='translate' (translating foreign speech directly into English).
+        Supports customizable words_per_line:
+          - 1 (default): 1-word-per-line SRT for animated reels/TikTok/shorts captions.
+          - N (e.g. 3, 5): N-word grouped subtitle lines.
+          - 0 or None: natural sentence/clause level subtitles.
         Acquires semaphore before execution to strictly guarantee bounded concurrency on GPU 0.
         Bypasses PyAV by pre-decoding input into 16 kHz float32 numpy arrays.
         """
@@ -191,48 +205,67 @@ class ASRService:
                 audio_16k,
                 beam_size=beam_size,
                 language=language,
+                task=task,
                 temperature=0.0,
                 vad_filter=vad_filter,
-                word_timestamps=True
+                word_timestamps=word_timestamps
             )
 
             seg_list = []
             text_segments = []
             srt_lines = []
-            word_idx = 1
+            srt_idx = 1
 
             for s_idx, s in enumerate(segments, start=1):
                 clean_text = s.text.strip()
                 if clean_text:
                     text_segments.append(clean_text)
 
-                if hasattr(s, "words") and s.words:
-                    for w in s.words:
-                        w_text = w.word.strip()
-                        if not w_text:
-                            continue
-                        seg_list.append({
-                            "id": word_idx,
-                            "start": round(w.start, 3),
-                            "end": round(w.end, 3),
-                            "text": w_text
-                        })
-                        srt_lines.append(f"{word_idx}\n{format_srt_time(w.start)} --> {format_srt_time(w.end)}\n{w_text}\n")
-                        word_idx += 1
+                # Word-level breakdown if available and requested
+                if word_timestamps and hasattr(s, "words") and s.words and words_per_line and words_per_line > 0:
+                    clean_words = [w for w in s.words if w.word.strip()]
+                    if words_per_line == 1:
+                        for w in clean_words:
+                            w_text = w.word.strip()
+                            seg_list.append({
+                                "id": srt_idx,
+                                "start": round(w.start, 3),
+                                "end": round(w.end, 3),
+                                "text": w_text
+                            })
+                            srt_lines.append(f"{srt_idx}\n{format_srt_time(w.start)} --> {format_srt_time(w.end)}\n{w_text}\n")
+                            srt_idx += 1
+                    else:
+                        # Group words into chunks of `words_per_line`
+                        for i in range(0, len(clean_words), words_per_line):
+                            chunk = clean_words[i:i + words_per_line]
+                            chunk_text = " ".join(w.word.strip() for w in chunk)
+                            start_t = chunk[0].start
+                            end_t = chunk[-1].end
+                            seg_list.append({
+                                "id": srt_idx,
+                                "start": round(start_t, 3),
+                                "end": round(end_t, 3),
+                                "text": chunk_text
+                            })
+                            srt_lines.append(f"{srt_idx}\n{format_srt_time(start_t)} --> {format_srt_time(end_t)}\n{chunk_text}\n")
+                            srt_idx += 1
                 else:
+                    # Natural sentence / clause level segmentation
                     seg_list.append({
-                        "id": s_idx,
+                        "id": srt_idx,
                         "start": round(s.start, 3),
                         "end": round(s.end, 3),
                         "text": clean_text
                     })
-                    srt_lines.append(f"{s_idx}\n{format_srt_time(s.start)} --> {format_srt_time(s.end)}\n{clean_text}\n")
+                    srt_lines.append(f"{srt_idx}\n{format_srt_time(s.start)} --> {format_srt_time(s.end)}\n{clean_text}\n")
+                    srt_idx += 1
 
             transcript = " ".join(text_segments).strip()
             srt_content = "\n".join(srt_lines).strip()
 
             dur = info.duration if hasattr(info, "duration") else 0.0
-            print(f"[ASR Service] Transcribed {dur:.1f}s audio in {(time.time()-t0)*1000:.1f}ms: \"{transcript[:60]}...\"")
+            print(f"[ASR Service] {task.capitalize()}d {dur:.1f}s audio in {(time.time()-t0)*1000:.1f}ms: \"{transcript[:60]}...\"")
 
             if output_format == "srt":
                 return srt_content
@@ -244,4 +277,11 @@ class ASRService:
                 return transcript, srt_content, seg_list
             return transcript
         finally:
+            if self.device == "cuda":
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
             self.pool.release()

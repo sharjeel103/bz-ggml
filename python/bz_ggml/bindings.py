@@ -630,7 +630,7 @@ class VocoderHandle:
             results.append(pcm_arr[start:start + cnt])
         return results
 
-    def decode_tiled(self, frames_tokens: List[int], ctx_frames: int = 80, step_frames: int = 240):
+    def decode_tiled(self, frames_tokens: List[int], ctx_frames: int = 80, step_frames: int = 160):
         """
         Non-streaming VRAM-bounded tiled vocoder decode returning float32 numpy PCM.
         Caps peak vocoder VRAM at ~0.9-1.2 GB regardless of total audio duration while

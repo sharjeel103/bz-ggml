@@ -2,6 +2,11 @@
 bz-ggml: High-Performance C++ Inference Engine for Breeze-TTS-2 on Dual GPUs with GGML
 """
 
+try:
+    import torch
+except ImportError:
+    pass
+
 from .bindings import (
     BreezeLib, GeneratorHandle, VocoderHandle,
     load_breeze_voice, save_breeze_voice,

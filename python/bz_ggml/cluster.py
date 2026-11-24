@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import numpy as np
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from .bindings import (
     BreezeLib,
     GeneratorHandle,
@@ -214,24 +219,60 @@ def select_burst_steps(active_sessions: dict, max_burst: int = 16) -> int:
     return 1
 
 
-class DynamicCapacityCoordinator:
+class TokenCapacityCoordinator:
     """
-    Coordinates dynamic VRAM headroom between continuous-batched TTS and auxiliary models
-    (Faster-Whisper on GPU 0, Resemble Enhancer on GPU 1) using the Green Light protocol.
+    Intelligent hardware-aware token capacity coordinator for Dual Tesla T4 cluster.
+    Guarantees exactly ~500 MiB safety headroom at peak load across all configurations
+    (INT8, FP16, Q4 burst, unconstrained ASR, and on-demand Enhancer).
     """
 
-    def __init__(self, cluster: "DualInstanceCluster"):
-        self.cluster = cluster
+    USABLE_VRAM_MIB = 14910
+    SAFETY_HEADROOM_MIB = 500
+    TARGET_MAX_VRAM_MIB = 14410
+    VOCODER_SCRATCHPAD_MIB = 1270
+    ASR_PEAK_MIB = 2160
+    ENHANCER_PEAK_MIB = 5055
+    TOKENS_PER_MIB = 4
+
+    def __init__(
+        self,
+        precision: str = "int8",
+        enable_q4_burst: bool = False,
+        enable_asr: bool = True,
+        enable_enhancer: bool = True,
+    ):
         self.lock = threading.RLock()
         self.cv = threading.Condition(self.lock)
-        self.reserved_headroom = {0: 0, 1: 0}
         self.active_tokens = {0: 0, 1: 0}
+        self.enhancer_active = False
+
+        # 1. Base Generator Footprint (INT8 / FP16 / Q4 burst)
+        gen_vram = 3400
+        if precision.lower() in ("fp16", "float16"):
+            gen_vram += 3400
+        if enable_q4_burst:
+            gen_vram += 1400
+        self.gen_vram = gen_vram
+
+        # 2. GPU 0 Fixed Ceiling (30,000 tokens for INT8)
+        static_0 = self.gen_vram + self.VOCODER_SCRATCHPAD_MIB + (self.ASR_PEAK_MIB if enable_asr else 0)
+        kv_0 = max(1000, self.TARGET_MAX_VRAM_MIB - static_0)
+        self.ceiling_gpu0 = min(30000, (kv_0 * self.TOKENS_PER_MIB // 100) * 100)
+
+        # 3. GPU 1 Normal Ceiling (38,900 tokens for INT8 - Enhancer is 0 MiB on GPU when idle)
+        static_1 = self.gen_vram + self.VOCODER_SCRATCHPAD_MIB
+        kv_1_normal = max(1000, self.TARGET_MAX_VRAM_MIB - static_1)
+        self.ceiling_gpu1_normal = min(38900, (kv_1_normal * self.TOKENS_PER_MIB // 100) * 100)
+
+        # 4. GPU 1 Enhancer Clamped Ceiling (18,400 tokens for INT8 - accounts for all 5,055 MiB weights + inference)
+        kv_1_enh = max(1000, self.TARGET_MAX_VRAM_MIB - (static_1 + self.ENHANCER_PEAK_MIB))
+        self.ceiling_gpu1_enh = min(18400, (kv_1_enh * self.TOKENS_PER_MIB // 100) * 100)
 
     def get_admission_ceiling(self, gpu_id: int) -> int:
         with self.lock:
-            budget = getattr(self.cluster, "active_token_budget", 50000)
-            reserved = self.reserved_headroom.get(gpu_id, 0)
-            return max(2000, budget - reserved)
+            if gpu_id == 0:
+                return self.ceiling_gpu0
+            return self.ceiling_gpu1_enh if self.enhancer_active else self.ceiling_gpu1_normal
 
     def get_free_headroom(self, gpu_id: int) -> int:
         with self.lock:
@@ -242,43 +283,36 @@ class DynamicCapacityCoordinator:
             self.active_tokens[gpu_id] = max(0, current_tokens)
             self.cv.notify_all()
 
-    def request_headroom(self, gpu_id: int, tokens_needed: int, timeout: float = 30.0) -> bool:
+    def acquire_enhancer_headroom(self) -> bool:
+        """
+        Pure event-driven headroom acquisition.
+        Zero fixed sleep intervals, zero polling.
+        Wakes up immediately via Condition notification the exact microsecond
+        active tokens on GPU 1 drop to or below the Enhancer ceiling.
+        """
         with self.lock:
-            self.reserved_headroom[gpu_id] = self.reserved_headroom.get(gpu_id, 0) + tokens_needed
-            target_ceiling = self.get_admission_ceiling(gpu_id)
-            print(
-                f"[DynamicCapacityCoordinator] Headroom requested on GPU {gpu_id}: "
-                f"{tokens_needed} tokens. Target ceiling: {target_ceiling}. "
-                f"Active: {self.active_tokens.get(gpu_id, 0)}"
-            )
-
-            start = time.time()
-            while self.active_tokens.get(gpu_id, 0) > target_ceiling:
-                remaining = timeout - (time.time() - start)
-                if remaining <= 0:
-                    print(
-                        f"[DynamicCapacityCoordinator] Warning: Headroom drain timed out "
-                        f"after {timeout}s on GPU {gpu_id}. Proceeding."
-                    )
-                    return False
-                self.cv.wait(timeout=min(0.2, remaining))
-
-            print(
-                f"[DynamicCapacityCoordinator] Green Light granted on GPU {gpu_id} "
-                f"(active={self.active_tokens.get(gpu_id, 0)} <= ceiling={target_ceiling})"
-            )
+            self.enhancer_active = True
+            target = self.ceiling_gpu1_enh
+            while self.active_tokens.get(1, 0) > target:
+                self.cv.wait()
             return True
 
-    def release_headroom(self, gpu_id: int, tokens_needed: int):
+    def release_enhancer_headroom(self):
         with self.lock:
-            self.reserved_headroom[gpu_id] = max(
-                0, self.reserved_headroom.get(gpu_id, 0) - tokens_needed
-            )
-            print(
-                f"[DynamicCapacityCoordinator] Headroom released on GPU {gpu_id}: "
-                f"-{tokens_needed} tokens. Restored ceiling: {self.get_admission_ceiling(gpu_id)}"
-            )
+            self.enhancer_active = False
             self.cv.notify_all()
+
+    def request_headroom(self, gpu_id: int, tokens_needed: int = 0, timeout: float = 0.0) -> bool:
+        if gpu_id == 1:
+            return self.acquire_enhancer_headroom()
+        return True
+
+    def release_headroom(self, gpu_id: int, tokens_needed: int = 0):
+        if gpu_id == 1:
+            self.release_enhancer_headroom()
+
+
+DynamicCapacityCoordinator = TokenCapacityCoordinator
 
 
 class DualInstanceCluster:
@@ -293,26 +327,20 @@ class DualInstanceCluster:
 
     @staticmethod
     def calculate_token_budget(
-        base_max_tokens: int = 50000,
+        base_max_tokens: int = 38400,
         enable_q4_burst: bool = False,
         vocoder_mode: str = "dynamic",
         precision: str = "int8",
-        enable_enhancer: bool = True,
-        enable_asr: bool = True,
+        enable_enhancer: bool = False,
+        enable_asr: bool = False,
+        **kwargs,
     ) -> int:
         budget = base_max_tokens
         if precision.lower() in ("fp16", "float16"):
-            budget -= 7420
+            budget -= 13600
         if enable_q4_burst:
-            budget -= 1400
-        if vocoder_mode in ("on", "dynamic"):
-            # Tiled vocoder (ctx=80, step=240) caps scratchpad at ~1.0-1.2 GB (~4,800 tokens)
-            budget -= 4800
-        if enable_enhancer:
-            budget -= 6450
-        if enable_asr:
-            budget -= 9600
-        return max(5000, budget)
+            budget -= 5600
+        return max(4000, budget)
 
     def __init__(
         self,
@@ -326,7 +354,7 @@ class DualInstanceCluster:
         precision: str = "int8",
         enable_enhancer: bool = True,
         enable_asr: bool = True,
-        base_max_tokens: int = 50000,
+        base_max_tokens: int = 38400,
         max_slots_per_gpu: int = 48,
         quantum_frames: int = 16,
     ):
@@ -347,16 +375,17 @@ class DualInstanceCluster:
             self.vocoder_mode = vocoder_mode.lower()
         self.enable_vocoder = self.vocoder_mode in ("on", "dynamic")
         self.base_max_tokens = base_max_tokens
-        self.active_token_budget = self.calculate_token_budget(
-            base_max_tokens=self.base_max_tokens,
-            enable_q4_burst=self.enable_q4_burst,
-            vocoder_mode=self.vocoder_mode,
+        self.capacity_coord = TokenCapacityCoordinator(
             precision=self.precision,
-            enable_enhancer=self.enable_enhancer,
+            enable_q4_burst=self.enable_q4_burst,
             enable_asr=self.enable_asr,
+            enable_enhancer=self.enable_enhancer,
         )
-        self.dynamic_coord = DynamicCapacityCoordinator(self)
+        self.dynamic_coord = self.capacity_coord
+        self.active_token_budget = self.capacity_coord.ceiling_gpu1_normal
         self.lib = BreezeLib(lib_path)
+        self._voc_rr_index = 0
+        self._voc_rr_lock = threading.Lock()
 
         # Island 0 (GPU 0)
         print(f"[Cluster] Initializing Island 0 on CUDA0 (Vocoder: {self.vocoder_mode})...")
@@ -372,7 +401,24 @@ class DualInstanceCluster:
         self.gen_b = GeneratorHandle(self.lib, model_path, cuda_device=1)
         self.voc_b = self.gen_b.create_vocoder() if self.enable_vocoder else None
         self._voc_lock_b = threading.Lock()
+        self.is_enhancer_running = False
         print(f"   -> Island 1 Online on CUDA1 in {time.time() - t0:.2f}s")
+
+        # Warm up vocoder buffers upfront so the 1,266 MiB gallocr scratchpad is pre-allocated
+        if self.enable_vocoder:
+            print("[Cluster] Pre-allocating bounded tiled vocoder scratchpads on CUDA0 & CUDA1...")
+            dummy_tokens = [0] * (16 * 240)
+            if self.voc_a:
+                try:
+                    self.voc_a.decode_tiled(dummy_tokens, ctx_frames=80, step_frames=240)
+                except Exception as e:
+                    print(f"   -> Vocoder A warmup warning: {e}")
+            if self.voc_b:
+                try:
+                    self.voc_b.decode_tiled(dummy_tokens, ctx_frames=80, step_frames=240)
+                except Exception as e:
+                    print(f"   -> Vocoder B warmup warning: {e}")
+            print("   -> Bounded Tiled Vocoder Scratchpads Pre-Allocated Cleanly.")
 
         # Optional Modular INT4 Depth Decoder (~300 MiB)
         self.has_q4_dd = False
@@ -449,24 +495,27 @@ class DualInstanceCluster:
     ) -> np.ndarray:
         """
         Decodes an arbitrary-length 16-codebook token array into 24 kHz float32 PCM using
-        strictly VRAM-bounded tiled decoding (default ctx=80, step=240 -> ~1.0 GB peak VRAM).
-        Automatically picks whichever GPU has more free headroom when gpu_id is None.
+        strictly VRAM-bounded tiled decoding.
+        Primary vocoder host: GPU 0 (always available, Whisper leaves >3.7 GB free).
+        Secondary / spillover host: GPU 1 (runs when GPU 0 is busy and is_enhancer_running is False).
         """
         if not tokens:
             return np.zeros(0, dtype=np.float32)
 
-        if gpu_id is None:
-            free_0 = self.dynamic_coord.get_free_headroom(0)
-            free_1 = self.dynamic_coord.get_free_headroom(1)
-            # Prefer non-busy vocoder lock if headroom is comparable
-            if self._voc_lock_a.locked() and not self._voc_lock_b.locked():
-                target_gpu = 1
-            elif self._voc_lock_b.locked() and not self._voc_lock_a.locked():
-                target_gpu = 0
-            else:
-                target_gpu = 0 if free_0 >= free_1 else 1
-        else:
+        # Equal-priority dynamic load balancing between GPU 0 and GPU 1
+        if gpu_id in (0, 1):
             target_gpu = gpu_id
+        else:
+            lock_a_busy = self._voc_lock_a.locked()
+            lock_b_busy = self._voc_lock_b.locked()
+            if not lock_a_busy and lock_b_busy:
+                target_gpu = 0
+            elif not lock_b_busy and lock_a_busy:
+                target_gpu = 1
+            else:
+                with self._voc_rr_lock:
+                    self._voc_rr_index = 1 - self._voc_rr_index
+                    target_gpu = self._voc_rr_index
 
         if target_gpu == 0:
             if self.voc_a is None:
@@ -478,6 +527,11 @@ class DualInstanceCluster:
             voc, lock = self.voc_b, self._voc_lock_b
 
         with lock:
+            if torch is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_device(target_gpu)
+                except Exception:
+                    pass
             return voc.decode_tiled(tokens, ctx_frames=ctx_frames, step_frames=step_frames)
 
     def _persistent_generator_loop(
@@ -541,7 +595,18 @@ class DualInstanceCluster:
                 except Exception as cb_err:
                     print(f"[{worker_name}] Completion callback error for session {sid}: {cb_err}")
 
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(gpu_id)
+            except Exception:
+                pass
+
         while self._running:
+            if torch is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_device(gpu_id)
+                except Exception:
+                    pass
             # A. Admit waiting chunks under active_token_budget & max_slots_per_gpu
             while self._running:
                 max_active_tokens = self.dynamic_coord.get_admission_ceiling(gpu_id)
@@ -737,20 +802,36 @@ class DualInstanceCluster:
         for sid in list(active_sessions.keys()):
             _retire_session(sid, error_msg="Cluster shutting down")
 
-    def encode_audio(self, pcm_samples: List[float], gpu_id: int = 0) -> Tuple[List[int], int]:
+    def encode_audio(self, pcm_samples: List[float], gpu_id: Optional[int] = None) -> Tuple[List[int], int]:
         """Encodes 24 kHz mono float32 audio samples into 16-codebook tokens at 12.5 Hz (max 10s)."""
         MAX_SAMPLES = 240000
         if len(pcm_samples) > MAX_SAMPLES:
             pcm_samples = pcm_samples[:MAX_SAMPLES]
+        
+        target_gpu = gpu_id
+        if target_gpu is None:
+            # Pick GPU 1 if Enhancer is NOT running, else GPU 0
+            target_gpu = 1 if not getattr(self, "is_enhancer_running", False) else 0
+
+        gen = self.gen_b if target_gpu == 1 else self.gen_a
         acquired = self.audio_encoder_pool.acquire(blocking=True, timeout=15.0)
         if not acquired:
-            raise TimeoutError("Audio reference encoder concurrency limit (2 jobs) exceeded on GPU 0")
+            raise TimeoutError(f"Audio reference encoder concurrency limit (2 jobs) exceeded on GPU {target_gpu}")
+        
+        # Request temporary headroom for the ~465 MiB audio encoder compute graph
+        self.dynamic_coord.request_headroom(target_gpu, tokens_needed=2000, timeout=10.0)
         try:
-            return self.gen_a.encode_audio(pcm_samples)
+            if torch is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_device(target_gpu)
+                except Exception:
+                    pass
+            return gen.encode_audio(pcm_samples)
         finally:
+            self.dynamic_coord.release_headroom(target_gpu, tokens_needed=2000)
             self.audio_encoder_pool.release()
 
-    def encode_voice_container(self, pcm_samples: List[float], transcript: str, gpu_id: int = 0) -> bytes:
+    def encode_voice_container(self, pcm_samples: List[float], transcript: str, gpu_id: Optional[int] = None) -> bytes:
         codes, frames = self.encode_audio(pcm_samples, gpu_id=gpu_id)
         return serialize_breeze_voice(text=transcript.strip(), codes=codes, frames=frames)
 

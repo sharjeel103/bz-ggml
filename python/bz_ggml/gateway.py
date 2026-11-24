@@ -171,22 +171,8 @@ class TelemetrySampler:
         gpu1_vram_total_mb = 15360
         gpu1_util_pct = 0.0
 
-        if self._nvml and self._nvml_handles:
-            try:
-                m0 = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handles[0])
-                u0 = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handles[0])
-                gpu0_vram_mb = int(m0.used // (1024 * 1024))
-                gpu0_vram_total_mb = int(m0.total // (1024 * 1024))
-                gpu0_util_pct = float(u0.gpu)
-                if len(self._nvml_handles) > 1:
-                    m1 = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handles[1])
-                    u1 = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handles[1])
-                    gpu1_vram_mb = int(m1.used // (1024 * 1024))
-                    gpu1_vram_total_mb = int(m1.total // (1024 * 1024))
-                    gpu1_util_pct = float(u1.gpu)
-            except Exception:
-                pass
-        elif self._has_torch_cuda:
+        # Prefer PyTorch CUDA C-API mem_get_info for container-accurate VRAM
+        if self._has_torch_cuda:
             try:
                 free0, total0 = self._torch.cuda.mem_get_info(0)
                 gpu0_vram_mb = int((total0 - free0) // (1024 * 1024))
@@ -195,6 +181,24 @@ class TelemetrySampler:
                     free1, total1 = self._torch.cuda.mem_get_info(1)
                     gpu1_vram_mb = int((total1 - free1) // (1024 * 1024))
                     gpu1_vram_total_mb = int(total1 // (1024 * 1024))
+            except Exception:
+                pass
+
+        if self._nvml and self._nvml_handles:
+            try:
+                u0 = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handles[0])
+                gpu0_util_pct = float(u0.gpu)
+                if not self._has_torch_cuda:
+                    m0 = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handles[0])
+                    gpu0_vram_mb = int(m0.used // (1024 * 1024))
+                    gpu0_vram_total_mb = int(m0.total // (1024 * 1024))
+                if len(self._nvml_handles) > 1:
+                    u1 = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handles[1])
+                    gpu1_util_pct = float(u1.gpu)
+                    if not self._has_torch_cuda:
+                        m1 = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handles[1])
+                        gpu1_vram_mb = int(m1.used // (1024 * 1024))
+                        gpu1_vram_total_mb = int(m1.total // (1024 * 1024))
             except Exception:
                 pass
 
@@ -407,6 +411,24 @@ class MTLSGatewayClient:
                 max_concurrent=EngineOrchestrator.MAX_QUEUE_TTS,
                 throughput_unit_per_sec=18.0
             ),
+            worker_pb2.JobTypeCapability(
+                job_type_name="audio_enhance",
+                quality_tiers=["standard"],
+                max_concurrent=4,
+                throughput_unit_per_sec=1.2
+            ),
+            worker_pb2.JobTypeCapability(
+                job_type_name="speech_to_text",
+                quality_tiers=["turbo"],
+                max_concurrent=2,
+                throughput_unit_per_sec=30.0
+            ),
+            worker_pb2.JobTypeCapability(
+                job_type_name="voice_registration",
+                quality_tiers=["standard"],
+                max_concurrent=2,
+                throughput_unit_per_sec=5.0
+            ),
         ]
 
         reg_req = worker_pb2.RegisterRequest(
@@ -610,7 +632,7 @@ class MTLSGatewayClient:
                 self.admission_ctrl.running_jobs.pop(job_id, None)
 
     def _parse_dispatch_job(self, job_id: str, dispatch: "worker_pb2.DispatchJob") -> Parcel:
-        """Translates workerpb DispatchJob into internal Parcel."""
+        """Translates workerpb DispatchJob into internal Parcel supporting all task types."""
         params_dict = {}
         if dispatch.params:
             try:
@@ -618,11 +640,35 @@ class MTLSGatewayClient:
             except Exception:
                 params_dict = {"raw_bytes": dispatch.params}
 
+        j_type = dispatch.job_type_name.lower()
         quality = dispatch.quality.lower()
-        tasks = [TaskSpec(TaskType.TTS, params_dict)]
-        if "studio" in quality:
-            tasks.append(TaskSpec(TaskType.ENHANCE, {}))
-            tasks.append(TaskSpec(TaskType.MASTER, {}))
+        tasks = []
+
+        if "tasks" in params_dict and isinstance(params_dict["tasks"], list):
+            # Custom explicit task sequence
+            for t in params_dict["tasks"]:
+                t_type = TaskType(t.get("task_type", "tts"))
+                tasks.append(TaskSpec(t_type, t.get("params", {})))
+        elif "enhance" in j_type:
+            tasks.append(TaskSpec(TaskType.ENHANCE, params_dict))
+        elif "asr" in j_type or "transcribe" in j_type or "translate" in j_type or "speech_to_text" in j_type:
+            tasks.append(TaskSpec(TaskType.ASR, params_dict))
+        elif "voice_reg" in j_type or "register_voice" in j_type or "voice_registration" in j_type:
+            if params_dict.get("enhance", True):
+                tasks.append(TaskSpec(TaskType.ENHANCE, {"chunk_seconds": 10.0}))
+            tasks.append(TaskSpec(TaskType.ASR, {"output_format": "txt"}))
+            tasks.append(TaskSpec(TaskType.VOICE_REGISTER, params_dict))
+        elif params_dict.get("return_tokens_only"):
+            tasks.append(TaskSpec(TaskType.TTS, params_dict))
+        else:
+            # Default TTS Pipeline
+            tasks.append(TaskSpec(TaskType.TTS, params_dict))
+            if "studio" in quality or params_dict.get("enhance", False):
+                tasks.append(TaskSpec(TaskType.ENHANCE, {"chunk_seconds": 10.0}))
+            if "studio" in quality or params_dict.get("master", False):
+                tasks.append(TaskSpec(TaskType.MASTER, {"preset": params_dict.get("preset", "optionA_rich_bass")}))
+            if params_dict.get("srt", False) or params_dict.get("asr", False):
+                tasks.append(TaskSpec(TaskType.ASR, params_dict.get("asr_params", {"output_format": "all"})))
 
         upload_targets = params_dict.get("upload_targets")
         if upload_targets:
@@ -653,6 +699,7 @@ class MTLSGatewayClient:
                 "error_message": result.error_message,
                 "duration_s": result.duration_s,
                 "sample_rate": result.sample_rate,
+                "tokens": result.tokens,
                 "transcript": result.transcript,
                 "subtitles_srt": result.subtitles_srt,
                 "upload_results": result.upload_results,

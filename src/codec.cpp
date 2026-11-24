@@ -96,7 +96,8 @@ std::vector<int> MimiCodec::encode(const std::vector<float> & audio, int & n_fra
     ggml_tensor * ra = linear(g.ctx, m->w("codec.aq.in_proj.weight"), emb); // [dim, T2]
     ggml_set_output(rs);
     g.write(rs);
-    g.compute(m->backend, ra);
+    Backend & be = be_override ? *be_override : m->backend;
+    g.compute(be, ra);
 
     std::vector<float> rs_h = tensor_to_f32(rs);
     std::vector<float> ra_h = tensor_to_f32(ra);

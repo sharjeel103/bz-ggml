@@ -17,6 +17,7 @@ import numpy as np
 import soundfile as sf
 
 FFMPEG_EXE = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
+from .asr import ASRService
 
 
 # =====================================================================
@@ -374,30 +375,33 @@ def stitch_audio_chunks(
 # 3. RESEMBLE ENHANCE (DENOISE & 44.1k UPSAMPLING)
 # =====================================================================
 
-_RESEMBLE_MODEL_CACHE: Dict[str, Any] = {}
+_RESEMBLE_CPU_MODEL: Any = None
 _RESEMBLE_LOCK = threading.Lock()
 
-def get_resemble_enhancer_model(device: str = "cuda:1"):
+def get_resemble_cpu_model():
     """
-    Singleton cache for Resemble Enhancer model weights in GPU VRAM.
-    Keeps model resident permanently to eliminate reload overhead.
+    Stages Resemble Enhancer model weights in CPU system RAM (0 MiB GPU VRAM).
+    Models are transferred to GPU on-demand during inference and evacuated immediately.
     """
-    global _RESEMBLE_MODEL_CACHE
+    global _RESEMBLE_CPU_MODEL
     with _RESEMBLE_LOCK:
-        if device in _RESEMBLE_MODEL_CACHE:
-            return _RESEMBLE_MODEL_CACHE[device]
+        if _RESEMBLE_CPU_MODEL is not None:
+            return _RESEMBLE_CPU_MODEL
         try:
             import torch
             from resemble_enhance.enhancer.inference import load_enhancer
-            print(f"[Resemble Enhancer] Loading permanent model weights on {device} (~1,477 MiB VRAM)...")
+            print("[Resemble Enhancer] Initializing weights in host CPU RAM (0 MiB GPU VRAM)...")
             t0 = time.time()
-            model = load_enhancer(None, device=device)
-            _RESEMBLE_MODEL_CACHE[device] = model
-            print(f"   -> Resemble Enhancer Online on {device} in {time.time()-t0:.2f}s!")
-            return model
+            _RESEMBLE_CPU_MODEL = load_enhancer(None, device="cpu")
+            print(f"   -> Resemble Enhancer ready in CPU RAM in {time.time()-t0:.2f}s!")
+            return _RESEMBLE_CPU_MODEL
         except Exception as e:
-            print(f"[Resemble Enhancer] Failed to load model on {device}: {e}")
+            print(f"[Resemble Enhancer] Failed to load model on CPU: {e}")
             return None
+
+
+def get_resemble_enhancer_model(device: str = "cuda:1"):
+    return get_resemble_cpu_model()
 
 
 def enhance_audio_array(
@@ -408,7 +412,7 @@ def enhance_audio_array(
 ) -> Tuple[np.ndarray, int]:
     """
     Enhances in-memory float32 audio, removes noise, and upsamples to 44.1 kHz.
-    Uses configurable chunk_seconds (default: 10.0s saves 1.2 GB active VRAM) and 1.0s overlap.
+    Moves model from CPU to GPU on-demand and evacuates 100% of GPU memory immediately after.
     """
     try:
         import torch
@@ -423,21 +427,25 @@ def enhance_audio_array(
         else:
             device = "cpu"
 
-    model = get_resemble_enhancer_model(device)
-    if model is None:
+    device_idx = int(device.split(":")[-1]) if ":" in device else 0
+
+    cpu_model = get_resemble_cpu_model()
+    if cpu_model is None:
         return pcm, sr
 
     t0 = time.time()
+    cuda_model = None
     try:
+        # 1. Transfer model weights from CPU to GPU on-demand (~0.4s)
+        cuda_model = cpu_model.to(device)
+
         dwav = torch.from_numpy(pcm.astype(np.float32))
         if dwav.dim() > 1:
             dwav = dwav.mean(dim=-1)
 
-        if "cuda" in device:
-            torch.cuda.empty_cache()
-
+        # 2. Run chunked neural inference
         hwav, out_sr = inference(
-            model=model,
+            model=cuda_model,
             dwav=dwav,
             sr=sr,
             device=device,
@@ -453,9 +461,20 @@ def enhance_audio_array(
         print(f"[Resemble Enhancer] In-memory enhanced {len(pcm)/sr:.1f}s audio in {time.time()-t0:.2f}s (Out SR: {out_sr})")
         return out_np.astype(np.float32), int(out_sr)
     finally:
+        # 3. Immediately evacuate model weights back to CPU and purge CUDA cache
+        try:
+            if cuda_model is not None:
+                cuda_model.to("cpu")
+                del cuda_model
+        except Exception:
+            pass
+        gc.collect()
         if "cuda" in device and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+            try:
+                with torch.cuda.device(device_idx):
+                    torch.cuda.empty_cache()
+            except Exception:
+                torch.cuda.empty_cache()
 
 
 def apply_resemble_enhancer(
@@ -702,6 +721,12 @@ def load_any_audio(
             data = data.mean(axis=1 if data.shape[1] < data.shape[0] else 0)
         sr = target_sr or 24000
     else:
+        # If input is a remote presigned or public URL (S3 / GCS / R2), download bytes into memory
+        if isinstance(audio_input, str) and (audio_input.startswith("http://") or audio_input.startswith("https://")):
+            import urllib.request
+            with urllib.request.urlopen(audio_input, timeout=30.0) as resp:
+                audio_input = resp.read()
+
         loaded = False
         data, sr = None, None
 

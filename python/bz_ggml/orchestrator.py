@@ -22,6 +22,10 @@ from enum import Enum
 from typing import Optional, List, Dict, Any, Tuple, Callable
 import numpy as np
 import urllib.request
+try:
+    import torch
+except ImportError:
+    torch = None
 
 from .cluster import DualInstanceCluster, UserTask, estimate_speech_profile
 from .asr import ASRService
@@ -180,6 +184,7 @@ class ParcelResult:
     sample_rate: int = 24000
     audio_pcm: Optional[np.ndarray] = None
     raw_audio_pcm: Optional[np.ndarray] = None
+    tokens: Optional[List[int]] = None
     transcript: Optional[str] = None
     subtitles_srt: Optional[str] = None
     segments: Optional[List[Dict[str, Any]]] = None
@@ -203,9 +208,29 @@ class EngineCapabilities:
     asr_model_size: str = "turbo"
     asr_device_index: int = 0
     enhancer_device_index: int = 1
+    vocoder_step_frames: int = 240
 
     def validate_parcel(self, parcel: Parcel) -> None:
         task_types = [t.task_type for t in parcel.tasks]
+        if parcel.payload.get("return_tokens_only"):
+            if TaskType.TTS not in task_types:
+                raise ValueError("Requested 'return_tokens_only' but TaskType.TTS is missing from parcel tasks.")
+            disallowed = {TaskType.ENHANCE, TaskType.MASTER, TaskType.ASR, TaskType.VOICE_REGISTER, TaskType.STITCH}
+            present_disallowed = disallowed.intersection(task_types)
+            if present_disallowed:
+                names = [t.value for t in present_disallowed]
+                raise ValueError(
+                    f"A request with 'return_tokens_only' must strictly contain only TTS. "
+                    f"Downstream audio stages {names} cannot execute without synthesized waveform audio."
+                )
+            if TaskType.UPLOAD in task_types:
+                upload_targets = parcel.payload.get("upload_targets") or parcel.upload_targets or {}
+                for k in upload_targets.keys():
+                    if k not in ("tokens", "tokens_json"):
+                        raise ValueError(
+                            f"Invalid upload target '{k}' for 'return_tokens_only' request. "
+                            f"Must be one of ['tokens', 'tokens_json']."
+                        )
         if TaskType.ENHANCE in task_types and not self.enable_enhancer:
             raise ValueError(
                 "Requested TaskType.ENHANCE but Resemble Enhancer is disabled on this engine instance."
@@ -222,7 +247,7 @@ class EngineCapabilities:
             upload_targets = parcel.payload.get("upload_targets") or parcel.upload_targets
             if not upload_targets or not isinstance(upload_targets, dict):
                 raise ValueError("TaskType.UPLOAD requires a valid dictionary of upload_targets in parcel payload.")
-            valid_keys = {"audio_mp3", "audio_wav", "subtitles_srt", "transcript_txt", "voice_breeze", "raw_audio_wav"}
+            valid_keys = {"audio_mp3", "audio_wav", "subtitles_srt", "transcript_txt", "voice_breeze", "raw_audio_wav", "tokens", "tokens_json"}
             for k, url in upload_targets.items():
                 if k not in valid_keys:
                     raise ValueError(f"Invalid upload target '{k}'. Must be one of {valid_keys}.")
@@ -318,6 +343,7 @@ class RequestContext:
     current_pcm: Optional[np.ndarray] = None
     current_sr: int = 24000
     raw_audio_pcm: Optional[np.ndarray] = None
+    tokens: Optional[List[int]] = None
     transcript: Optional[str] = None
     subtitles_srt: Optional[str] = None
     voice_bytes: Optional[bytes] = None
@@ -521,14 +547,15 @@ class EngineOrchestrator:
         self,
         parcel: Parcel,
         progress_callback: Optional[Callable[[str, float, str], None]] = None,
+        timeout: float = 1200.0,
     ) -> ParcelResult:
-        return self.submit_sync(parcel, progress_callback=progress_callback)
+        return self.submit_sync(parcel, progress_callback=progress_callback, timeout=timeout)
 
     def submit_sync(
         self,
         parcel: Parcel,
         progress_callback: Optional[Callable[[str, float, str], None]] = None,
-        timeout: float = 600.0,
+        timeout: float = 1200.0,
         skip_admission: bool = False,
     ) -> ParcelResult:
         self.validate_parcel(parcel)
@@ -807,12 +834,26 @@ class EngineOrchestrator:
                         cancel_event=req.cancel_event,
                     )
 
-            # All chunks complete -> hand off merged token stream to tiled vocoder worker
+            # All chunks complete -> hand off merged token stream to tiled vocoder worker or bypass if return_tokens_only
             if merged_tokens is not None:
                 with self.state_lock:
                     self.tts_assemblies.pop(req.request_id, None)
-                self._report_progress(req, "tts", 0.88, "Running continuous tiled vocoder...")
-                self.vocode_queue.put((req.request_id, merged_tokens, assembly.started_at, req.cancel_event))
+
+                if req.parcel.payload.get("return_tokens_only"):
+                    req.tokens = merged_tokens
+                    self._report_progress(req, "tts", 1.0, "Completed token generation (vocoder bypassed).")
+                    self.completion_queue.put(
+                        JobDoneEvent(
+                            request_id=req.request_id,
+                            task_type=TaskType.TTS,
+                            success=True,
+                            artifacts={"tokens": merged_tokens},
+                            stage_timing_s=time.time() - assembly.started_at,
+                        )
+                    )
+                else:
+                    self._report_progress(req, "tts", 0.88, "Running continuous tiled vocoder...")
+                    self.vocode_queue.put((req.request_id, merged_tokens, assembly.started_at, req.cancel_event))
 
         self._report_progress(
             req,
@@ -927,15 +968,22 @@ class EngineOrchestrator:
                 req.status = "COMPLETED"
             req.overall_progress = 1.0
 
+            dur_s = 0.0
+            if req.current_pcm is not None and req.current_sr > 0:
+                dur_s = round(len(req.current_pcm) / float(req.current_sr), 2)
+            elif req.tokens:
+                dur_s = round((len(req.tokens) / 16.0) * 0.08, 2)
+
             result = ParcelResult(
                 parcel_id=req.request_id,
                 success=(req.status == "COMPLETED"),
                 error_message=req.error_message,
-                duration_s=round(len(req.current_pcm) / float(req.current_sr), 2) if req.current_pcm is not None else 0.0,
+                duration_s=dur_s,
                 chunks_count=req.metadata.get("chunks_count", 1),
                 sample_rate=req.current_sr,
                 audio_pcm=req.current_pcm,
                 raw_audio_pcm=req.raw_audio_pcm,
+                tokens=req.tokens,
                 transcript=req.transcript,
                 subtitles_srt=req.subtitles_srt,
                 voice_bytes=req.voice_bytes,
@@ -944,6 +992,10 @@ class EngineOrchestrator:
                 stage_timings=req.stage_timings,
                 metadata=req.metadata,
             )
+
+            if req.tokens and (req.parcel.payload.get("return_tokens_only") or (req.parcel.return_artifacts and "tokens" in req.parcel.return_artifacts)):
+                import json
+                result.artifact_bytes["tokens"] = json.dumps(req.tokens).encode("utf-8")
 
             if req.status == "COMPLETED" and req.parcel.return_artifacts:
                 for art_name in req.parcel.return_artifacts:
@@ -1045,8 +1097,8 @@ class EngineOrchestrator:
                 pcm = self.cluster.decode_tokens_tiled(
                     merged_tokens,
                     ctx_frames=80,
-                    step_frames=240,
-                    gpu_id=worker_idx % 2,
+                    step_frames=getattr(self.capabilities, "vocoder_step_frames", 240),
+                    gpu_id=None,
                 )
                 self.completion_queue.put(
                     JobDoneEvent(
@@ -1082,11 +1134,12 @@ class EngineOrchestrator:
                 if pcm is None or len(pcm) == 0:
                     raise ValueError("ENHANCE stage requires audio input.")
 
+                # Mark Enhancer active on GPU 1 (blocks new vocoders from spilling onto GPU 1)
                 chunk_sec = float(job.params.get("chunk_seconds", self.capabilities.chunk_seconds_enhancer))
-                tokens_needed = 16850 if chunk_sec <= 10.0 else 22210
 
-                if hasattr(self.cluster, "dynamic_coord"):
-                    self.cluster.dynamic_coord.request_headroom(gpu_id=1, tokens_needed=tokens_needed)
+                coord = getattr(self.cluster, "capacity_coord", getattr(self.cluster, "dynamic_coord", None))
+                if coord and hasattr(coord, "acquire_enhancer_headroom"):
+                    coord.acquire_enhancer_headroom()
                 try:
                     device_tag = f"cuda:{self.capabilities.enhancer_device_index}"
                     enhanced_pcm, out_sr = enhance_audio_array(
@@ -1096,9 +1149,14 @@ class EngineOrchestrator:
                         device=device_tag,
                     )
                 finally:
-                    if hasattr(self.cluster, "dynamic_coord"):
-                        self.cluster.dynamic_coord.release_headroom(gpu_id=1, tokens_needed=tokens_needed)
-
+                    if torch is not None and torch.cuda.is_available():
+                        try:
+                            with torch.cuda.device(self.capabilities.enhancer_device_index):
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    if coord and hasattr(coord, "release_enhancer_headroom"):
+                        coord.release_enhancer_headroom()
                 self.completion_queue.put(
                     JobDoneEvent(
                         request_id=job.request_id,
@@ -1135,18 +1193,24 @@ class EngineOrchestrator:
                 if self.asr_service is None:
                     raise RuntimeError("ASR Service instance is not configured on this engine.")
 
-                tokens_needed = 9600
-                if hasattr(self.cluster, "dynamic_coord"):
-                    self.cluster.dynamic_coord.request_headroom(gpu_id=0, tokens_needed=tokens_needed)
-                try:
-                    transcript, srt_content, seg_list = self.asr_service.transcribe(
-                        audio=pcm,
-                        sample_rate=job.input_sr,
-                        output_format="all",
-                    )
-                finally:
-                    if hasattr(self.cluster, "dynamic_coord"):
-                        self.cluster.dynamic_coord.release_headroom(gpu_id=0, tokens_needed=tokens_needed)
+                asr_task = job.params.get("task", "transcribe")
+                asr_lang = job.params.get("language", "en")
+                words_per_line = job.params.get("words_per_line", 1)
+                beam_size = int(job.params.get("beam_size", 1))
+                vad_filter = bool(job.params.get("vad_filter", True))
+                word_timestamps = bool(job.params.get("word_timestamps", True))
+
+                transcript, srt_content, seg_list = self.asr_service.transcribe(
+                    audio=pcm,
+                    sample_rate=job.input_sr,
+                    task=asr_task,
+                    language=asr_lang,
+                    beam_size=beam_size,
+                    vad_filter=vad_filter,
+                    word_timestamps=word_timestamps,
+                    words_per_line=words_per_line,
+                    output_format="all",
+                )
 
                 self.completion_queue.put(
                     JobDoneEvent(
@@ -1204,7 +1268,7 @@ class EngineOrchestrator:
                 voice_bytes = self.cluster.encode_voice_container(
                     pcm_samples=pcm_24k.tolist(),
                     transcript=transcript.strip(),
-                    gpu_id=0,
+                    gpu_id=None,
                 )
 
                 self.completion_queue.put(
@@ -1302,6 +1366,7 @@ class EngineOrchestrator:
                     txt = req.transcript if req else None
                     v_bytes = req.voice_bytes if req else None
                     raw_pcm = req.raw_audio_pcm if req else None
+                    toks = req.tokens if req else None
 
                 def get_bytes(name: str) -> Tuple[Optional[bytes], str]:
                     if name == "audio_mp3" and current_pcm is not None:
@@ -1316,6 +1381,9 @@ class EngineOrchestrator:
                         return v_bytes, "application/octet-stream"
                     elif name == "raw_audio_wav" and raw_pcm is not None:
                         return encode_pcm_to_wav_bytes(raw_pcm, 24000), "audio/wav"
+                    elif (name == "tokens" or name == "tokens_json") and toks:
+                        import json
+                        return json.dumps(toks).encode("utf-8"), "application/json"
                     return None, "application/octet-stream"
 
                 for art_name, target_url in upload_targets.items():

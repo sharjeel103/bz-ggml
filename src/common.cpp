@@ -2,6 +2,15 @@
 #include "ggml-cpu.h"
 #if defined(GGML_USE_CUDA)
 #include "ggml-cuda.h"
+#include <dlfcn.h>
+typedef int (*cuda_set_device_fn)(int);
+static inline void set_cuda_device_safe(int dev) {
+    if (dev < 0) return;
+    static cuda_set_device_fn fn = (cuda_set_device_fn) dlsym(RTLD_DEFAULT, "cudaSetDevice");
+    if (fn) fn(dev);
+}
+#else
+static inline void set_cuda_device_safe(int) {}
 #endif
 
 #include <cmath>
@@ -11,13 +20,16 @@
 namespace breeze {
 
 void Backend::init_device(int cuda_device) {
+    this->cuda_device = cuda_device;
 #if defined(GGML_USE_CUDA)
+    set_cuda_device_safe(cuda_device);
     backend = ggml_backend_cuda_init(cuda_device);
     is_gpu = backend != nullptr;
 #endif
     if (!backend) {
         backend = ggml_backend_cpu_init();
         is_gpu = false;
+        this->cuda_device = -1;
     }
     alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
 }
@@ -99,6 +111,7 @@ ggml_tensor * Graph::input_f32(const std::vector<float> & data, int ne0, int ne1
 }
 
 void Graph::compute(Backend & be, ggml_tensor * out) {
+    set_cuda_device_safe(be.cuda_device);
     ggml_set_output(out);
     for (ggml_tensor * r : extra_roots) {
         ggml_set_output(r);

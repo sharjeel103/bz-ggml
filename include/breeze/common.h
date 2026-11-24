@@ -16,6 +16,7 @@ struct Backend {
     ggml_backend_t backend = nullptr;
     ggml_gallocr_t alloc = nullptr;
     bool is_gpu = false;
+    int cuda_device = -1;
 
     void init(bool prefer_gpu);
     void init_device(int cuda_device);
