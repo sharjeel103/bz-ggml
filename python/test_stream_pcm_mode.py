@@ -11,17 +11,21 @@ from bz_ggml import UserTask, VoiceConversionTask
 
 class TestStreamPCMMode(unittest.TestCase):
     def test_task_default_parameters(self):
-        # 1. Standard TTS task defaults to stream_pcm=True for backward compatibility
-        task_streaming = UserTask(id=1, text="Hello world")
+        # 1. Standard TTS task can be configured with stream_pcm=True
+        task_streaming = UserTask(id=1, text="Hello world", stream_pcm=True)
         self.assertTrue(task_streaming.stream_pcm)
         self.assertFalse(task_streaming.client_has_vocoder)
 
-        # 2. Studio task explicitly sets stream_pcm=False
+        # 2. Studio task explicitly sets stream_pcm=False (or defaults to False)
         task_studio = UserTask(id=2, text="Studio recording", stream_pcm=False)
         self.assertFalse(task_studio.stream_pcm)
         self.assertFalse(task_studio.client_has_vocoder)
 
-        # 3. VoiceConversionTask defaults to stream_pcm=False (native single-pass)
+        # 3. Default UserTask is non-streaming (stream_pcm=False)
+        task_default = UserTask(id=4, text="Default recording")
+        self.assertFalse(task_default.stream_pcm)
+
+        # 4. VoiceConversionTask defaults to stream_pcm=False (native single-pass)
         task_conv = VoiceConversionTask(id=3, src_codes=[1, 2], src_frames=10)
         self.assertFalse(task_conv.stream_pcm)
 

@@ -76,31 +76,32 @@ class AdmissionController:
             return self.orchestrator.evaluate_admission(parcel)
 
     def cancel(self, job_id: str) -> bool:
-        """Cancels a job if queued or currently running in orchestrator."""
+        """Cancels a job and immediately aborts any queued or active GPU chunks."""
         with self.lock:
             self.cancelled_job_ids.add(job_id)
-            with self.orchestrator.state_lock:
-                req = self.orchestrator.active_requests.get(job_id)
-                if req:
-                    req.status = "CANCELLED"
-                    req.completion_event.set()
-                    return True
-        return False
+            return self.orchestrator.cancel_request(job_id)
 
     def submit_sync(
         self,
         parcel: Parcel,
-        progress_callback: Optional[Callable[[str, float, str], None]] = None
+        progress_callback: Optional[Callable[[str, float, str], None]] = None,
+        skip_admission: bool = False
     ) -> Tuple[bool, str, float, float, Optional[ParcelResult]]:
         """
         Synchronous admission and execution entrypoint (used by Gradio and direct callers).
         Returns: (accepted, reason, duration_s, eta_s, ParcelResult)
         """
-        accepted, reason, dur_s, eta_s, pos = self.evaluate_admission(parcel)
-        if not accepted:
-            return accepted, reason, dur_s, eta_s, None
+        dur_s, eta_s = 0.0, 0.0
+        if not skip_admission:
+            accepted, reason, dur_s, eta_s, pos = self.evaluate_admission(parcel)
+            if not accepted:
+                return accepted, reason, dur_s, eta_s, None
 
-        result = self.orchestrator.submit_sync(parcel, progress_callback=progress_callback)
+        result = self.orchestrator.submit_sync(
+            parcel,
+            progress_callback=progress_callback,
+            skip_admission=True
+        )
         status_str = "COMPLETED" if result.success else (result.error_message or "FAILED")
         return result.success, status_str, dur_s, eta_s, result
 
@@ -132,6 +133,19 @@ class TelemetrySampler:
         except ImportError:
             self._psutil = None
 
+        # Optional pynvml for driver-level GPU utilization & VRAM (includes GGML CUDA allocations)
+        self._nvml = None
+        self._nvml_handles = []
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            cnt = pynvml.nvmlDeviceGetCount()
+            self._nvml_handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(cnt)]
+        except Exception:
+            self._nvml = None
+            self._nvml_handles = []
+
     def sample_metrics(self) -> Dict[str, Any]:
         """Collects full hardware & queue metrics in under 20 microseconds."""
         t_now_ms = int(time.time() * 1000)
@@ -149,17 +163,42 @@ class TelemetrySampler:
             except Exception:
                 pass
 
-        # 2. GPU 0 & GPU 1 VRAM via PyTorch C-API (sub-microsecond)
+        # 2. Driver-level GPU 0 & GPU 1 VRAM & Utilization (includes GGML + PyTorch allocations)
         gpu0_vram_mb = 0
         gpu0_vram_total_mb = 15360
+        gpu0_util_pct = 0.0
         gpu1_vram_mb = 0
         gpu1_vram_total_mb = 15360
+        gpu1_util_pct = 0.0
 
+        # Prefer PyTorch CUDA C-API mem_get_info for container-accurate VRAM
         if self._has_torch_cuda:
             try:
-                gpu0_vram_mb = int(self._torch.cuda.memory_reserved(0) // (1024 * 1024))
+                free0, total0 = self._torch.cuda.mem_get_info(0)
+                gpu0_vram_mb = int((total0 - free0) // (1024 * 1024))
+                gpu0_vram_total_mb = int(total0 // (1024 * 1024))
                 if self._torch.cuda.device_count() > 1:
-                    gpu1_vram_mb = int(self._torch.cuda.memory_reserved(1) // (1024 * 1024))
+                    free1, total1 = self._torch.cuda.mem_get_info(1)
+                    gpu1_vram_mb = int((total1 - free1) // (1024 * 1024))
+                    gpu1_vram_total_mb = int(total1 // (1024 * 1024))
+            except Exception:
+                pass
+
+        if self._nvml and self._nvml_handles:
+            try:
+                u0 = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handles[0])
+                gpu0_util_pct = float(u0.gpu)
+                if not self._has_torch_cuda:
+                    m0 = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handles[0])
+                    gpu0_vram_mb = int(m0.used // (1024 * 1024))
+                    gpu0_vram_total_mb = int(m0.total // (1024 * 1024))
+                if len(self._nvml_handles) > 1:
+                    u1 = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handles[1])
+                    gpu1_util_pct = float(u1.gpu)
+                    if not self._has_torch_cuda:
+                        m1 = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handles[1])
+                        gpu1_vram_mb = int(m1.used // (1024 * 1024))
+                        gpu1_vram_total_mb = int(m1.total // (1024 * 1024))
             except Exception:
                 pass
 
@@ -186,10 +225,12 @@ class TelemetrySampler:
             "ram_total_gb": ram_total_gb,
             "gpu0_vram_used_mb": gpu0_vram_mb,
             "gpu0_vram_total_mb": gpu0_vram_total_mb,
+            "gpu0_util_percent": gpu0_util_pct,
             "gpu0_active_tokens": gpu0_tokens,
             "gpu0_token_ceiling": gpu0_ceiling,
             "gpu1_vram_used_mb": gpu1_vram_mb,
             "gpu1_vram_total_mb": gpu1_vram_total_mb,
+            "gpu1_util_percent": gpu1_util_pct,
             "gpu1_active_tokens": gpu1_tokens,
             "gpu1_token_ceiling": gpu1_ceiling,
             "queue_depths": orch_snapshot.get("queue_depths", {}),
@@ -250,7 +291,8 @@ class MTLSGatewayClient:
         admission_ctrl: AdmissionController,
         node_id: Optional[str] = None,
         telemetry_interval_s: float = 1.0,
-        declared_lease_seconds: int = 604800
+        declared_lease_seconds: int = 604800,
+        require_mtls: bool = True
     ):
         self.server_url = server_url
         self.ca_cert_path = ca_cert_path
@@ -263,6 +305,7 @@ class MTLSGatewayClient:
         self.declared_lease_seconds = declared_lease_seconds
         self.worker_id: Optional[str] = None
 
+        self.require_mtls = require_mtls
         self.sampler = TelemetrySampler(self.node_id, self.orchestrator)
         self.ssl_context = self._create_ssl_context()
         self.running = False
@@ -274,14 +317,23 @@ class MTLSGatewayClient:
             ctx.load_verify_locations(cafile=self.ca_cert_path)
             ctx.verify_mode = ssl.CERT_REQUIRED
             ctx.check_hostname = False
+        elif self.require_mtls:
+            raise FileNotFoundError(
+                f"mTLS CA certificate not found at '{self.ca_cert_path}'. "
+                "Pass require_mtls=False only for local dev."
+            )
         else:
-            logger.warning(f"CA certificate '{self.ca_cert_path}' not found; using unverified SSL.")
+            logger.warning(f"CA certificate '{self.ca_cert_path}' not found; using unverified SSL (require_mtls=False).")
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
         if os.path.exists(self.client_cert_path) and os.path.exists(self.client_key_path):
             ctx.load_cert_chain(certfile=self.client_cert_path, keyfile=self.client_key_path)
             logger.info("Loaded client certificate and private key for mTLS.")
+        elif self.require_mtls:
+            raise FileNotFoundError(
+                f"mTLS client cert/key not found ('{self.client_cert_path}', '{self.client_key_path}')."
+            )
 
         return ctx
 
@@ -358,6 +410,24 @@ class MTLSGatewayClient:
                 quality_tiers=["standard", "studio"],
                 max_concurrent=EngineOrchestrator.MAX_QUEUE_TTS,
                 throughput_unit_per_sec=18.0
+            ),
+            worker_pb2.JobTypeCapability(
+                job_type_name="audio_enhance",
+                quality_tiers=["standard"],
+                max_concurrent=4,
+                throughput_unit_per_sec=1.2
+            ),
+            worker_pb2.JobTypeCapability(
+                job_type_name="speech_to_text",
+                quality_tiers=["turbo"],
+                max_concurrent=2,
+                throughput_unit_per_sec=30.0
+            ),
+            worker_pb2.JobTypeCapability(
+                job_type_name="voice_registration",
+                quality_tiers=["standard"],
+                max_concurrent=2,
+                throughput_unit_per_sec=5.0
             ),
         ]
 
@@ -508,8 +578,14 @@ class MTLSGatewayClient:
             sync_resp = worker_pb2.SyncResponse(
                 actual_running=actual_running,
                 free_capacity=free_cap,
-                gpu_util_pct=float(metrics.get("cpu_percent", 0.0)),
-                vram_used_gb=float(metrics.get("gpu0_vram_used_mb", 0)) / 1024.0,
+                gpu_util_pct=round(
+                    0.5 * (float(metrics.get("gpu0_util_percent", 0.0)) + float(metrics.get("gpu1_util_percent", 0.0))),
+                    2,
+                ),
+                vram_used_gb=round(
+                    (float(metrics.get("gpu0_vram_used_mb", 0)) + float(metrics.get("gpu1_vram_used_mb", 0))) / 1024.0,
+                    2,
+                ),
                 remaining_lease_seconds=self.declared_lease_seconds
             )
             sync_env = worker_pb2.Envelope(
@@ -530,7 +606,7 @@ class MTLSGatewayClient:
 
         try:
             def run():
-                return self.admission_ctrl.submit_sync(parcel)
+                return self.admission_ctrl.submit_sync(parcel, skip_admission=True)
 
             _, _, _, _, result = await loop.run_in_executor(None, run)
 
@@ -556,7 +632,7 @@ class MTLSGatewayClient:
                 self.admission_ctrl.running_jobs.pop(job_id, None)
 
     def _parse_dispatch_job(self, job_id: str, dispatch: "worker_pb2.DispatchJob") -> Parcel:
-        """Translates workerpb DispatchJob into internal Parcel."""
+        """Translates workerpb DispatchJob into internal Parcel supporting all task types."""
         params_dict = {}
         if dispatch.params:
             try:
@@ -564,11 +640,42 @@ class MTLSGatewayClient:
             except Exception:
                 params_dict = {"raw_bytes": dispatch.params}
 
+        j_type = dispatch.job_type_name.lower()
         quality = dispatch.quality.lower()
-        tasks = [TaskSpec(TaskType.TTS, params_dict)]
-        if "studio" in quality:
-            tasks.append(TaskSpec(TaskType.ENHANCE, {}))
-            tasks.append(TaskSpec(TaskType.MASTER, {}))
+        tasks = []
+
+        if "tasks" in params_dict and isinstance(params_dict["tasks"], list):
+            # Custom explicit task sequence
+            for t in params_dict["tasks"]:
+                t_type = TaskType(t.get("task_type", "tts"))
+                tasks.append(TaskSpec(t_type, t.get("params", {})))
+        elif "enhance" in j_type:
+            tasks.append(TaskSpec(TaskType.ENHANCE, params_dict))
+        elif "asr" in j_type or "transcribe" in j_type or "translate" in j_type or "speech_to_text" in j_type:
+            tasks.append(TaskSpec(TaskType.ASR, params_dict))
+        elif "voice_reg" in j_type or "register_voice" in j_type or "voice_registration" in j_type:
+            v_enh = params_dict.get("enhance", "auto")
+            if v_enh is True:
+                tasks.append(TaskSpec(TaskType.ENHANCE, {"chunk_seconds": 10.0}))
+            elif isinstance(v_enh, str) and v_enh.strip().lower() == "auto":
+                tasks.append(TaskSpec(TaskType.ENHANCE, {"chunk_seconds": 10.0, "auto_gate": True, "min_snr_db": 30.0}))
+            if params_dict.get("master", True):
+                tasks.append(TaskSpec(TaskType.MASTER, {"preset": params_dict.get("preset", "gentle_loudnorm")}))
+            explicit_tx = params_dict.get("transcript")
+            if not (isinstance(explicit_tx, str) and explicit_tx.strip()):
+                tasks.append(TaskSpec(TaskType.ASR, {"output_format": "txt"}))
+            tasks.append(TaskSpec(TaskType.VOICE_REGISTER, params_dict))
+        elif params_dict.get("return_tokens_only"):
+            tasks.append(TaskSpec(TaskType.TTS, params_dict))
+        else:
+            # Default TTS Pipeline
+            tasks.append(TaskSpec(TaskType.TTS, params_dict))
+            if params_dict.get("enhance", "studio" in quality):
+                tasks.append(TaskSpec(TaskType.ENHANCE, {"chunk_seconds": 10.0}))
+            if params_dict.get("master", "studio" in quality):
+                tasks.append(TaskSpec(TaskType.MASTER, {"preset": params_dict.get("preset", "optionA_rich_bass")}))
+            if params_dict.get("srt", False) or params_dict.get("asr", False):
+                tasks.append(TaskSpec(TaskType.ASR, params_dict.get("asr_params", {"output_format": "all"})))
 
         upload_targets = params_dict.get("upload_targets")
         if upload_targets:
@@ -587,7 +694,7 @@ class MTLSGatewayClient:
         loop = asyncio.get_running_loop()
 
         def run():
-            return self.admission_ctrl.submit_sync(parcel)
+            return self.admission_ctrl.submit_sync(parcel, skip_admission=True)
 
         _, _, _, _, result = await loop.run_in_executor(None, run)
 
@@ -599,6 +706,7 @@ class MTLSGatewayClient:
                 "error_message": result.error_message,
                 "duration_s": result.duration_s,
                 "sample_rate": result.sample_rate,
+                "tokens": result.tokens,
                 "transcript": result.transcript,
                 "subtitles_srt": result.subtitles_srt,
                 "upload_results": result.upload_results,

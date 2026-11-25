@@ -2,6 +2,11 @@
 bz-ggml: High-Performance C++ Inference Engine for Breeze-TTS-2 on Dual GPUs with GGML
 """
 
+try:
+    import torch
+except ImportError:
+    pass
+
 from .bindings import (
     BreezeLib, GeneratorHandle, VocoderHandle,
     load_breeze_voice, save_breeze_voice,
@@ -16,7 +21,11 @@ from .telemetry import TelemetryProfiler
 from .asr import ASRService, format_srt_time, load_audio_16k
 from .audio_pipeline import (
     split_text_into_smart_chunks,
+    split_text_with_anchor,
     stitch_audio_chunks,
+    level_and_stitch_chunks,
+    trim_chunk_edges,
+    estimate_audio_snr_db,
     apply_resemble_enhancer,
     enhance_audio_array,
     apply_studio_normalization,
@@ -65,7 +74,11 @@ __all__ = [
     "serialize_breeze_voice",
     "deserialize_breeze_voice",
     "split_text_into_smart_chunks",
+    "split_text_with_anchor",
     "stitch_audio_chunks",
+    "level_and_stitch_chunks",
+    "trim_chunk_edges",
+    "estimate_audio_snr_db",
     "apply_resemble_enhancer",
     "enhance_audio_array",
     "apply_studio_normalization",
