@@ -654,18 +654,25 @@ class MTLSGatewayClient:
         elif "asr" in j_type or "transcribe" in j_type or "translate" in j_type or "speech_to_text" in j_type:
             tasks.append(TaskSpec(TaskType.ASR, params_dict))
         elif "voice_reg" in j_type or "register_voice" in j_type or "voice_registration" in j_type:
-            if params_dict.get("enhance", True):
+            v_enh = params_dict.get("enhance", "auto")
+            if v_enh is True:
                 tasks.append(TaskSpec(TaskType.ENHANCE, {"chunk_seconds": 10.0}))
-            tasks.append(TaskSpec(TaskType.ASR, {"output_format": "txt"}))
+            elif isinstance(v_enh, str) and v_enh.strip().lower() == "auto":
+                tasks.append(TaskSpec(TaskType.ENHANCE, {"chunk_seconds": 10.0, "auto_gate": True, "min_snr_db": 30.0}))
+            if params_dict.get("master", True):
+                tasks.append(TaskSpec(TaskType.MASTER, {"preset": params_dict.get("preset", "gentle_loudnorm")}))
+            explicit_tx = params_dict.get("transcript")
+            if not (isinstance(explicit_tx, str) and explicit_tx.strip()):
+                tasks.append(TaskSpec(TaskType.ASR, {"output_format": "txt"}))
             tasks.append(TaskSpec(TaskType.VOICE_REGISTER, params_dict))
         elif params_dict.get("return_tokens_only"):
             tasks.append(TaskSpec(TaskType.TTS, params_dict))
         else:
             # Default TTS Pipeline
             tasks.append(TaskSpec(TaskType.TTS, params_dict))
-            if "studio" in quality or params_dict.get("enhance", False):
+            if params_dict.get("enhance", "studio" in quality):
                 tasks.append(TaskSpec(TaskType.ENHANCE, {"chunk_seconds": 10.0}))
-            if "studio" in quality or params_dict.get("master", False):
+            if params_dict.get("master", "studio" in quality):
                 tasks.append(TaskSpec(TaskType.MASTER, {"preset": params_dict.get("preset", "optionA_rich_bass")}))
             if params_dict.get("srt", False) or params_dict.get("asr", False):
                 tasks.append(TaskSpec(TaskType.ASR, params_dict.get("asr_params", {"output_format": "all"})))

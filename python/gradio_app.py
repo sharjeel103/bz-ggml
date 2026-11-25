@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
 Breeze-TTS Studio: Decoupled Gradio Web Application Client
-Provides in-browser Text-to-Speech, Zero-Shot Voice Cloning, Human-in-the-Loop Voice Registration (.breeze),
-Speech-to-Speech Voice Conversion (Mode 4), and Subtitle/Transcription tools.
-Strictly decoupled from the engine: consumes public bz_ggml APIs and respects all engine contracts.
+Provides in-browser Long-Form Production Studio, Text-to-Speech, Zero-Shot Voice Cloning,
+Auto-Gated Voice Registration (.breeze), Speech-to-Speech Conversion (Mode 4), and Whisper Turbo Subtitles.
+Consumes public bz_ggml APIs directly with verified Option A timbre-lock defaults.
 """
 
 import argparse
 import os
 import queue
-import shutil
 import sys
 import tempfile
 import threading
@@ -19,22 +18,28 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bz_ggml import (
-    DualInstanceCluster, UserTask, VoiceConversionTask,
-    load_breeze_voice, save_breeze_voice,
-    serialize_breeze_voice, deserialize_breeze_voice,
-    EngineOrchestrator, EngineCapabilities,
-    TaskType, TaskSpec, Parcel, ParcelResult,
-    save_pcm_to_mp3, save_pcm_to_wav
+    DualInstanceCluster,
+    VoiceConversionTask,
+    load_breeze_voice,
+    deserialize_breeze_voice,
+    EngineOrchestrator,
+    EngineCapabilities,
+    Parcel,
+    ParcelResult,
+    save_pcm_to_mp3,
+    save_pcm_to_wav,
 )
 from bz_ggml.asr import ASRService
-from bz_ggml.audio_pipeline import (
-    split_text_into_smart_chunks, stitch_audio_chunks,
-    apply_resemble_enhancer, apply_studio_normalization,
-    convert_to_mp3_256k, generate_1word_srt_file,
-    format_chunk_preview_markdown
-)
+from bz_ggml.audio_pipeline import format_chunk_preview_markdown
 
 import gradio as gr
+
+DEFAULT_OPTION_A_INSTRUCTION = "Speak clearly and naturally."
+REG_ENHANCE_CHOICES = [
+    "Auto (Skip Resemble if Clean >= 30 dB)",
+    "Always Enhance (44.1 kHz Denoise)",
+    "Off (Gentle Mastering Only)",
+]
 
 # Global Configuration Dictionary (Populated by CLI args)
 APP_CONFIG: Dict[str, Any] = {
@@ -81,8 +86,10 @@ def get_cluster() -> DualInstanceCluster:
         model_path = APP_CONFIG["model_path"]
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found at: {model_path}")
+        resolved_prec = DualInstanceCluster.resolve_precision(model_path, APP_CONFIG.get("precision"))
+        APP_CONFIG["precision"] = resolved_prec
         print(f"[Gradio Studio] Initializing DualInstanceCluster with Model: {model_path}")
-        print(f"  • Precision: {APP_CONFIG.get('precision', 'int8')} | Vocoder Mode: {APP_CONFIG['vocoder_mode']} | Q4 Burst: {APP_CONFIG['enable_q4_burst']}")
+        print(f"  - Precision: {resolved_prec.upper()} | Vocoder Mode: {APP_CONFIG['vocoder_mode']} | Q4 Burst: {APP_CONFIG['enable_q4_burst']}")
         cluster_instance = DualInstanceCluster(
             model_path=model_path,
             lib_path=APP_CONFIG["lib_path"],
@@ -91,9 +98,9 @@ def get_cluster() -> DualInstanceCluster:
             q4_threshold=APP_CONFIG["q4_threshold"],
             enable_vocoder=True,
             vocoder_mode=APP_CONFIG["vocoder_mode"],
-            precision=APP_CONFIG.get("precision", "int8"),
+            precision=resolved_prec,
             enable_enhancer=APP_CONFIG.get("enable_enhancer", True),
-            enable_asr=APP_CONFIG.get("enable_asr", True)
+            enable_asr=APP_CONFIG.get("enable_asr", True),
         )
     return cluster_instance
 
@@ -107,7 +114,7 @@ def get_asr_service() -> Optional[ASRService]:
         asr_service_instance = ASRService(
             model_size=APP_CONFIG["asr_model"],
             cuda_device=APP_CONFIG["asr_device"],
-            compute_type="float16"
+            compute_type="float16",
         )
     return asr_service_instance
 
@@ -119,7 +126,7 @@ def get_orchestrator() -> EngineOrchestrator:
         cluster = get_cluster()
         asr = get_asr_service()
         caps = EngineCapabilities(
-            precision=APP_CONFIG.get("precision", "int8"),
+            precision=cluster.precision,
             enable_q4_surge=APP_CONFIG.get("enable_q4_burst", False),
             vocoder_mode=APP_CONFIG.get("vocoder_mode", "on"),
             enable_enhancer=APP_CONFIG.get("enable_enhancer", True),
@@ -127,61 +134,21 @@ def get_orchestrator() -> EngineOrchestrator:
             chunk_seconds_enhancer=APP_CONFIG.get("enhancer_chunk_sec", 10.0),
             asr_model_size=APP_CONFIG.get("asr_model", "turbo"),
             asr_device_index=APP_CONFIG.get("asr_device", 0),
-            enhancer_device_index=APP_CONFIG.get("enhancer_device", 1)
+            enhancer_device_index=APP_CONFIG.get("enhancer_device", 1),
         )
         orchestrator_instance = EngineOrchestrator(
             cluster=cluster,
             asr_service=asr,
-            capabilities=caps
+            capabilities=caps,
         )
     return orchestrator_instance
 
 
 def load_audio_24k(audio_path: str) -> List[float]:
-    """Loads an audio file and converts to 24 kHz mono float32 in [-1.0, 1.0]."""
-    try:
-        import torchaudio
-        sig, sr = torchaudio.load(audio_path)
-        if sig.shape[0] > 1:
-            sig = sig.mean(dim=0, keepdim=True)
-        if sr != 24000:
-            sig = torchaudio.functional.resample(sig, sr, 24000)
-        return sig.squeeze().cpu().numpy().astype(np.float32).tolist()
-    except Exception:
-        pass
-
-    try:
-        import soundfile as sf
-        import scipy.signal
-        data, sr = sf.read(audio_path)
-        if data.ndim > 1:
-            data = data.mean(axis=1)
-        if sr != 24000:
-            num_samples = int(len(data) * 24000 / sr)
-            data = scipy.signal.resample(data, num_samples)
-        return data.astype(np.float32).tolist()
-    except Exception:
-        pass
-
-    import wave
-    with wave.open(audio_path, 'rb') as wf:
-        n_ch = wf.getnchannels()
-        width = wf.getsampwidth()
-        sr = wf.getframerate()
-        frames = wf.readframes(wf.getnframes())
-        if width == 2:
-            data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-        elif width == 4:
-            data = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
-        else:
-            data = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
-        if n_ch > 1:
-            data = data.reshape(-1, n_ch).mean(axis=1)
-        if sr != 24000:
-            import scipy.signal
-            num_samples = int(len(data) * 24000 / sr)
-            data = scipy.signal.resample(data, num_samples)
-        return data.astype(np.float32).tolist()
+    """Loads an audio file at 24 kHz mono float32 headroom via the core pipeline loader."""
+    from bz_ggml.audio_pipeline import load_any_audio
+    pcm, _ = load_any_audio(audio_path, target_sr=24000)
+    return pcm.astype(np.float32).tolist()
 
 
 def list_saved_voices() -> List[str]:
@@ -205,16 +172,25 @@ def get_voice_file_path(voice_display_name: str) -> Optional[str]:
     return path if os.path.exists(path) else None
 
 
-def transcribe_audio_sample(audio_path: Optional[str]) -> str:
-    """Transcribes an audio sample on GPU 1 using faster-whisper with VAD filtering."""
-    if not audio_path or not os.path.exists(audio_path):
-        return "Error: Please upload or record an audio file first."
-    try:
-        asr = get_asr_service()
-        transcript = asr.transcribe(audio_path, vad_filter=True)
-        return transcript.strip()
-    except Exception as e:
-        return f"ASR Transcription Error: {str(e)}"
+def _load_selected_voice(selected_voice: str) -> Tuple[Optional[List[int]], int, Optional[str], Optional[str]]:
+    """Loads reference tokens, frame count, transcript, and path when a saved .breeze persona is selected."""
+    voice_path = get_voice_file_path(selected_voice)
+    if not voice_path:
+        return None, 0, None, None
+    v_data = load_breeze_voice(voice_path)
+    return v_data["codes"], int(v_data["frames"]), v_data["text"], voice_path
+
+
+def _resolve_reg_enhance_mode(enhance_mode: Any) -> Tuple[Any, str]:
+    """Maps Radio label or boolean into Parcel.voice_registration enhance argument."""
+    if isinstance(enhance_mode, bool):
+        return enhance_mode, ("Resemble 44.1 kHz" if enhance_mode else "Direct Gentle Master")
+    text = str(enhance_mode or "").strip().lower()
+    if text.startswith("auto"):
+        return "auto", "Auto SNR Gate (Resemble skipped if >= 30 dB + Gentle Master)"
+    if text.startswith("off") or text in ("false", "0", "none"):
+        return False, "Off (Gentle Master Only)"
+    return True, "Always Enhance (Resemble 44.1 kHz + Gentle Master)"
 
 
 def transcribe_subtitles_tool(audio_path: Optional[str]) -> Tuple[str, str]:
@@ -223,6 +199,8 @@ def transcribe_subtitles_tool(audio_path: Optional[str]) -> Tuple[str, str]:
         return "Error: Please upload an audio file.", ""
     try:
         asr = get_asr_service()
+        if asr is None:
+            return "ASR Microservice is disabled on this instance (--disable-asr).", ""
         transcript, srt_content, _ = asr.transcribe(audio_path, vad_filter=True, return_subtitles=True)
         return transcript, srt_content
     except Exception as e:
@@ -232,25 +210,29 @@ def transcribe_subtitles_tool(audio_path: Optional[str]) -> Tuple[str, str]:
 def register_voice_file(
     voice_name: str,
     audio_path: Optional[str],
-    enhance: bool = True
-) -> Tuple[Optional[str], str, Any, Any, Any]:
+    enhance_mode: Any = REG_ENHANCE_CHOICES[0],
+    transcript_override: str = "",
+) -> Tuple[Optional[str], str, Any, Any, Any, Any]:
     """
-    Submits a Voice Persona Registration parcel [TRIM <= 10s, ENHANCE (if checked), ASR, VOICE_REGISTER]
-    to the Engine Orchestrator, receives in-memory .breeze bytes, saves to voices_dir, and updates UI dropdowns.
-    Zero manual transcript required (Whisper Turbo v3 automatically transcribes).
+    Submits a Voice Persona Registration parcel [ENHANCE (auto/on/off), MASTER, ASR (unless transcript supplied), VOICE_REGISTER]
+    to EngineOrchestrator, saves .breeze container, and refreshes all voice dropdowns.
     """
     if not voice_name.strip():
-        return None, "❌ Error: Voice name is required.", gr.update(), gr.update(), gr.update()
+        return None, "Error: Voice name is required.", gr.update(), gr.update(), gr.update(), gr.update()
     if not audio_path or not os.path.exists(audio_path):
-        return None, "❌ Error: Audio sample file is required.", gr.update(), gr.update(), gr.update()
+        return None, "Error: Audio sample file is required.", gr.update(), gr.update(), gr.update(), gr.update()
 
     try:
         orchestrator = get_orchestrator()
+        enhance_arg, enhance_desc = _resolve_reg_enhance_mode(enhance_mode)
+        clean_tx = transcript_override.strip() or None
         parcel = Parcel.voice_registration(
             audio_input=audio_path,
             voice_name=voice_name.strip(),
-            enhance=bool(enhance),
-            max_duration_s=10.0
+            transcript=clean_tx,
+            enhance=enhance_arg,
+            master=True,
+            max_duration_s=10.0,
         )
         t0 = time.time()
         res = orchestrator.dispatch(parcel)
@@ -260,181 +242,162 @@ def register_voice_file(
         container_bytes = res.voice_bytes
         enc_time = time.time() - t0
 
-        # Client-side storage: save bytes to configured voices_dir
         v_dir = APP_CONFIG["voices_dir"]
         os.makedirs(v_dir, exist_ok=True)
-        safe_name = "".join(c for c in voice_name.strip() if c.isalnum() or c in (' ', '_', '-')).strip()
+        safe_name = "".join(c for c in voice_name.strip() if c.isalnum() or c in (" ", "_", "-")).strip()
         breeze_filename = f"{safe_name.lower().replace(' ', '_')}.breeze"
         breeze_path = os.path.join(v_dir, breeze_filename)
 
         with open(breeze_path, "wb") as f:
             f.write(container_bytes)
 
-        # Also create tempfile copy for Gradio file widget serving
         temp_export = os.path.join(tempfile.gettempdir(), breeze_filename)
         with open(temp_export, "wb") as f:
             f.write(container_bytes)
 
-        # Read back container metadata for display
         meta = deserialize_breeze_voice(container_bytes)
         file_kb = len(container_bytes) / 1024.0
+        tx_source = "Manual Override" if clean_tx else f"Auto Whisper ({APP_CONFIG['asr_model']})"
 
         msg = (
-            f"✅ **Voice Registered Successfully!**\n\n"
-            f"• **Voice Persona**: `{voice_name.strip()}`\n"
-            f"• **Auto-Transcribed Text**: \"{res.transcript}\"\n"
-            f"• **Enhanced on GPU 1**: {'Yes (Resemble 44.1 kHz)' if enhance else 'No (Direct 24 kHz)'}\n"
-            f"• **Acoustic Frames**: {meta['frames']} ({meta['frames'] * 0.08:.2f}s reference audio - strictly capped <= 10s)\n"
-            f"• **Discrete Tokens**: {len(meta['codes'])} tokens (16 codebooks @ 12.5 Hz)\n"
-            f"• **Encode Time**: {enc_time:.2f}s (Pinned to GPU 0 Reference Encoder Pool)\n"
-            f"• **Saved In Registry**: `{breeze_path}` ({file_kb:.1f} KB)\n"
-            f"• **Instant Availability**: Now selectable in all Cloning & TTS dropdowns with 0 ms load!"
+            f"### Voice Registered Successfully\n\n"
+            f"- **Voice Persona**: `{voice_name.strip()}`\n"
+            f"- **Transcript ({tx_source})**: \"{meta['text']}\"\n"
+            f"- **Conditioning**: {enhance_desc}\n"
+            f"- **Acoustic Frames**: {meta['frames']} ({meta['frames'] * 0.08:.2f}s @ 12.5 Hz, capped <= 10s)\n"
+            f"- **Discrete Tokens**: {len(meta['codes'])} tokens (16 codebooks)\n"
+            f"- **Total Encode Time**: {enc_time:.2f}s (Timings: {res.stage_timings})\n"
+            f"- **Saved Registry File**: `{breeze_path}` ({file_kb:.1f} KB)"
         )
 
         updated_choices = list_saved_voices()
-        return (
-            temp_export,
-            msg,
-            gr.update(choices=updated_choices, value=voice_name.strip().title()),
-            gr.update(choices=updated_choices, value=voice_name.strip().title()),
-            gr.update(choices=updated_choices, value=voice_name.strip().title())
-        )
+        selected_title = breeze_filename[:-7].replace("_", " ").title()
+        dd_upd = gr.update(choices=updated_choices, value=selected_title)
+        return temp_export, msg, dd_upd, dd_upd, dd_upd, dd_upd
     except Exception as e:
-        return None, f"❌ Voice Registration Failed: {str(e)}", gr.update(), gr.update(), gr.update()
+        return None, f"Voice Registration Failed: {str(e)}", gr.update(), gr.update(), gr.update(), gr.update()
+
+
+def _run_single_tts_ui(
+    text: str,
+    instruction: str,
+    selected_voice: str,
+    cfg_scale: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    depth_temperature: float,
+    depth_cfg_codebooks: int,
+    seed: int,
+    require_voice: bool = False,
+) -> Generator[Tuple[Any, Any, str], None, None]:
+    """Shared handler for Tab 1 (TTS & Voice Design) and Tab 2 (Zero-Shot Cloning)."""
+    if not text.strip():
+        yield None, gr.update(visible=False), "Error: Text input is empty."
+        return
+
+    try:
+        ref_codes, ref_frames, ref_text, voice_path = _load_selected_voice(selected_voice)
+    except Exception as e:
+        yield None, gr.update(visible=False), f"Error loading voice container: {str(e)}"
+        return
+
+    if require_voice and not voice_path:
+        yield None, gr.update(visible=False), f"Error: Voice persona '{selected_voice}' not found in registry."
+        return
+
+    voice_label = selected_voice if voice_path else "Default Native Speaker"
+    orchestrator = get_orchestrator()
+    prefix = "clone" if require_voice else "tts"
+
+    parcel = Parcel.tts_pipeline(
+        script_text=text.strip(),
+        voice_name=selected_voice,
+        instruction=(instruction or DEFAULT_OPTION_A_INSTRUCTION).strip(),
+        cfg_scale=float(cfg_scale),
+        follower_cfg_scale=float(cfg_scale),
+        temperature=float(temperature),
+        top_p=float(top_p),
+        top_k=int(top_k),
+        repetition_penalty=float(repetition_penalty),
+        depth_temperature=float(depth_temperature),
+        depth_cfg_codebooks=int(depth_cfg_codebooks),
+        seed=int(seed),
+        enhance=False,
+        master=True,
+        srt=False,
+        ref_codes=ref_codes,
+        ref_frames=ref_frames,
+        ref_text=ref_text,
+        parcel_id=f"{prefix}_{int(time.time() * 1000)}",
+    )
+
+    yield None, gr.update(visible=False), f"Synthesizing on Dual GPUs ({voice_label})..."
+
+    t0 = time.time()
+    res = orchestrator.dispatch(parcel)
+    wall = time.time() - t0
+
+    if not res.success or res.audio_pcm is None:
+        yield None, gr.update(visible=False), f"Synthesis failed: {res.error_message}"
+        return
+
+    out_wav = os.path.join(tempfile.gettempdir(), f"{parcel.parcel_id}.wav")
+    save_pcm_to_wav(res.audio_pcm, res.sample_rate, out_wav)
+    rt_speed = res.duration_s / max(0.01, wall)
+
+    stats_msg = (
+        f"### Synthesis Complete (Studio Master)\n\n"
+        f"- **Voice Persona**: `{voice_label}`\n"
+        f"- **Chunks**: {res.chunks_count} | **Audio Length**: {res.duration_s:.2f}s @ {res.sample_rate} Hz\n"
+        f"- **Compute Time**: {wall:.2f}s (**{rt_speed:.2f}x** realtime)\n"
+        f"- **Sampling**: CFG={float(cfg_scale):.1f}, Temp={float(temperature):.2f}, DepthTemp={float(depth_temperature):.2f}, DepthCFG={int(depth_cfg_codebooks)}\n"
+        f"- **Output File**: `{os.path.basename(out_wav)}` ({os.path.getsize(out_wav)/1024:.1f} KB)"
+    )
+    yield out_wav, gr.update(value=out_wav, visible=True), stats_msg
 
 
 def tts_generate(
     text: str,
     instruction: str,
     selected_voice: str,
-    delivery_mode: str,
     cfg_scale: float,
     temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    depth_temperature: float,
+    depth_cfg_codebooks: int,
     seed: int,
-    max_steps: int
-) -> Generator[Tuple[Any, Any, Any, str], None, None]:
-    if not text.strip():
-        yield gr.skip(), None, gr.update(visible=False), "❌ Error: Text input is empty."
-        return
-
-    ref_codes = None
-    ref_frames = 0
-    ref_text = None
-    voice_path = get_voice_file_path(selected_voice)
-    if voice_path:
-        v_data = load_breeze_voice(voice_path)
-        ref_codes = v_data["codes"]
-        ref_frames = v_data["frames"]
-        ref_text = v_data["text"]
-
-    voice_label = selected_voice if voice_path else "Default Native Speaker"
-    orchestrator = get_orchestrator()
-
-    parcel = Parcel.tts_pipeline(
-        script_text=text.strip(),
-        voice_name=selected_voice,
-        instruction=instruction,
-        cfg_scale=float(cfg_scale),
-        temperature=float(temperature),
-        seed=int(seed),
-        enhance=False,
-        master=True,
-        srt=False,
-        ref_codes=ref_codes,
-        ref_frames=ref_frames,
-        ref_text=ref_text,
-        parcel_id=f"tts_single_{int(time.time()*1000)}"
+) -> Generator[Tuple[Any, Any, str], None, None]:
+    yield from _run_single_tts_ui(
+        text, instruction, selected_voice,
+        cfg_scale, temperature, top_p, top_k, repetition_penalty,
+        depth_temperature, depth_cfg_codebooks, seed,
+        require_voice=False,
     )
-
-    yield gr.skip(), None, gr.update(visible=False), f"⏳ Synthesizing audio on Dual GPU Islands ({voice_label})..."
-
-    t0 = time.time()
-    res = orchestrator.dispatch(parcel)
-    wall = time.time() - t0
-
-    if not res.success or res.audio_pcm is None:
-        yield gr.skip(), None, gr.update(visible=False), f"❌ Synthesis failed: {res.error_message}"
-        return
-
-    out_wav = os.path.join(tempfile.gettempdir(), f"{parcel.parcel_id}.wav")
-    save_pcm_to_wav(res.audio_pcm, res.sample_rate, out_wav)
-
-    stats_msg = (
-        f"✅ **Synthesis Complete** | Studio Master\n\n"
-        f"• **Voice Persona**: `{voice_label}`\n"
-        f"• **Audio Length**: {res.duration_s:.2f}s ({len(res.audio_pcm):,} samples @ {res.sample_rate} Hz)\n"
-        f"• **Compute Time**: {wall:.2f}s\n"
-        f"• **Master File**: `{os.path.basename(out_wav)}` ({os.path.getsize(out_wav)/1024:.1f} KB)"
-    )
-    yield gr.skip(), out_wav, gr.update(value=out_wav, visible=True), stats_msg
 
 
 def voice_clone_generate(
     text: str,
     selected_voice: str,
     instruction: str,
-    delivery_mode: str,
     cfg_scale: float,
     temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    depth_temperature: float,
+    depth_cfg_codebooks: int,
     seed: int,
-    max_steps: int
-) -> Generator[Tuple[Any, Any, Any, str], None, None]:
-    if not text.strip():
-        yield gr.skip(), None, gr.update(visible=False), "❌ Error: Target text is empty."
-        return
-
-    voice_path = get_voice_file_path(selected_voice)
-    if not voice_path:
-        yield gr.skip(), None, gr.update(visible=False), f"❌ Error: Voice persona '{selected_voice}' not found in registry."
-        return
-
-    try:
-        v_data = load_breeze_voice(voice_path)
-        ref_codes = v_data["codes"]
-        ref_frames = v_data["frames"]
-        ref_text = v_data["text"]
-    except Exception as e:
-        yield gr.skip(), None, gr.update(visible=False), f"❌ Error loading voice container: {str(e)}"
-        return
-
-    orchestrator = get_orchestrator()
-    parcel = Parcel.tts_pipeline(
-        script_text=text.strip(),
-        voice_name=selected_voice,
-        instruction=instruction,
-        cfg_scale=float(cfg_scale),
-        temperature=float(temperature),
-        seed=int(seed),
-        enhance=False,
-        master=True,
-        srt=False,
-        ref_codes=ref_codes,
-        ref_frames=ref_frames,
-        ref_text=ref_text,
-        parcel_id=f"clone_{int(time.time()*1000)}"
+) -> Generator[Tuple[Any, Any, str], None, None]:
+    yield from _run_single_tts_ui(
+        text, instruction, selected_voice,
+        cfg_scale, temperature, top_p, top_k, repetition_penalty,
+        depth_temperature, depth_cfg_codebooks, seed,
+        require_voice=True,
     )
-
-    yield gr.skip(), None, gr.update(visible=False), f"⏳ Synthesizing cloned voice on Dual GPU Islands (`{selected_voice}`)..."
-
-    t0 = time.time()
-    res = orchestrator.dispatch(parcel)
-    wall = time.time() - t0
-
-    if not res.success or res.audio_pcm is None:
-        yield gr.skip(), None, gr.update(visible=False), f"❌ Synthesis failed: {res.error_message}"
-        return
-
-    out_wav = os.path.join(tempfile.gettempdir(), f"{parcel.parcel_id}.wav")
-    save_pcm_to_wav(res.audio_pcm, res.sample_rate, out_wav)
-
-    stats_msg = (
-        f"✅ **Cloning Complete** | Studio Master\n\n"
-        f"• **Cloned Persona**: `{selected_voice}`\n"
-        f"• **Audio Length**: {res.duration_s:.2f}s ({len(res.audio_pcm):,} samples @ {res.sample_rate} Hz)\n"
-        f"• **Compute Time**: {wall:.2f}s\n"
-        f"• **Master File**: `{os.path.basename(out_wav)}` ({os.path.getsize(out_wav)/1024:.1f} KB)"
-    )
-    yield gr.skip(), out_wav, gr.update(value=out_wav, visible=True), stats_msg
 
 
 def voice_convert_generate(
@@ -444,35 +407,27 @@ def voice_convert_generate(
     ref_text: str,
     keep_acoustic: int,
     cfg_scale: float,
-    seed: int
+    seed: int,
 ) -> Tuple[Optional[str], str]:
     if not source_audio:
         return None, "Error: Source audio file is required."
 
-    voice_path = get_voice_file_path(selected_voice)
-    ref_codes = None
-    ref_frames = 0
-    final_ref_text = None
-
-    if voice_path:
-        v_data = load_breeze_voice(voice_path)
-        ref_codes = v_data["codes"]
-        ref_frames = v_data["frames"]
-        final_ref_text = v_data["text"]
-    elif ref_audio and os.path.exists(ref_audio):
-        cluster = get_cluster()
-        ref_pcm = load_audio_24k(ref_audio)
-        ref_codes, ref_frames = cluster.encode_audio(ref_pcm, gpu_id=0)
-        final_ref_text = ref_text.strip() if ref_text else None
-    else:
-        return None, "Error: Please select a registered voice or provide target reference audio."
+    ref_codes, ref_frames, final_ref_text, voice_path = _load_selected_voice(selected_voice)
+    if not voice_path:
+        if ref_audio and os.path.exists(ref_audio):
+            cluster = get_cluster()
+            ref_pcm = load_audio_24k(ref_audio)
+            ref_codes, ref_frames = cluster.encode_audio(ref_pcm, gpu_id=0)
+            final_ref_text = ref_text.strip() if ref_text else None
+        else:
+            return None, "Error: Please select a registered voice or provide target reference audio."
 
     try:
         cluster = get_cluster()
         src_pcm = load_audio_24k(source_audio)
         src_codes, src_frames = cluster.encode_audio(src_pcm, gpu_id=0)
         if src_frames <= 0 or not src_codes:
-            return None, "❌ Error: Could not encode source audio frames."
+            return None, "Error: Could not encode source audio frames."
 
         task = VoiceConversionTask(
             id=int(time.time() * 1000) % 100000,
@@ -485,35 +440,38 @@ def voice_convert_generate(
             keep_acoustic=int(keep_acoustic),
             seed=int(seed),
             client_has_vocoder=False,
-            stream_pcm=False
+            stream_pcm=False,
         )
 
-        audio_samples, tokens, stats = cluster.convert_voice_task(task)
+        audio_samples, _, stats = cluster.convert_voice_task(task)
         if not audio_samples:
             return None, "Error: Voice conversion produced no samples."
 
         out_wav = os.path.join(tempfile.gettempdir(), f"converted_voice_{task.id}.wav")
-        import wave
-        with wave.open(out_wav, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(24000)
-            pcm_np = np.array(audio_samples, dtype=np.float32)
-            pcm_int16 = (np.clip(pcm_np, -1.0, 1.0) * 32767.0).astype(np.int16)
-            w.writeframes(pcm_int16.tobytes())
+        save_pcm_to_wav(np.asarray(audio_samples, dtype=np.float32), 24000, out_wav)
 
         target_desc = selected_voice if voice_path else (os.path.basename(ref_audio) if ref_audio else "Reference Audio")
         stats_msg = (
-            f"✅ **Voice Conversion Complete (Mode 4)**\n\n"
-            f"• **Source Audio**: `{os.path.basename(source_audio)}` ({src_frames * 0.08:.2f}s, {src_frames} frames)\n"
-            f"• **Target Persona**: `{target_desc}`\n"
-            f"• **Wall Time**: {stats['compute_wall_s']:.2f}s (RTF: {stats['rtf']:.3f}x)\n"
-            f"• **Acoustic Codebooks Kept**: {keep_acoustic}/15\n"
-            f"• **Worker Island**: {stats['worker']}"
+            f"### Voice Conversion Complete (Mode 4)\n\n"
+            f"- **Source Audio**: `{os.path.basename(source_audio)}` ({src_frames * 0.08:.2f}s, {src_frames} frames)\n"
+            f"- **Target Persona**: `{target_desc}`\n"
+            f"- **Wall Time**: {stats['compute_wall_s']:.2f}s (RTF: {stats['rtf']:.3f}x)\n"
+            f"- **Acoustic Codebooks Kept**: {keep_acoustic}/15\n"
+            f"- **Worker Island**: {stats['worker']}"
         )
         return out_wav, stats_msg
     except Exception as e:
-        return None, f"❌ Error during voice conversion: {str(e)}"
+        return None, f"Error during voice conversion: {str(e)}"
+
+
+def preview_chunks_ui(text: str, selected_voice: str, auto_chunk_bounds: bool, target_w: int, max_w: int) -> str:
+    """Computes live semantic chunk preview matching orchestrator auto-sizing for cloned vs uncloned."""
+    if auto_chunk_bounds:
+        has_voice = bool(get_voice_file_path(selected_voice))
+        eff_tw, eff_mw = (45, 60) if has_voice else (110, 140)
+    else:
+        eff_tw, eff_mw = int(target_w), int(max_w)
+    return format_chunk_preview_markdown(text, target_words=eff_tw, max_words=eff_mw)
 
 
 def run_longform_pipeline_ui(
@@ -522,52 +480,65 @@ def run_longform_pipeline_ui(
     instruction: str,
     cfg_scale: float,
     temperature: float,
+    top_p: float,
+    top_k: int,
+    repetition_penalty: float,
+    depth_temperature: float,
+    depth_cfg_codebooks: int,
     seed: int,
     pause_ms: int,
+    auto_chunk_bounds: bool,
     target_words: int,
     max_words: int,
     apply_enhance: bool,
     apply_master: bool,
-    apply_srt: bool
+    apply_srt: bool,
 ) -> Generator[Tuple[str, Optional[str], Optional[str], Optional[str], Any, Any, Any, Any], None, None]:
     if not script_text.strip():
-        yield "❌ Error: Script text is empty.", None, None, "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), list_deliverable_files()
+        yield "Error: Script text is empty.", None, None, "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), list_deliverable_files()
         return
 
     out_dir = APP_CONFIG["outputs_dir"]
     os.makedirs(out_dir, exist_ok=True)
 
-    ref_codes = None
-    ref_frames = 0
-    ref_text = None
-    voice_path = get_voice_file_path(selected_voice)
-    if voice_path:
-        v_data = load_breeze_voice(voice_path)
-        ref_codes = v_data["codes"]
-        ref_frames = v_data["frames"]
-        ref_text = v_data["text"]
+    try:
+        ref_codes, ref_frames, ref_text, voice_path = _load_selected_voice(selected_voice)
+    except Exception as e:
+        yield f"Error loading registered voice: {e}", None, None, "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), list_deliverable_files()
+        return
+
+    eff_target_words = None if auto_chunk_bounds else int(target_words)
+    eff_max_words = None if auto_chunk_bounds else int(max_words)
+    eff_enhance = bool(apply_enhance and APP_CONFIG.get("enable_enhancer", True))
+    eff_srt = bool(apply_srt and APP_CONFIG.get("enable_asr", True))
 
     job_id = f"prod_{int(time.time() * 1000)}"
     parcel = Parcel.tts_pipeline(
         script_text=script_text.strip(),
         voice_name=selected_voice,
-        instruction=instruction,
+        instruction=(instruction or DEFAULT_OPTION_A_INSTRUCTION).strip(),
         cfg_scale=float(cfg_scale),
+        follower_cfg_scale=float(cfg_scale),
         temperature=float(temperature),
+        top_p=float(top_p),
+        top_k=int(top_k),
+        repetition_penalty=float(repetition_penalty),
+        depth_temperature=float(depth_temperature),
+        depth_cfg_codebooks=int(depth_cfg_codebooks),
         seed=int(seed),
         pause_ms=int(pause_ms),
-        target_words=int(target_words),
-        max_words=int(max_words),
-        enhance=bool(apply_enhance),
+        target_words=eff_target_words,
+        max_words=eff_max_words,
+        enhance=eff_enhance,
         master=bool(apply_master),
-        srt=bool(apply_srt),
+        srt=eff_srt,
         ref_codes=ref_codes,
         ref_frames=ref_frames,
         ref_text=ref_text,
-        parcel_id=job_id
+        parcel_id=job_id,
     )
 
-    update_queue = queue.Queue()
+    update_queue: queue.Queue = queue.Queue()
 
     def progress_callback(stage: str, progress: float, msg: str):
         update_queue.put({"stage": stage, "progress": progress, "msg": msg})
@@ -584,7 +555,7 @@ def run_longform_pipeline_ui(
     thread = threading.Thread(target=worker_thread, daemon=True)
     thread.start()
 
-    last_log = "🚀 Dispatching Parcel to Engine Orchestrator..."
+    last_log = "Dispatching Parcel to Engine Orchestrator..."
     raw_mp3_path = None
     mastered_mp3_path = None
     srt_content = ""
@@ -599,14 +570,13 @@ def run_longform_pipeline_ui(
                 res: ParcelResult = item["result"]
                 if not res.success:
                     yield (
-                        f"❌ **Engine Error**: {res.error_message}",
+                        f"Engine Error: {res.error_message}",
                         None, None, "",
                         gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
-                        list_deliverable_files()
+                        list_deliverable_files(),
                     )
                     break
 
-                # Client-Side Persistence: Save in-memory results directly to outputs directory
                 if res.raw_audio_pcm is not None and len(res.raw_audio_pcm) > 0:
                     raw_mp3_path = os.path.join(out_dir, f"{job_id}_raw.mp3")
                     save_pcm_to_mp3(res.raw_audio_pcm, 24000, raw_mp3_path)
@@ -624,14 +594,14 @@ def run_longform_pipeline_ui(
                 mins = int(res.duration_s // 60)
                 secs = int(res.duration_s % 60)
                 summary = (
-                    f"🎉 **Parcel Pipeline Completed Successfully!**\n\n"
-                    f"• **Parcel ID**: `{res.parcel_id}`\n"
-                    f"• **Cohesive Chunks**: {res.chunks_count} chunks synthesized symmetrically across Dual GPUs\n"
-                    f"• **Total Audio**: {res.duration_s:.2f}s ({mins}m {secs}s @ {res.sample_rate} Hz)\n"
-                    f"• **Raw Voiceover**: `{os.path.basename(raw_mp3_path) if raw_mp3_path else 'N/A'}` (256k MP3)\n"
-                    f"• **Mastered Voiceover**: `{os.path.basename(mastered_mp3_path) if mastered_mp3_path else 'N/A'}` (Broadcast Standard)\n"
-                    f"• **Word Subtitles**: `{os.path.basename(srt_file_path) if srt_file_path else 'Disabled'}`\n"
-                    f"• **Stage Timings**: {', '.join(f'{k}: {v:.2f}s' for k, v in res.stage_timings.items())}"
+                    f"### Parcel Pipeline Completed Successfully\n\n"
+                    f"- **Parcel ID**: `{res.parcel_id}` ({'Cloned: ' + selected_voice if voice_path else 'Default Voice'})\n"
+                    f"- **Cohesive Chunks**: {res.chunks_count} chunks synthesized cleanly on Dual GPUs\n"
+                    f"- **Total Audio**: {res.duration_s:.2f}s ({mins}m {secs}s @ {res.sample_rate} Hz)\n"
+                    f"- **Raw Voiceover**: `{os.path.basename(raw_mp3_path) if raw_mp3_path else 'N/A'}` (256k MP3)\n"
+                    f"- **Mastered Voiceover**: `{os.path.basename(mastered_mp3_path) if mastered_mp3_path else 'N/A'}` (Option A Broadcast)\n"
+                    f"- **Word Subtitles**: `{os.path.basename(srt_file_path) if srt_file_path else 'Disabled'}`\n"
+                    f"- **Stage Timings**: {', '.join(f'{k}: {v:.2f}s' for k, v in res.stage_timings.items())}"
                 )
 
                 saved_files = list_deliverable_files()
@@ -643,21 +613,21 @@ def run_longform_pipeline_ui(
                     gr.update(value=mastered_mp3_path, visible=bool(mastered_mp3_path)),
                     gr.update(value=raw_mp3_path, visible=bool(raw_mp3_path)),
                     gr.update(value=srt_file_path, visible=bool(srt_file_path)),
-                    saved_files
+                    saved_files,
                 )
                 break
 
             elif stage == "failed":
                 err = item.get("error", "Unknown error")
                 yield (
-                    f"❌ **Pipeline Failure**: {err}",
+                    f"Pipeline Failure: {err}",
                     raw_mp3_path,
                     mastered_mp3_path,
                     "",
                     gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=False),
-                    list_deliverable_files()
+                    list_deliverable_files(),
                 )
                 break
 
@@ -665,14 +635,14 @@ def run_longform_pipeline_ui(
                 last_log = item.get("msg", last_log)
                 pct = item.get("progress", 0.0)
                 yield (
-                    f"⏳ **[{stage.upper()}] ({int(pct*100)}%)**: {last_log}",
+                    f"[{stage.upper()}] ({int(pct*100)}%): {last_log}",
                     raw_mp3_path,
                     mastered_mp3_path,
                     srt_content,
                     gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=False),
-                    gr.skip()
+                    gr.skip(),
                 )
 
         except queue.Empty:
@@ -680,331 +650,289 @@ def run_longform_pipeline_ui(
                 break
 
 
+def _build_sampling_controls(accordion_open: bool = False) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
+    """Creates shared Option A verified sampling controls for Long-Form, TTS, and Cloning tabs."""
+    with gr.Row():
+        cfg = gr.Slider(1.0, 5.0, value=1.6, step=0.1, label="CFG Scale (1.6 = Option A Cloned Lock)")
+        temp = gr.Slider(0.05, 1.2, value=0.55, step=0.05, label="Temperature (0.55 = Balanced)")
+        seed = gr.Number(value=42, label="Random Seed", precision=0)
+
+    with gr.Accordion("Advanced Option A Sampling & Depth Timbre Lock", open=accordion_open):
+        with gr.Row():
+            top_p = gr.Slider(0.1, 1.0, value=0.85, step=0.01, label="Top-P Nucleus")
+            top_k = gr.Slider(1, 100, value=30, step=1, label="Top-K")
+            rep_pen = gr.Slider(1.0, 1.4, value=1.08, step=0.01, label="Repetition Penalty (1.08)")
+        with gr.Row():
+            depth_temp = gr.Slider(0.0, 1.0, value=0.0, step=0.05, label="Depth Temperature (0.0 = Clean Argmax)")
+            depth_cfg = gr.Slider(0, 15, value=3, step=1, label="Depth CFG Codebooks (3 = Timbre-Lock)")
+
+    return cfg, temp, top_p, top_k, rep_pen, depth_temp, depth_cfg, seed
+
+
+def _is_gradio_6_plus() -> bool:
+    try:
+        return int(str(getattr(gr, "__version__", "4")).split(".")[0]) >= 6
+    except Exception:
+        return False
+
+
 def build_app() -> gr.Blocks:
     custom_css = """
     .gradio-container { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    .status-badge { font-weight: bold; color: #10b981; }
     """
-
     initial_voices = list_saved_voices()
+    blocks_kwargs: Dict[str, Any] = {"title": "Breeze-TTS Studio"}
+    if not _is_gradio_6_plus():
+        blocks_kwargs["css"] = custom_css
+        blocks_kwargs["theme"] = gr.themes.Soft()
 
-    with gr.Blocks(title="Breeze-TTS Studio", css=custom_css, theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(**blocks_kwargs) as demo:
         gr.Markdown(
             """
-            # 🎙️ Breeze-TTS Studio & Voice Lab
-            ### High-Fidelity Neural Speech Synthesis, Zero-Shot Voice Cloning & Subtitles
-            *32-Frame Bit-Exact Stateful Vocoder | Whisper ASR Microservice | Portable `.breeze` Containers*
+            # Breeze-TTS Studio & Voice Lab
+            ### Option A Locked-Consistency Speech Synthesis, Auto-Gated Cloning & Subtitles
+            *Step-480 Tiled Vocoder | Isolated Chunk Decoding + RMS Leveling | Whisper Turbo ASR | Portable `.breeze` Containers*
             """
         )
 
         with gr.Tabs():
             # ---------------- TAB 0: LONG-FORM PRODUCTION PIPELINE ----------------
-            with gr.TabItem("🎬 Long-Form Studio (Auto-Chunk, Multi-GPU Parallel & Mastering)"):
+            with gr.TabItem("Long-Form Studio (Parallel Chunks & Mastering)"):
                 with gr.Row():
                     with gr.Column(scale=3):
-                        gr.Markdown(
-                            """
-                            ### 🎬 Long-Form Script Engine & Studio Mastering
-                            *Unlimited Length Scripts • Semantic Chunking • Dual-GPU Continuous Batching • Resemble Enhancer • Studio Broadcast Normalization • 1-Word SRT*
-                            """
-                        )
                         lf_script = gr.Textbox(
                             label="Full Script to Synthesize (Unlimited Length)",
-                            placeholder="Paste your long-form script here (articles, documentary scripts, stories)... It will be chunked intelligently at natural paragraph and sentence boundaries.",
+                            placeholder="Paste your long-form script here...",
                             lines=10,
                             value=(
-                                "Welcome to the full production pipeline demonstration.\n\n"
-                                "Our system features an autonomous dual-island architecture with zero PCIe bottlenecks. "
-                                "Each Tesla T4 GPU operates its own resident generator and dedicated streaming vocoder in VRAM.\n\n"
-                                "When long scripts are submitted, the intelligent semantic chunker partitions the text into cohesive "
-                                "speech units without ever slicing sentences or paragraphs in half. All chunks are dispatched concurrently "
-                                "across both GPUs using multi-session continuous batching, saturating hardware capacity for maximum throughput."
-                            )
+                                "On a humid September morning in nineteen seventy-seven, a Titan Centaur rocket lifted off from Cape Canaveral, "
+                                "piercing the morning haze with a sustained pillar of flame.\n\n"
+                                "Fastened to its upper stage was Voyager One, carrying within its delicate instruments the grandest aspirations "
+                                "of the human species into the cosmic dark."
+                            ),
                         )
                         with gr.Row():
                             lf_voice_dropdown = gr.Dropdown(
                                 choices=initial_voices,
                                 value=initial_voices[0],
                                 label="Voice Persona (From Voices Registry)",
-                                scale=4
+                                scale=4,
                             )
-                            lf_refresh_voice = gr.Button("🔄", scale=1)
+                            lf_refresh_voice = gr.Button("Refresh", scale=1)
 
                         lf_refresh_voice.click(
                             fn=lambda: gr.update(choices=list_saved_voices()),
                             inputs=[],
-                            outputs=[lf_voice_dropdown]
+                            outputs=[lf_voice_dropdown],
                         )
 
                         lf_instruction = gr.Textbox(
                             label="Speaker Style / Narration Direction",
-                            value="Speak with natural clarity, warm authoritative pacing, and professional broadcast presence."
+                            value=DEFAULT_OPTION_A_INSTRUCTION,
                         )
 
-                        with gr.Row():
-                            lf_cfg = gr.Slider(1.0, 5.0, value=1.5, step=0.1, label="CFG Guidance Scale (1.0 = Clean, 4.0 = Expressive)")
-                            lf_temp = gr.Slider(0.05, 1.2, value=0.25, step=0.05, label="Temperature (Sampling Randomness)")
-                            lf_seed = gr.Number(value=42, label="Base Random Seed", precision=0)
-                            lf_pause = gr.Slider(100, 600, value=200, step=25, label="Inter-Chunk Breath Pause (ms)")
+                        lf_cfg, lf_temp, lf_top_p, lf_top_k, lf_rep, lf_dtemp, lf_dcfg, lf_seed = _build_sampling_controls(False)
+                        lf_pause = gr.Slider(0, 600, value=200, step=25, label="Inter-Chunk Breath Pause (ms)")
 
-                        with gr.Accordion("✂️ Intelligent Chunking Controls & Visual Preview", open=True):
+                        with gr.Accordion("Semantic Chunking Controls & Preview", open=False):
+                            lf_auto_chunks = gr.Checkbox(
+                                value=True,
+                                label="Auto Chunk Sizing (Recommended: 45w/60w Cloned, 110w/140w Uncloned)",
+                            )
                             with gr.Row():
-                                lf_target_words = gr.Slider(30, 200, value=80, step=5, label="Target Words per Chunk (Ideal: 70-90w)")
-                                lf_max_words = gr.Slider(50, 250, value=120, step=5, label="Max Words per Chunk (Ceiling: 120-150w)")
-                            lf_preview_btn = gr.Button("🔍 Preview Chunks & Word Breakdown")
-                            lf_preview_box = gr.Markdown("Paste or type your script above and click **Preview Chunks** to inspect how the parser partitions your text.")
+                                lf_target_words = gr.Slider(25, 140, value=45, step=5, label="Manual Target Words/Chunk")
+                                lf_max_words = gr.Slider(40, 170, value=60, step=5, label="Manual Max Words/Chunk")
+                            lf_preview_btn = gr.Button("Preview Chunks & Word Breakdown")
+                            lf_preview_box = gr.Markdown("Click **Preview Chunks** to inspect partitions.")
 
                         lf_preview_btn.click(
-                            fn=lambda text, tw, mw: format_chunk_preview_markdown(text, target_words=int(tw), max_words=int(mw)),
-                            inputs=[lf_script, lf_target_words, lf_max_words],
-                            outputs=[lf_preview_box]
+                            fn=preview_chunks_ui,
+                            inputs=[lf_script, lf_voice_dropdown, lf_auto_chunks, lf_target_words, lf_max_words],
+                            outputs=[lf_preview_box],
                         )
 
-                        gr.Markdown("#### 🎛️ Post-Processing & Mastering Controls")
                         with gr.Row():
-                            lf_chk_enhance = gr.Checkbox(value=True, label="✨ Apply Resemble Enhancer (44.1 kHz Denoise & Upsample)")
-                            lf_chk_master = gr.Checkbox(value=True, label="🎚️ Apply Gentle Studio Mastering (swift_history Winning Preset)")
-                            lf_chk_srt = gr.Checkbox(value=True, label="📝 Generate 1-Word per Line SRT Subtitles")
+                            lf_chk_enhance = gr.Checkbox(
+                                value=False,
+                                label="Apply Resemble Enhancer (44.1 kHz Denoise - keep off for raw timbre)",
+                            )
+                            lf_chk_master = gr.Checkbox(value=True, label="Apply Studio Mastering (optionA_rich_bass)")
+                            lf_chk_srt = gr.Checkbox(
+                                value=APP_CONFIG.get("enable_asr", True),
+                                label="Generate 1-Word SRT Subtitles",
+                            )
 
-                        lf_submit_btn = gr.Button("🚀 Dispatch Long-Form Production Pipeline", variant="primary", size="lg")
+                        lf_submit_btn = gr.Button("Dispatch Long-Form Pipeline", variant="primary", size="lg")
 
                     with gr.Column(scale=2):
                         lf_status_box = gr.Markdown("Ready to process script.")
-                        lf_audio_raw = gr.Audio(label="1️⃣ Raw Stitched Voiceover (256k MP3)", type="filepath")
-                        lf_audio_mastered = gr.Audio(label="2️⃣ Enhanced & Mastered Voiceover (256k MP3)", type="filepath")
-                        lf_srt_box = gr.Textbox(label="3️⃣ 1-Word per Line SRT Subtitles Preview", lines=7)
+                        lf_audio_raw = gr.Audio(label="Raw Stitched Voiceover (256k MP3)", type="filepath")
+                        lf_audio_mastered = gr.Audio(label="Mastered Voiceover (256k MP3)", type="filepath")
+                        lf_srt_box = gr.Textbox(label="1-Word SRT Subtitles Preview", lines=7)
 
                         with gr.Row():
-                            lf_down_mastered = gr.DownloadButton("📥 Download Mastered MP3 (256k)", visible=False, variant="primary")
-                            lf_down_raw = gr.DownloadButton("📥 Download Raw MP3", visible=False)
-                            lf_down_srt = gr.DownloadButton("📥 Download 1-Word SRT", visible=False)
+                            lf_down_mastered = gr.DownloadButton("Download Mastered MP3", visible=False, variant="primary")
+                            lf_down_raw = gr.DownloadButton("Download Raw MP3", visible=False)
+                            lf_down_srt = gr.DownloadButton("Download 1-Word SRT", visible=False)
 
-                        gr.Markdown("### 📂 Saved Deliverables History")
-                        lf_history_refresh = gr.Button("🔄 Refresh Saved Files")
+                        lf_history_refresh = gr.Button("Refresh Saved Files")
                         lf_history_files = gr.File(
-                            label="Download Output Files (.mp3 / .srt)",
+                            label="Saved Output Files (.mp3 / .srt / .wav)",
                             file_count="multiple",
-                            value=list_deliverable_files()
+                            value=list_deliverable_files(),
                         )
                         lf_history_refresh.click(
                             fn=list_deliverable_files,
                             inputs=[],
-                            outputs=[lf_history_files]
+                            outputs=[lf_history_files],
                         )
 
                 lf_submit_btn.click(
                     fn=run_longform_pipeline_ui,
                     inputs=[
                         lf_script, lf_voice_dropdown, lf_instruction,
-                        lf_cfg, lf_temp, lf_seed, lf_pause,
-                        lf_target_words, lf_max_words,
-                        lf_chk_enhance, lf_chk_master, lf_chk_srt
+                        lf_cfg, lf_temp, lf_top_p, lf_top_k, lf_rep, lf_dtemp, lf_dcfg,
+                        lf_seed, lf_pause, lf_auto_chunks, lf_target_words, lf_max_words,
+                        lf_chk_enhance, lf_chk_master, lf_chk_srt,
                     ],
                     outputs=[
                         lf_status_box, lf_audio_raw, lf_audio_mastered, lf_srt_box,
-                        lf_down_mastered, lf_down_raw, lf_down_srt,
-                        lf_history_files
-                    ]
+                        lf_down_mastered, lf_down_raw, lf_down_srt, lf_history_files,
+                    ],
                 )
 
             # ---------------- TAB 1: TEXT-TO-SPEECH & VOICE DESIGN ----------------
-            with gr.TabItem("✨ Text-to-Speech & Voice Design"):
+            with gr.TabItem("Text-to-Speech & Voice Design"):
                 with gr.Row():
                     with gr.Column(scale=3):
                         tts_text = gr.Textbox(
                             label="Text to Synthesize",
-                            placeholder="Type or paste the script you want synthesized...",
                             lines=4,
-                            value="Welcome to Breeze-TTS Studio. Today we are demonstrating stateful streaming speech synthesis on dual GPUs."
+                            value="Welcome to Breeze-TTS Studio. Synthesizing high-fidelity speech with locked timbre across dual GPUs.",
                         )
                         tts_instruction = gr.Textbox(
-                            label="Speaker Persona / Emotional Style Instruction",
-                            placeholder="Describe tone, accent, pacing, or emotional style...",
-                            value="Speak with a warm, authoritative, engaging documentary narration style."
+                            label="Speaker Persona / Style Instruction",
+                            value=DEFAULT_OPTION_A_INSTRUCTION,
                         )
-
                         with gr.Row():
                             tts_voice_dropdown = gr.Dropdown(
                                 choices=initial_voices,
                                 value=initial_voices[0],
-                                label="Voice Persona (From Voices Registry)",
-                                scale=4
+                                label="Voice Persona (Optional Registry Selection)",
+                                scale=4,
                             )
-                            tts_refresh_btn = gr.Button("🔄", scale=1)
+                            tts_refresh_btn = gr.Button("Refresh", scale=1)
 
                         tts_refresh_btn.click(
                             fn=lambda: gr.update(choices=list_saved_voices()),
                             inputs=[],
-                            outputs=[tts_voice_dropdown]
+                            outputs=[tts_voice_dropdown],
                         )
 
-                        with gr.Row():
-                            tts_delivery = gr.Radio(
-                                choices=[
-                                    "Real-Time Streaming (32-Frame Chunks)",
-                                    "Studio Master (Full Single-Pass, Zero Clicks)"
-                                ],
-                                value="Real-Time Streaming (32-Frame Chunks)",
-                                label="Vocoder Synthesis Mode"
-                            )
-
-                        with gr.Accordion("Advanced Generation Parameters", open=False):
-                            with gr.Row():
-                                tts_cfg = gr.Slider(1.0, 5.0, value=1.0, step=0.1, label="CFG Guidance Scale (1.0 = Pure TTS, 2.5 = (laugh)/(sigh), 4.0 = Voice Design)")
-                                tts_temp = gr.Slider(0.1, 1.2, value=0.25, step=0.05, label="Temperature")
-                                tts_seed = gr.Number(value=42, label="Random Seed")
-                                tts_max = gr.Slider(100, 2040, value=1200, step=10, label="Max Output Frames (Up to 2,040 Hardware Limit)")
-
-                        tts_btn = gr.Button("▶ Generate Audio", variant="primary", size="lg")
+                        tts_cfg, tts_temp, tts_top_p, tts_top_k, tts_rep, tts_dtemp, tts_dcfg, tts_seed = _build_sampling_controls(False)
+                        tts_btn = gr.Button("Generate Audio", variant="primary", size="lg")
 
                     with gr.Column(scale=2):
-                        tts_stream_audio = gr.Audio(
-                            label="🔊 Live Audio Stream (Real-Time Playback)",
-                            streaming=True,
-                            autoplay=True
-                        )
-                        tts_master_audio = gr.Audio(
-                            label="🎵 Complete Master Audio Recording (Seekable Waveform & Replay)",
-                            type="filepath"
-                        )
-                        tts_download_file = gr.File(
-                            label="Download Master WAV (Single-File)",
-                            file_types=[".wav"],
-                            visible=False
-                        )
+                        tts_master_audio = gr.Audio(label="Synthesized Audio (Mastered WAV)", type="filepath")
+                        tts_download_file = gr.File(label="Download Master WAV", file_types=[".wav"], visible=False)
                         tts_stats = gr.Markdown("Ready to synthesize.")
 
                 tts_btn.click(
                     fn=tts_generate,
                     inputs=[
-                        tts_text, tts_instruction, tts_voice_dropdown, tts_delivery,
-                        tts_cfg, tts_temp, tts_seed, tts_max
+                        tts_text, tts_instruction, tts_voice_dropdown,
+                        tts_cfg, tts_temp, tts_top_p, tts_top_k, tts_rep, tts_dtemp, tts_dcfg, tts_seed,
                     ],
-                    outputs=[tts_stream_audio, tts_master_audio, tts_download_file, tts_stats]
+                    outputs=[tts_master_audio, tts_download_file, tts_stats],
                 )
 
             # ---------------- TAB 2: ZERO-SHOT VOICE CLONING ----------------
-            with gr.TabItem("🎭 Zero-Shot Voice Cloning"):
+            with gr.TabItem("Zero-Shot Voice Cloning"):
                 with gr.Row():
                     with gr.Column(scale=3):
                         clone_text = gr.Textbox(
                             label="Text to Speak in Cloned Voice",
-                            placeholder="Enter the text you want the cloned speaker to say...",
-                            lines=3,
-                            value="This is a demonstration of zero-shot voice cloning using pre-registered voice containers."
+                            lines=4,
+                            value="This is a demonstration of zero-shot voice cloning using a pre-registered .breeze voice container.",
                         )
-
                         with gr.Row():
                             clone_voice_dropdown = gr.Dropdown(
                                 choices=initial_voices,
                                 value=initial_voices[0] if initial_voices else None,
-                                label="Voice Persona (From Voices Registry)",
-                                scale=4
+                                label="Registered Voice Persona",
+                                scale=4,
                             )
-                            clone_refresh_btn = gr.Button("🔄", scale=1)
+                            clone_refresh_btn = gr.Button("Refresh", scale=1)
 
                         clone_refresh_btn.click(
                             fn=lambda: gr.update(choices=list_saved_voices()),
                             inputs=[],
-                            outputs=[clone_voice_dropdown]
+                            outputs=[clone_voice_dropdown],
                         )
 
                         clone_instruction = gr.Textbox(
-                            label="Emotional Delivery Adjustment (Optional)",
-                            placeholder="e.g., Speak with excitement and energy",
-                            value="Speak clearly and naturally."
+                            label="Delivery Direction (Neutral Recommended for Cloning)",
+                            value=DEFAULT_OPTION_A_INSTRUCTION,
                         )
-
-                        with gr.Row():
-                            clone_delivery = gr.Radio(
-                                choices=[
-                                    "Real-Time Streaming (32-Frame Chunks)",
-                                    "Studio Master (Full Single-Pass, Zero Clicks)"
-                                ],
-                                value="Real-Time Streaming (32-Frame Chunks)",
-                                label="Vocoder Synthesis Mode"
-                            )
-
-                        with gr.Accordion("Advanced Voice Cloning Parameters", open=False):
-                            with gr.Row():
-                                clone_cfg = gr.Slider(1.0, 5.0, value=1.0, step=0.1, label="CFG Guidance Scale (1.0 = Exact Clone, 4.0 = Emotional Steering/Voice Edit)")
-                                clone_temp = gr.Slider(0.1, 1.2, value=0.25, step=0.05, label="Temperature")
-                                clone_seed = gr.Number(value=42, label="Random Seed")
-                                clone_max = gr.Slider(100, 2040, value=1200, step=10, label="Max Output Frames (Up to 2,040 Hardware Limit)")
-
-                        clone_btn = gr.Button("▶ Clone Voice & Synthesize", variant="primary", size="lg")
+                        cl_cfg, cl_temp, cl_top_p, cl_top_k, cl_rep, cl_dtemp, cl_dcfg, cl_seed = _build_sampling_controls(False)
+                        clone_btn = gr.Button("Clone Voice & Synthesize", variant="primary", size="lg")
 
                     with gr.Column(scale=2):
-                        clone_stream_audio = gr.Audio(
-                            label="🔊 Live Cloned Speech Stream (Real-Time Playback)",
-                            streaming=True,
-                            autoplay=True
-                        )
-                        clone_master_audio = gr.Audio(
-                            label="🎵 Complete Master Audio Recording (Seekable Waveform & Replay)",
-                            type="filepath"
-                        )
-                        clone_download_file = gr.File(
-                            label="Download Master Cloned WAV (Single-File)",
-                            file_types=[".wav"],
-                            visible=False
-                        )
+                        clone_master_audio = gr.Audio(label="Cloned Audio Output (Mastered WAV)", type="filepath")
+                        clone_download_file = gr.File(label="Download Cloned WAV", file_types=[".wav"], visible=False)
                         clone_stats = gr.Markdown("Select a registered voice to begin.")
 
                 clone_btn.click(
                     fn=voice_clone_generate,
                     inputs=[
-                        clone_text, clone_voice_dropdown, clone_instruction, clone_delivery,
-                        clone_cfg, clone_temp, clone_seed, clone_max
+                        clone_text, clone_voice_dropdown, clone_instruction,
+                        cl_cfg, cl_temp, cl_top_p, cl_top_k, cl_rep, cl_dtemp, cl_dcfg, cl_seed,
                     ],
-                    outputs=[clone_stream_audio, clone_master_audio, clone_download_file, clone_stats]
+                    outputs=[clone_master_audio, clone_download_file, clone_stats],
                 )
 
             # ---------------- TAB 3: VOICE REGISTRATION & MANAGEMENT ----------------
-            with gr.TabItem("🎙️ Voice Registration & Management (.breeze)"):
+            with gr.TabItem("Voice Registration (.breeze)"):
                 with gr.Row():
                     with gr.Column(scale=3):
                         gr.Markdown(
                             """
-                            ### Human-in-the-Loop Voice Registration
-                            1. **Record or Upload** reference audio (4–10 seconds).
-                            2. **Click Auto-Transcribe** to run GPU 1 ASR (`faster-whisper-small`).
-                            3. **Review & Correct** transcript in the text box below.
-                            4. **Register**: The engine compiles 16-codebook tokens and returns in-memory `.breeze` bytes, saving to the registry.
+                            ### Voice Persona Registration
+                            1. Upload reference speech (clean audio <= 10.0s is optimal; longer clips auto-trim to 10.0s).
+                            2. **Auto SNR Gate** skips Resemble resynthesis automatically when input SNR >= 30 dB, preserving original timbre, and runs GPU 1 denoising when noisy.
+                            3. Whisper **Turbo** on CUDA:0 auto-transcribes the clip unless an optional transcript override is supplied.
                             """
                         )
                         reg_name = gr.Textbox(
                             label="Voice Persona Name",
-                            placeholder="e.g. David Attenborough, Scarlett, Morgan...",
-                            value="My Speaker"
+                            placeholder="e.g. cilian, narrator_1...",
+                            value="My Speaker",
                         )
                         reg_audio = gr.Audio(
                             label="Speaker Audio Sample (WAV / MP3 / M4A - Auto-Trimmed to <= 10s)",
-                            type="filepath"
+                            type="filepath",
                         )
-                        reg_chk_enhance = gr.Checkbox(
-                            label="✨ Enhance & Denoise Voice Persona (Resemble Enhancer on GPU 1)",
-                            value=True
+                        reg_enhance_mode = gr.Radio(
+                            choices=REG_ENHANCE_CHOICES,
+                            value=REG_ENHANCE_CHOICES[0],
+                            label="Reference Audio Conditioning Mode",
                         )
-                        gr.Markdown("ℹ️ *Ingested audio is automatically hard-trimmed to the first 10.0 seconds and transcribed automatically via Faster-Whisper Turbo v3 on GPU 0. Zero manual transcription required.*")
-
-                        reg_btn = gr.Button("💾 Register Voice (.breeze)", variant="primary", size="lg")
+                        reg_transcript = gr.Textbox(
+                            label="Transcript Override (Optional - leave blank for automatic Whisper Turbo ASR)",
+                            placeholder="Leave empty to auto-transcribe with faster-whisper turbo...",
+                            lines=2,
+                        )
+                        reg_btn = gr.Button("Register Voice (.breeze)", variant="primary", size="lg")
 
                     with gr.Column(scale=2):
-                        reg_file = gr.File(label="Exported .breeze Voice File (Download & Share)")
+                        reg_file = gr.File(label="Exported .breeze Voice File")
                         reg_stats = gr.Markdown("Ready to register new voice persona.")
 
-                reg_btn.click(
-                    fn=register_voice_file,
-                    inputs=[reg_name, reg_audio, reg_chk_enhance],
-                    outputs=[reg_file, reg_stats, tts_voice_dropdown, clone_voice_dropdown, lf_voice_dropdown]
-                )
-
             # ---------------- TAB 4: SPEECH-TO-SPEECH CONVERSION ----------------
-            with gr.TabItem("🔄 Speech-to-Speech Voice Conversion (Mode 4)"):
+            with gr.TabItem("Speech-to-Speech Conversion (Mode 4)"):
                 with gr.Row():
                     with gr.Column(scale=3):
-                        gr.Markdown("Transform one speaker's voice into another while preserving timing, cadence, and pronunciation.")
+                        gr.Markdown("Transform source speech into another voice while preserving timing and cadence.")
                         with gr.Row():
                             conv_src_audio = gr.Audio(label="Source Audio (Speech to convert)", type="filepath")
                             conv_ref_audio = gr.Audio(label="Target Voice Audio (Optional if selecting below)", type="filepath")
@@ -1014,30 +942,27 @@ def build_app() -> gr.Blocks:
                                 choices=initial_voices,
                                 value=initial_voices[0],
                                 label="Target Voice Persona (From Registry)",
-                                scale=4
+                                scale=4,
                             )
-                            conv_refresh_btn = gr.Button("🔄", scale=1)
+                            conv_refresh_btn = gr.Button("Refresh", scale=1)
 
                         conv_refresh_btn.click(
                             fn=lambda: gr.update(choices=list_saved_voices()),
                             inputs=[],
-                            outputs=[conv_voice_dropdown]
+                            outputs=[conv_voice_dropdown],
                         )
 
                         conv_ref_text = gr.Textbox(
                             label="Target Voice Transcript (Optional)",
-                            placeholder="Transcript of the target reference voice...",
-                            lines=1
+                            placeholder="Transcript of target reference voice...",
+                            lines=1,
                         )
                         with gr.Row():
-                            conv_keep = gr.Slider(
-                                0, 15, value=0, step=1,
-                                label="Keep Acoustic Codebooks (0=Full Transfer, 1..3=Keep Pitch/Melody)"
-                            )
-                            conv_cfg = gr.Slider(1.0, 5.0, value=1.5, step=0.1, label="CFG Scale (1.5 = Standard, 2.0 = Enhanced Conversion, 4.0 = Strong Steering)")
-                            conv_seed = gr.Number(value=42, label="Random Seed")
+                            conv_keep = gr.Slider(0, 15, value=0, step=1, label="Keep Acoustic Codebooks (0 = Full Transfer)")
+                            conv_cfg = gr.Slider(1.0, 5.0, value=1.5, step=0.1, label="CFG Scale")
+                            conv_seed = gr.Number(value=42, label="Random Seed", precision=0)
 
-                        conv_btn = gr.Button("▶ Convert Speech", variant="primary", size="lg")
+                        conv_btn = gr.Button("Convert Speech", variant="primary", size="lg")
 
                     with gr.Column(scale=2):
                         conv_output_audio = gr.Audio(label="Converted Audio Output", type="filepath")
@@ -1047,47 +972,56 @@ def build_app() -> gr.Blocks:
                     fn=voice_convert_generate,
                     inputs=[
                         conv_src_audio, conv_voice_dropdown, conv_ref_audio, conv_ref_text,
-                        conv_keep, conv_cfg, conv_seed
+                        conv_keep, conv_cfg, conv_seed,
                     ],
-                    outputs=[conv_output_audio, conv_stats]
+                    outputs=[conv_output_audio, conv_stats],
+                )
+
+                reg_btn.click(
+                    fn=register_voice_file,
+                    inputs=[reg_name, reg_audio, reg_enhance_mode, reg_transcript],
+                    outputs=[reg_file, reg_stats, tts_voice_dropdown, clone_voice_dropdown, lf_voice_dropdown, conv_voice_dropdown],
                 )
 
             # ---------------- TAB 5: ASR & SUBTITLES TOOL ----------------
-            with gr.TabItem("📝 ASR Transcription & Subtitles (.srt)"):
+            with gr.TabItem("ASR Transcription & Subtitles (.srt)"):
                 with gr.Row():
                     with gr.Column(scale=3):
                         gr.Markdown(
-                            """
-                            ### Whisper ASR & Subtitle Generator (GPU 1)
-                            Transcribes audio of **any duration** (from 5 seconds to 2 hours) with **constant ~288 MiB VRAM footprint**.
-                            Uses Silero VAD to strip silence and yields timestamped SRT subtitles.
+                            f"""
+                            ### Whisper ASR & Subtitle Generator ({APP_CONFIG['asr_model']} on CUDA:{APP_CONFIG['asr_device']})
+                            Transcribes speech of any duration using Silero VAD filtering and exports word-level SRT timestamps.
                             """
                         )
                         sub_audio = gr.Audio(label="Upload Audio File (Speech)", type="filepath")
-                        sub_btn = gr.Button("🎙️ Generate Subtitles & Transcript", variant="primary")
+                        sub_btn = gr.Button("Generate Subtitles & Transcript", variant="primary")
 
                     with gr.Column(scale=3):
                         sub_text = gr.Textbox(label="Plain Transcript", lines=5)
-                        sub_srt = gr.Textbox(label="SRT Subtitles (With Exact Timestamps)", lines=8)
+                        sub_srt = gr.Textbox(label="SRT Subtitles", lines=8)
 
                 sub_btn.click(
                     fn=transcribe_subtitles_tool,
                     inputs=[sub_audio],
-                    outputs=[sub_text, sub_srt]
+                    outputs=[sub_text, sub_srt],
                 )
 
             # ---------------- TAB 6: TELEMETRY & ENGINE PROFILE ----------------
-            with gr.TabItem("📊 Engine Configuration & Telemetry"):
+            with gr.TabItem("Engine Configuration"):
+                resolved_prec = DualInstanceCluster.resolve_precision(
+                    APP_CONFIG["model_path"], APP_CONFIG.get("precision")
+                )
                 gr.Markdown(
                     f"""
-                    ### Active Engine Profile (Zero Hardcoding)
-                    * **Model GGUF**: `{APP_CONFIG['model_path']}`
-                    * **Shared C++ Library**: `{APP_CONFIG['lib_path'] or 'Auto-detected'}`
-                    * **Modular Q4 Surge**: `{'Enabled (Threshold: ' + str(APP_CONFIG['q4_threshold']) + ')' if APP_CONFIG['enable_q4_burst'] else 'Disabled (100% Precision)'}`
-                    * **Vocoder Execution**: `{APP_CONFIG['vocoder_mode'].upper()} (32-Frame Stateful Causal Session)`
-                    * **Voices Directory**: `{os.path.abspath(APP_CONFIG['voices_dir'])}`
-                    * **ASR Microservice**: `{APP_CONFIG['asr_model']} pinned to CUDA:{APP_CONFIG['asr_device']}`
-                    * **Engine Concurrency**: Autonomous Dual-Island Architecture (GPU 0: Island A, GPU 1: Island B)
+                    ### Active Engine Profile
+                    - **Model GGUF**: `{APP_CONFIG['model_path']}` (**{resolved_prec.upper()}**)
+                    - **Shared C++ Library**: `{APP_CONFIG['lib_path'] or 'Auto-detected'}`
+                    - **Vocoder Execution**: `{APP_CONFIG['vocoder_mode'].upper()} (Step 480 / Tile 560 Isolated Per-Chunk Vocoder + RMS Leveling)`
+                    - **Modular Q4 Surge**: `{'Enabled (Threshold: ' + str(APP_CONFIG['q4_threshold']) + ')' if APP_CONFIG['enable_q4_burst'] else 'Disabled (Full Precision)'}`
+                    - **Default Option A Sampling**: `cfg=1.6, temp=0.55, top_p=0.85, top_k=30, rep_pen=1.08, depth_temp=0.0, dcfg=3`
+                    - **Voices Directory**: `{os.path.abspath(APP_CONFIG['voices_dir'])}`
+                    - **ASR Microservice**: `{'Enabled (' + APP_CONFIG['asr_model'] + ' on CUDA:' + str(APP_CONFIG['asr_device']) + ')' if APP_CONFIG['enable_asr'] else 'Disabled'}`
+                    - **Enhancer Microservice**: `{'Enabled (on-demand CPU->CUDA:' + str(APP_CONFIG['enhancer_device']) + ', Auto-SNR gate @ 30 dB)' if APP_CONFIG['enable_enhancer'] else 'Disabled'}`
                     """
                 )
 
@@ -1098,14 +1032,14 @@ def main():
     parser = argparse.ArgumentParser(description="Breeze-TTS Studio Decoupled Web Application")
     parser.add_argument("--model", type=str, default="breeze-tts-2-q8_0.gguf", help="Path to base GGUF model")
     parser.add_argument("--lib", type=str, default=None, help="Path to libbreeze.so")
-    parser.add_argument("--precision", type=str, choices=["int8", "fp16"], default="int8", help="Engine precision mode")
+    parser.add_argument("--precision", type=str, choices=["auto", "int8", "fp16"], default="auto", help="Engine precision mode (default: auto-detect from model path)")
     parser.add_argument("--q4-model", type=str, default=None, help="Path to modular Q4 depth decoder GGUF")
     parser.add_argument("--enable-q4", action="store_true", help="Enable modular Q4 surge tiering")
     parser.add_argument("--q4-threshold", type=int, default=10, help="Active session threshold for Q4 burst")
     parser.add_argument("--vocoder-mode", type=str, choices=["on", "dynamic", "off"], default="on", help="Vocoder mode")
     parser.add_argument("--disable-enhancer", action="store_true", help="Disable Resemble Enhancer microservice")
     parser.add_argument("--disable-asr", action="store_true", help="Disable Whisper ASR microservice")
-    parser.add_argument("--enhancer-chunk-sec", type=float, default=10.0, help="Sliding window chunk duration for Resemble Enhancer (10.0s saves 1.2 GB VRAM)")
+    parser.add_argument("--enhancer-chunk-sec", type=float, default=10.0, help="Sliding window chunk duration for Resemble Enhancer")
     parser.add_argument("--enhancer-device", type=int, default=1, help="CUDA device index for Resemble Enhancer")
     parser.add_argument("--voices-dir", type=str, default="data/voices", help="Local directory for .breeze voice containers")
     parser.add_argument("--asr-device", type=int, default=0, help="CUDA device index for Whisper ASR")
@@ -1115,10 +1049,11 @@ def main():
     parser.add_argument("--share", action="store_true", help="Create public Gradio share link")
     args = parser.parse_args()
 
-    # Populate Global Configuration
+    resolved_prec = DualInstanceCluster.resolve_precision(args.model, args.precision)
+
     APP_CONFIG["model_path"] = args.model
     APP_CONFIG["lib_path"] = args.lib
-    APP_CONFIG["precision"] = args.precision
+    APP_CONFIG["precision"] = resolved_prec
     APP_CONFIG["q4_model_path"] = args.q4_model
     APP_CONFIG["enable_q4_burst"] = args.enable_q4
     APP_CONFIG["q4_threshold"] = args.q4_threshold
@@ -1134,41 +1069,46 @@ def main():
     os.makedirs(APP_CONFIG["voices_dir"], exist_ok=True)
     os.makedirs(APP_CONFIG["outputs_dir"], exist_ok=True)
 
-    print("⏳ Pre-warming cluster engine, orchestrator & micro-services...")
+    print("Pre-warming cluster engine, orchestrator & micro-services...")
     try:
-        orch = get_orchestrator()
-        print(f"   ✅ EngineOrchestrator online & ready (Precision: {APP_CONFIG['precision'].upper()} | Enhancer: {APP_CONFIG['enable_enhancer']} | ASR: {APP_CONFIG['enable_asr']}).")
+        get_orchestrator()
+        print(f"   EngineOrchestrator online (Precision: {APP_CONFIG['precision'].upper()} | Enhancer: {APP_CONFIG['enable_enhancer']} | ASR: {APP_CONFIG['enable_asr']}).")
     except Exception as e:
-        print(f"   ⚠️ Engine initialization deferred/failed: {e}")
+        print(f"   Engine initialization deferred/failed: {e}")
 
     demo = build_app()
-    print(f"\n🚀 Launching Breeze-TTS Studio on http://{args.host}:{args.port}")
-    print(f"   • Model: {APP_CONFIG['model_path']} ({APP_CONFIG['precision'].upper()})")
-    print(f"   • Voices Registry: {os.path.abspath(APP_CONFIG['voices_dir'])}")
-    print(f"   • ASR: {APP_CONFIG['asr_model']} on CUDA:{APP_CONFIG['asr_device']}")
-    print(f"   • Enhancer: CUDA:{APP_CONFIG['enhancer_device']} (Chunks: {APP_CONFIG['enhancer_chunk_sec']}s)")
+    print(f"\nLaunching Breeze-TTS Studio on http://{args.host}:{args.port}")
+    print(f"   Model: {APP_CONFIG['model_path']} ({APP_CONFIG['precision'].upper()})")
+    print(f"   Voices Registry: {os.path.abspath(APP_CONFIG['voices_dir'])}")
+    print(f"   ASR: {APP_CONFIG['asr_model']} on CUDA:{APP_CONFIG['asr_device']} (Enabled: {APP_CONFIG['enable_asr']})")
+    print(f"   Enhancer: CUDA:{APP_CONFIG['enhancer_device']} (Enabled: {APP_CONFIG['enable_enhancer']})")
 
     allowed_dirs = [
         os.path.abspath(APP_CONFIG["voices_dir"]),
         os.path.abspath(APP_CONFIG["outputs_dir"]),
         tempfile.gettempdir(),
-        os.getcwd()
+        os.getcwd(),
     ]
     if os.path.exists("/kaggle/working"):
-        allowed_dirs.append(os.path.abspath("/kaggle/working"))
-    if os.path.exists("/kaggle/working/data"):
-        allowed_dirs.append(os.path.abspath("/kaggle/working/data"))
-    if os.path.exists("/kaggle/working/data/outputs"):
-        allowed_dirs.append(os.path.abspath("/kaggle/working/data/outputs"))
-    allowed_dirs = list(set([d for d in allowed_dirs if os.path.exists(d)]))
+        allowed_dirs.extend([
+            os.path.abspath("/kaggle/working"),
+            os.path.abspath("/kaggle/working/data"),
+            os.path.abspath("/kaggle/working/data/outputs"),
+        ])
+    allowed_dirs = list({d for d in allowed_dirs if os.path.exists(d)})
+
+    launch_kwargs: Dict[str, Any] = {
+        "server_name": args.host,
+        "server_port": args.port,
+        "share": args.share,
+        "allowed_paths": allowed_dirs,
+    }
+    if _is_gradio_6_plus():
+        launch_kwargs["css"] = ".gradio-container { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }"
+        launch_kwargs["theme"] = gr.themes.Soft()
 
     demo.queue(default_concurrency_limit=10)
-    demo.launch(
-        server_name=args.host,
-        server_port=args.port,
-        share=args.share,
-        allowed_paths=allowed_dirs
-    )
+    demo.launch(**launch_kwargs)
 
 
 if __name__ == "__main__":

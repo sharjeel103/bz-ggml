@@ -121,6 +121,8 @@ def test_vocoder_priority_routing():
             self.voc_b = MockVocoder()
             self._voc_lock_a = threading.Lock()
             self._voc_lock_b = threading.Lock()
+            self._voc_rr_index = 0
+            self._voc_rr_lock = threading.Lock()
 
         decode_tokens_tiled = None
 

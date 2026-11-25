@@ -1,33 +1,80 @@
-import asyncio, json, uuid, ssl, sys, urllib.request, websockets
+import asyncio, json, os, uuid, ssl, sys, urllib.request, websockets
 
-PROXY_URL = 'https://kkb-production.jupyter-proxy.kaggle.net/k/373264596/eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2IiwidHlwIjoiSldUIn0..QHEFci2NTigKJL_ugaju1w.3FpTtsG2wHAHUukofkwu_R8m6cfm1Z6YNUJQ1nMO3MoQBlv4hVIOV5avcHI3xjvPrhbUsnMjz5uNOMdV82cn6iQXiZS2steY_b64e3tq97gd15VmbqrGIqtHR_rPi-XBHH2QPPnnMFWIbOD6ApkluYxCsDVMvuO6ACV_T12lHMcKBArw4nNgJqX3I00_pqv58Z2-Nu3PPa0VsYZZeQ9WChYHNJp7W0S0dKwOhOl9090LpAVUiwds15pOhhDBSffx.9eu1dG2E1kVzgfSWX-Uxrw/proxy'
+PROXY_URL = os.environ.get("KAGGLE_PROXY_URL", "").strip()
 CTX = ssl.create_default_context()
 
-def get_or_create_idle_kernel():
-    req = urllib.request.Request(PROXY_URL.rstrip('/') + '/api/kernels')
+
+def _require_proxy_url() -> str:
+    if not PROXY_URL:
+        raise RuntimeError(
+            "KAGGLE_PROXY_URL is not set. Export KAGGLE_PROXY_URL='https://.../proxy' before running remote Kaggle scripts."
+        )
+    return PROXY_URL.rstrip("/")
+
+
+def list_kernels():
+    req = urllib.request.Request(_require_proxy_url() + "/api/kernels")
     with urllib.request.urlopen(req, context=CTX, timeout=10) as r:
-        kernels = json.loads(r.read().decode('utf-8'))
+        return json.loads(r.read().decode("utf-8"))
+
+
+def get_or_create_idle_kernel():
+    base = _require_proxy_url()
+    kernels = list_kernels()
     for k in kernels:
-        if k['execution_state'] == 'idle':
-            return k['id']
-    # Create new
+        if k.get("execution_state") == "idle":
+            return k["id"]
     req = urllib.request.Request(
-        PROXY_URL.rstrip('/') + '/api/kernels',
-        data=json.dumps({'name': 'python3'}).encode('utf-8'),
-        headers={'Content-Type': 'application/json'},
-        method='POST'
+        base + "/api/kernels",
+        data=json.dumps({"name": "python3"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
     with urllib.request.urlopen(req, context=CTX, timeout=10) as r:
-        k = json.loads(r.read().decode('utf-8'))
-        return k['id']
+        k = json.loads(r.read().decode("utf-8"))
+        return k["id"]
 
-async def execute_code(code_str, kernel_id=None, timeout_sec=900):
+
+def purge_extra_kernels(keep_kernel_id=None):
+    """Delete all other Kaggle Jupyter kernels so none hold stale GPU VRAM."""
+    base = _require_proxy_url()
+    killed = []
+    for k in list_kernels():
+        kid = k.get("id")
+        if not kid or kid == keep_kernel_id:
+            continue
+        req = urllib.request.Request(base + f"/api/kernels/{kid}", method="DELETE")
+        try:
+            with urllib.request.urlopen(req, context=CTX, timeout=10) as r:
+                if r.status in (200, 204):
+                    killed.append(kid)
+        except Exception as e:
+            print(f"[purge_extra_kernels] Warning deleting kernel {kid}: {e}", flush=True)
+    return killed
+
+
+def restart_kernel(kernel_id=None):
+    base = _require_proxy_url()
     if not kernel_id:
         kernel_id = get_or_create_idle_kernel()
+    req = urllib.request.Request(
+        base + f"/api/kernels/{kernel_id}/restart",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, context=CTX, timeout=15) as r:
+        return r.status == 200
+
+
+async def execute_code(code_str, kernel_id=None, timeout_sec=900):
+    base = _require_proxy_url()
+    if not kernel_id:
+        kernel_id = get_or_create_idle_kernel()
+
+    ws_url = base.replace("https://", "wss://").replace("http://", "ws://") + f"/api/kernels/{kernel_id}/channels"
     
-    ws_url = PROXY_URL.replace('https://', 'wss://').replace('http://', 'ws://').rstrip('/') + f'/api/kernels/{kernel_id}/channels'
-    
-    async with websockets.connect(ws_url, ssl=CTX, max_size=20*1024*1024, ping_interval=None, ping_timeout=None) as ws:
+    async with websockets.connect(ws_url, ssl=CTX, max_size=50*1024*1024, ping_interval=30, ping_timeout=180) as ws:
         msg_id = str(uuid.uuid4())
         await ws.send(json.dumps({
             'header': {'msg_id': msg_id, 'username': 'admin', 'session': str(uuid.uuid4()), 'msg_type': 'execute_request', 'version': '5.3'},
@@ -39,7 +86,9 @@ async def execute_code(code_str, kernel_id=None, timeout_sec=900):
         stdout_buf = []
         stderr_buf = []
         status = 'ok'
-        while True:
+        got_reply = False
+        got_idle = False
+        while not (got_reply and got_idle):
             raw = await asyncio.wait_for(ws.recv(), timeout=timeout_sec)
             msg = json.loads(raw)
             if msg.get('parent_header', {}).get('msg_id') == msg_id:
@@ -60,10 +109,13 @@ async def execute_code(code_str, kernel_id=None, timeout_sec=900):
                     sys.stderr.flush()
                     status = 'error'
                     stderr_buf.append(err_txt)
-                    break
+                    got_reply = True
+                    got_idle = True
                 elif mtype == 'execute_reply':
                     status = msg['content']['status']
-                    break
+                    got_reply = True
+                elif mtype == 'status' and msg['content'].get('execution_state') == 'idle':
+                    got_idle = True
         return ''.join(stdout_buf), ''.join(stderr_buf), status
 
 if __name__ == '__main__':

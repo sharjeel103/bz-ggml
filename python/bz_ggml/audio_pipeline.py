@@ -326,19 +326,145 @@ def format_chunk_preview_markdown(
 
 
 # =====================================================================
-# 2. CHUNK STITCHING & BREATH GAP
+# 2. CHUNK STITCHING, LEVELING & SIGNAL QUALITY DIAGNOSTICS
 # =====================================================================
 
+def estimate_audio_snr_db(pcm: np.ndarray, sr: int = 24000) -> float:
+    """
+    Estimates active-speech SNR in dB using 20ms frame percentiles (P90 vs P5)
+    with a quiet-frame spectral-flatness guard for continuous non-paused speech.
+    """
+    if pcm is None or len(pcm) == 0:
+        return 0.0
+    arr = np.asarray(pcm, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = arr.mean(axis=-1)
+
+    win = max(16, int(0.02 * sr))
+    n_frames = len(arr) // win
+    if n_frames < 4:
+        return 0.0
+
+    frames = arr[: n_frames * win].reshape(n_frames, win)
+    frame_rms = np.sqrt(np.mean(frames * frames, axis=1))
+    frame_db = 20.0 * np.log10(frame_rms + 1e-9)
+
+    p90 = float(np.percentile(frame_db, 90))
+    p5 = float(np.percentile(frame_db, 5))
+    if p90 <= -55.0:
+        return 0.0
+
+    # If the clip has clear quiet pauses, P90 - P5 directly captures speech-to-noise ratio.
+    if (p90 - p5) >= 20.0:
+        return round(max(0.0, p90 - p5), 2)
+
+    # Continuous speech with few pauses: check upper-band Wiener spectral flatness on quietest frames.
+    q_count = max(1, n_frames // 10)
+    quiet_idx = np.argsort(frame_db)[:q_count]
+    freqs = np.fft.rfftfreq(win, 1.0 / float(sr))
+    hi_mask = freqs >= min(2000.0, float(sr) * 0.25)
+    hann = np.hanning(win).astype(np.float32)
+    flatnesses = []
+    for idx in quiet_idx:
+        pwr = np.abs(np.fft.rfft(frames[idx] * hann)) ** 2
+        band = pwr[hi_mask] + 1e-12
+        if len(band) > 0:
+            geo = float(np.exp(np.mean(np.log(band))))
+            arith = float(np.mean(band))
+            flatnesses.append(geo / max(1e-12, arith))
+    med_flat = float(np.median(flatnesses)) if flatnesses else 1.0
+    if med_flat < 0.28 and float(np.percentile(frame_db, 5)) > -35.0:
+        # Quietest segments are still clean tonal speech (no audible broadband noise floor)
+        return 35.0
+    return round(max(0.0, p90 - p5), 2)
+
+
+def trim_chunk_edges(
+    pcm: np.ndarray,
+    sr: int = 24000,
+    thresh_db: float = -52.0,
+    pad_ms: float = 35.0,
+) -> np.ndarray:
+    """Safely trims dead digital silence on chunk edges while preserving 35ms natural attack/release."""
+    if pcm is None or len(pcm) == 0:
+        return np.zeros(0, dtype=np.float32)
+    arr = np.asarray(pcm, dtype=np.float32)
+    if len(arr) <= int(0.5 * sr):
+        return arr
+
+    thresh = 10.0 ** (thresh_db / 20.0)
+    active = np.flatnonzero(np.abs(arr) >= thresh)
+    if len(active) == 0:
+        return arr
+
+    pad = int(max(0.0, pad_ms) * sr / 1000.0)
+    start = max(0, int(active[0]) - pad)
+    end = min(len(arr), int(active[-1]) + pad + 1)
+    if end - start < int(0.25 * sr):
+        return arr
+    return arr[start:end]
+
+
 def apply_micro_fade(pcm: np.ndarray, fade_samples: int = 120) -> np.ndarray:
-    """Applies a 5ms linear fade-in and fade-out to prevent DC offset clicks."""
-    if len(pcm) < fade_samples * 2:
+    """Applies a smooth raised-cosine fade-in and fade-out to prevent edge clicks."""
+    if len(pcm) < fade_samples * 2 or fade_samples <= 0:
         return pcm
     pcm = pcm.copy()
-    fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
-    fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+    t = np.linspace(0.0, np.pi, fade_samples, dtype=np.float32)
+    fade_in = 0.5 * (1.0 - np.cos(t))
+    fade_out = 0.5 * (1.0 + np.cos(t))
     pcm[:fade_samples] *= fade_in
     pcm[-fade_samples:] *= fade_out
     return pcm
+
+
+def level_and_stitch_chunks(
+    chunks_pcm: List[np.ndarray],
+    sample_rate: int = 24000,
+    pause_ms: int = 200,
+    max_gain_db: float = 2.5,
+    fade_ms: float = 10.0,
+) -> np.ndarray:
+    """
+    Trims excess edge silence, gently equalizes chunk-to-chunk active loudness
+    (clamped to +-max_gain_db around median chunk RMS, zero hard clipping),
+    and joins chunks with raised-cosine fades and a natural breath pause.
+    """
+    valid = [trim_chunk_edges(np.asarray(c, dtype=np.float32), sr=sample_rate) for c in chunks_pcm if c is not None and len(c) > 0]
+    if not valid:
+        return np.array([], dtype=np.float32)
+
+    if len(valid) > 1 and max_gain_db > 0.0:
+        active_thresh = 10.0 ** (-45.0 / 20.0)
+        chunk_dbs: List[float] = []
+        for c in valid:
+            speech = c[np.abs(c) >= active_thresh]
+            ref = speech if len(speech) >= max(240, len(c) // 20) else c
+            rms = float(np.sqrt(np.mean(ref * ref)))
+            chunk_dbs.append(20.0 * math.log10(rms + 1e-9))
+
+        target_db = float(np.clip(np.median(chunk_dbs), -24.0, -14.0))
+        leveled: List[np.ndarray] = []
+        for c, c_db in zip(valid, chunk_dbs):
+            gain_db = float(np.clip(target_db - c_db, -max_gain_db, max_gain_db))
+            scaled = c * float(10.0 ** (gain_db / 20.0))
+            peak = float(np.max(np.abs(scaled)))
+            if peak > 0.96:
+                scaled = scaled * (0.95 / peak)
+            leveled.append(scaled.astype(np.float32))
+        valid = leveled
+
+    fade_len = int(sample_rate * (max(0.0, fade_ms) / 1000.0))
+    silence_len = int(sample_rate * (max(0, int(pause_ms)) / 1000.0))
+    silence = np.zeros(silence_len, dtype=np.float32) if silence_len > 0 else None
+
+    stitched_parts = []
+    for idx, chunk in enumerate(valid):
+        stitched_parts.append(apply_micro_fade(chunk.astype(np.float32), fade_samples=fade_len))
+        if idx < len(valid) - 1 and silence is not None:
+            stitched_parts.append(silence)
+
+    return np.concatenate(stitched_parts)
 
 
 def stitch_audio_chunks(
@@ -404,6 +530,44 @@ def get_resemble_enhancer_model(device: str = "cuda:1"):
     return get_resemble_cpu_model()
 
 
+def _prepare_resemble_chunking(
+    orig_samples: int,
+    sr: int,
+    chunk_seconds: float,
+    target_rate: int = 44100,
+) -> Tuple[float, float, int]:
+    """
+    Computes safe (chunk_seconds, overlap_seconds, pad_input_samples) for
+    resemble_enhance.inference() so trailing chunks never drop below 1.5s
+    (avoiding [1, 128, 1] BatchNorm spatial crashes and overlap misalignment).
+    """
+    safe_chunk_s = max(2.0, float(chunk_seconds))
+    dur_s = orig_samples / float(sr)
+    min_chunk_s = 1.5
+
+    if dur_s <= safe_chunk_s:
+        # Single-pass mode: resemblance steps by (chunk - overlap), so overlap=0
+        # guarantees <=10s inputs run as 1 whole chunk without a tiny tail sliver.
+        pad_in = max(0, int(math.ceil(min_chunk_s * sr)) - orig_samples) if dur_s < min_chunk_s else 0
+        eff_dur_s = max(dur_s, min_chunk_s)
+        eff_chunk_s = max(safe_chunk_s, eff_dur_s + 0.05)
+        return eff_chunk_s, 0.0, pad_in
+
+    eff_overlap_s = min(1.0, safe_chunk_s * 0.25)
+    chunk_len_t = int(target_rate * safe_chunk_s)
+    overlap_len_t = int(target_rate * eff_overlap_s)
+    hop_len_t = max(1, chunk_len_t - overlap_len_t)
+    est_target_len = int(math.ceil(orig_samples * target_rate / float(sr)))
+    rem_t = est_target_len % hop_len_t
+    min_tail_t = max(int(min_chunk_s * target_rate), overlap_len_t + int(0.5 * target_rate))
+
+    pad_in = 0
+    if rem_t < min_tail_t:
+        needed_t = (min_tail_t - rem_t) + int(0.05 * target_rate)
+        pad_in = int(math.ceil(needed_t * float(sr) / target_rate))
+    return safe_chunk_s, eff_overlap_s, pad_in
+
+
 def enhance_audio_array(
     pcm: np.ndarray,
     sr: int = 24000,
@@ -414,8 +578,12 @@ def enhance_audio_array(
     Enhances in-memory float32 audio, removes noise, and upsamples to 44.1 kHz.
     Moves model from CPU to GPU on-demand and evacuates 100% of GPU memory immediately after.
     """
+    if pcm is None or len(pcm) == 0:
+        return pcm, sr
+
     try:
         import torch
+        import torch.nn.functional as F
         from resemble_enhance.enhancer.inference import inference
     except ImportError:
         print("[Enhancer Warning] resemble-enhance is not installed. Returning raw audio...")
@@ -438,27 +606,44 @@ def enhance_audio_array(
     try:
         # 1. Transfer model weights from CPU to GPU on-demand (~0.4s)
         cuda_model = cpu_model.to(device)
+        cuda_model.eval()
 
         dwav = torch.from_numpy(pcm.astype(np.float32))
         if dwav.dim() > 1:
             dwav = dwav.mean(dim=-1)
 
-        # 2. Run chunked neural inference
-        hwav, out_sr = inference(
-            model=cuda_model,
-            dwav=dwav,
+        orig_samples = int(dwav.shape[-1])
+        target_rate = int(getattr(getattr(cuda_model, "hp", None), "wav_rate", 44100))
+        eff_chunk_s, eff_overlap_s, pad_in = _prepare_resemble_chunking(
+            orig_samples=orig_samples,
             sr=sr,
-            device=device,
             chunk_seconds=chunk_seconds,
-            overlap_seconds=1.0,
+            target_rate=target_rate,
         )
+        if pad_in > 0:
+            dwav = F.pad(dwav, (0, pad_in))
+
+        # 2. Run chunked neural inference in inference_mode
+        with torch.inference_mode():
+            hwav, out_sr = inference(
+                model=cuda_model,
+                dwav=dwav,
+                sr=sr,
+                device=device,
+                chunk_seconds=eff_chunk_s,
+                overlap_seconds=eff_overlap_s,
+            )
+
+        if pad_in > 0:
+            expected_out_len = int(round(orig_samples * float(out_sr) / float(sr)))
+            hwav = hwav[:expected_out_len]
 
         out_np = hwav.cpu().numpy()
         max_val = np.abs(out_np).max()
         if max_val > 1.0:
             out_np = out_np / max_val * 0.99
 
-        print(f"[Resemble Enhancer] In-memory enhanced {len(pcm)/sr:.1f}s audio in {time.time()-t0:.2f}s (Out SR: {out_sr})")
+        print(f"[Resemble Enhancer] In-memory enhanced {orig_samples/sr:.1f}s audio in {time.time()-t0:.2f}s (Out SR: {out_sr})")
         return out_np.astype(np.float32), int(out_sr)
     finally:
         # 3. Immediately evacuate model weights back to CPU and purge CUDA cache
@@ -761,11 +946,11 @@ def load_any_audio(
                 cmd.extend(["-i", str(audio_input)])
                 input_bytes = None
             out_rate = target_sr or 24000
-            cmd.extend(["-f", "s16le", "-ac", "1", "-ar", str(out_rate), "pipe:1"])
+            cmd.extend(["-f", "f32le", "-ac", "1", "-ar", str(out_rate), "pipe:1"])
             res = subprocess.run(cmd, input=input_bytes, capture_output=True)
             if res.returncode != 0:
                 raise RuntimeError(f"Universal audio decoder failed: {res.stderr.decode()}")
-            data = np.frombuffer(res.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+            data = np.frombuffer(res.stdout, dtype=np.float32).copy()
             sr = out_rate
 
         if data.ndim > 1:

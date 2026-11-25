@@ -222,16 +222,16 @@ def select_burst_steps(active_sessions: dict, max_burst: int = 16) -> int:
 class TokenCapacityCoordinator:
     """
     Intelligent hardware-aware token capacity coordinator for Dual Tesla T4 cluster.
-    Guarantees exactly ~500 MiB safety headroom at peak load across all configurations
-    (INT8, FP16, Q4 burst, unconstrained ASR, and on-demand Enhancer).
+    Guarantees exactly ~500-600 MiB safety headroom at peak load across all configurations
+    (INT8, FP16, Q4 burst, permanent ASR on GPU 0, and on-demand Enhancer on GPU 1).
     """
 
     USABLE_VRAM_MIB = 14910
     SAFETY_HEADROOM_MIB = 500
     TARGET_MAX_VRAM_MIB = 14410
-    VOCODER_SCRATCHPAD_MIB = 1270
-    ASR_PEAK_MIB = 2160
-    ENHANCER_PEAK_MIB = 5055
+    VOCODER_SCRATCHPAD_MIB = 2726  # Empirically measured for Step 480 (Tile 560) on Tesla T4
+    ASR_PEAK_MIB = 2160            # Permanent Whisper Turbo allocation on GPU 0
+    ENHANCER_PEAK_MIB = 5055       # Resemble Enhancer weights + inference peak
     TOKENS_PER_MIB = 4
 
     def __init__(
@@ -254,19 +254,28 @@ class TokenCapacityCoordinator:
             gen_vram += 1400
         self.gen_vram = gen_vram
 
-        # 2. GPU 0 Fixed Ceiling (30,000 tokens for INT8)
+        # 2. GPU 0 Ceiling (Dynamic based on ASR enablement)
+        # When enable_asr=True: reserves 2,160 MiB for Whisper Turbo -> 24,400 tokens (Free VRAM: 524 MiB)
+        # When enable_asr=False: no ASR reservation -> 33,100 tokens (Free VRAM: 509 MiB, matching GPU 1)
         static_0 = self.gen_vram + self.VOCODER_SCRATCHPAD_MIB + (self.ASR_PEAK_MIB if enable_asr else 0)
         kv_0 = max(1000, self.TARGET_MAX_VRAM_MIB - static_0)
-        self.ceiling_gpu0 = min(30000, (kv_0 * self.TOKENS_PER_MIB // 100) * 100)
+        max_cap_0 = 24400 if enable_asr else 33100
+        self.ceiling_gpu0 = min(max_cap_0, (kv_0 * self.TOKENS_PER_MIB // 100) * 100)
 
-        # 3. GPU 1 Normal Ceiling (38,900 tokens for INT8 - Enhancer is 0 MiB on GPU when idle)
+        # 3. GPU 1 Normal Ceiling (Enhancer is 0 MiB on GPU when idle: 3400 + 2726 = 6126 MiB static)
+        # Target: 14,410 - 6,126 = 8,284 MiB -> 33,100 tokens (Free VRAM: 509 MiB)
         static_1 = self.gen_vram + self.VOCODER_SCRATCHPAD_MIB
         kv_1_normal = max(1000, self.TARGET_MAX_VRAM_MIB - static_1)
-        self.ceiling_gpu1_normal = min(38900, (kv_1_normal * self.TOKENS_PER_MIB // 100) * 100)
+        self.ceiling_gpu1_normal = min(33100, (kv_1_normal * self.TOKENS_PER_MIB // 100) * 100)
 
-        # 4. GPU 1 Enhancer Clamped Ceiling (18,400 tokens for INT8 - accounts for all 5,055 MiB weights + inference)
+        # 4. GPU 1 Enhancer Clamped Ceiling (accounts for all 5,055 MiB weights + inference)
+        # Target: 14,410 - (6,126 + 5,055) = 3,229 MiB -> 12,900 tokens (Free VRAM: 504 MiB)
         kv_1_enh = max(1000, self.TARGET_MAX_VRAM_MIB - (static_1 + self.ENHANCER_PEAK_MIB))
-        self.ceiling_gpu1_enh = min(18400, (kv_1_enh * self.TOKENS_PER_MIB // 100) * 100)
+        self.ceiling_gpu1_enh = min(12900, (kv_1_enh * self.TOKENS_PER_MIB // 100) * 100)
+
+        # Compatibility aliases for metric loggers and gateways
+        self.gpu0_ceiling = self.ceiling_gpu0
+        self.gpu1_ceiling = self.ceiling_gpu1_normal
 
     def get_admission_ceiling(self, gpu_id: int) -> int:
         with self.lock:
@@ -342,6 +351,16 @@ class DualInstanceCluster:
             budget -= 5600
         return max(4000, budget)
 
+    @staticmethod
+    def resolve_precision(model_path: str, precision: Optional[str] = None) -> str:
+        """Resolves 'int8' vs 'fp16' from explicit precision or model filename when omitted/'auto'."""
+        if precision is not None:
+            norm = str(precision).strip().lower()
+            if norm and norm != "auto":
+                return norm
+        base = os.path.basename(str(model_path or "")).lower()
+        return "fp16" if ("f16" in base or "fp16" in base) else "int8"
+
     def __init__(
         self,
         model_path: str,
@@ -351,7 +370,7 @@ class DualInstanceCluster:
         q4_threshold: int = 10,
         enable_vocoder: Optional[bool] = None,
         vocoder_mode: str = "on",
-        precision: str = "int8",
+        precision: Optional[str] = None,
         enable_enhancer: bool = True,
         enable_asr: bool = True,
         base_max_tokens: int = 38400,
@@ -362,7 +381,7 @@ class DualInstanceCluster:
         self.q4_model_path = q4_model_path
         self.enable_q4_burst = enable_q4_burst
         self.q4_threshold = q4_threshold
-        self.precision = precision
+        self.precision = self.resolve_precision(model_path, precision)
         self.enable_enhancer = enable_enhancer
         self.enable_asr = enable_asr
         self.sample_rate = 24000
@@ -404,18 +423,18 @@ class DualInstanceCluster:
         self.is_enhancer_running = False
         print(f"   -> Island 1 Online on CUDA1 in {time.time() - t0:.2f}s")
 
-        # Warm up vocoder buffers upfront so the 1,266 MiB gallocr scratchpad is pre-allocated
+        # Warm up vocoder buffers upfront so the gallocr scratchpad is pre-allocated for Step 480 (Tile 560)
         if self.enable_vocoder:
-            print("[Cluster] Pre-allocating bounded tiled vocoder scratchpads on CUDA0 & CUDA1...")
-            dummy_tokens = [0] * (16 * 240)
+            print("[Cluster] Pre-allocating bounded tiled vocoder scratchpads (Step 480, Ctx 80, Tile 560) on CUDA0 & CUDA1...")
+            dummy_tokens = [0] * (16 * 1000)
             if self.voc_a:
                 try:
-                    self.voc_a.decode_tiled(dummy_tokens, ctx_frames=80, step_frames=240)
+                    self.voc_a.decode_tiled(dummy_tokens, ctx_frames=80, step_frames=480)
                 except Exception as e:
                     print(f"   -> Vocoder A warmup warning: {e}")
             if self.voc_b:
                 try:
-                    self.voc_b.decode_tiled(dummy_tokens, ctx_frames=80, step_frames=240)
+                    self.voc_b.decode_tiled(dummy_tokens, ctx_frames=80, step_frames=480)
                 except Exception as e:
                     print(f"   -> Vocoder B warmup warning: {e}")
             print("   -> Bounded Tiled Vocoder Scratchpads Pre-Allocated Cleanly.")
@@ -490,7 +509,7 @@ class DualInstanceCluster:
         self,
         tokens: List[int],
         ctx_frames: int = 80,
-        step_frames: int = 240,
+        step_frames: int = 480,
         gpu_id: Optional[int] = None,
     ) -> np.ndarray:
         """
@@ -1089,6 +1108,9 @@ class DualInstanceCluster:
                 except Exception:
                     pass
                 setattr(self, attr, None)
+
+    def shutdown(self):
+        self.close()
 
     def __del__(self):
         self.close()

@@ -1,0 +1,23 @@
+# Runtime dependencies for Breeze-TTS-2 Engine, Gradio Studio & Worker Gateway
+# Note: Install standard packages first, then install `resemble-enhance` with `--no-deps`
+# on Python 3.12 / Kaggle to preserve system PyTorch/CUDA compatibility:
+#   pip install -r requirements.txt && pip install --no-deps resemble-enhance
+numpy
+scipy
+soundfile
+av<18
+faster-whisper
+deepspeed
+hjson
+tabulate
+celluloid
+resampy
+omegaconf
+ptflops
+librosa
+websockets
+huggingface_hub
+gradio
+matplotlib
+protobuf
+psutil
