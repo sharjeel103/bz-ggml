@@ -21,3 +21,4 @@ gradio
 matplotlib
 protobuf
 psutil
+nvidia-ml-py

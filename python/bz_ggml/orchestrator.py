@@ -13,6 +13,7 @@ Production non-streaming dual-T4 pipeline:
   - Zero temporary WAV files on disk; full in-memory PCM/token hand-offs and real cancellation.
 """
 
+import hashlib
 import math
 import queue
 import threading
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, List, Dict, Any, Tuple, Callable, Union
 import numpy as np
+import urllib.error
 import urllib.request
 try:
     import torch
@@ -65,7 +67,7 @@ class Parcel:
     tasks: List[TaskSpec]
     payload: Dict[str, Any] = field(default_factory=dict)
     return_artifacts: Optional[List[str]] = None
-    upload_targets: Optional[Dict[str, str]] = None
+    upload_targets: Optional[Dict[str, Any]] = None
 
     @classmethod
     def tts_pipeline(
@@ -93,7 +95,7 @@ class Parcel:
         ref_frames: int = 0,
         ref_text: Optional[str] = None,
         return_artifacts: Optional[List[str]] = None,
-        upload_targets: Optional[Dict[str, str]] = None,
+        upload_targets: Optional[Dict[str, Any]] = None,
         parcel_id: Optional[str] = None,
     ) -> "Parcel":
         """Constructs a standard long-form non-streaming TTS production pipeline Parcel."""
@@ -148,7 +150,7 @@ class Parcel:
         master: bool = True,
         max_duration_s: float = 10.0,
         return_artifacts: Optional[List[str]] = None,
-        upload_targets: Optional[Dict[str, str]] = None,
+        upload_targets: Optional[Dict[str, Any]] = None,
         parcel_id: Optional[str] = None,
     ) -> "Parcel":
         """Constructs a Voice Persona Registration pipeline Parcel with strict <= 10s auto-trimming."""
@@ -186,6 +188,7 @@ class Parcel:
 class ParcelResult:
     parcel_id: str
     success: bool = True
+    status: str = "COMPLETED"
     error_message: Optional[str] = None
     duration_s: float = 0.0
     chunks_count: int = 1
@@ -261,12 +264,22 @@ class EngineCapabilities:
             if not upload_targets or not isinstance(upload_targets, dict):
                 raise ValueError("TaskType.UPLOAD requires a valid dictionary of upload_targets in parcel payload.")
             valid_keys = {"audio_mp3", "audio_wav", "subtitles_srt", "transcript_txt", "voice_breeze", "raw_audio_wav", "tokens", "tokens_json"}
-            for k, url in upload_targets.items():
+            for k, target_spec in upload_targets.items():
                 if k not in valid_keys:
                     raise ValueError(f"Invalid upload target '{k}'. Must be one of {valid_keys}.")
-                if not isinstance(url, str) or not (url.startswith("http://") or url.startswith("https://")):
-                    raise ValueError(f"Upload target URL for '{k}' must be a valid HTTP/HTTPS URL.")
-                if k in ("subtitles_srt", "transcript_txt") and TaskType.ASR not in task_types and not parcel.payload.get("transcript"):
+                if isinstance(target_spec, dict):
+                    url = target_spec.get("url") or target_spec.get("upload_url") or ""
+                    allow_inline = bool(target_spec.get("allow_inline_fallback", False))
+                    if url and not (isinstance(url, str) and (url.startswith("http://") or url.startswith("https://"))):
+                        raise ValueError(f"Upload target URL for '{k}' must be a valid HTTP/HTTPS URL.")
+                    if not url and not allow_inline:
+                        raise ValueError(f"Upload target '{k}' has empty URL and allow_inline_fallback is False.")
+                elif isinstance(target_spec, str):
+                    if not (target_spec.startswith("http://") or target_spec.startswith("https://")):
+                        raise ValueError(f"Upload target URL for '{k}' must be a valid HTTP/HTTPS URL.")
+                else:
+                    raise ValueError(f"Upload target '{k}' must be a URL string or target specification dict.")
+                if k in ("subtitles_srt", "transcript_txt") and TaskType.ASR not in task_types and parcel.payload.get("transcript") is None:
                     raise ValueError(f"Upload target '{k}' requested but ASR task is missing from parcel.")
                 if k == "voice_breeze" and TaskType.VOICE_REGISTER not in task_types:
                     raise ValueError(f"Upload target '{k}' requested but VOICE_REGISTER task is missing from parcel.")
@@ -603,7 +616,10 @@ class EngineOrchestrator:
             if TaskType.TTS in task_types:
                 script = parcel.payload.get("script_text", "")
                 words = len(script.split()) if script else 40
-                has_ref = bool(parcel.payload.get("ref_codes") and parcel.payload.get("ref_frames"))
+                has_ref = bool(
+                    (parcel.payload.get("ref_codes") and parcel.payload.get("ref_frames"))
+                    or parcel.payload.get("_has_voice_ref_hint")
+                )
                 step_w = 45 if has_ref else 110
                 chunks_needed = 1 if words <= (60 if has_ref else self.SINGLE_CHUNK_MAX_WORDS) else max(2, math.ceil(words / step_w))
                 if self._pending_tts_chunks + chunks_needed > self.MAX_QUEUE_TTS:
@@ -671,7 +687,7 @@ class EngineOrchestrator:
         """Immediately cancels an active request, aborting any queued or active GPU chunks."""
         with self.state_lock:
             req = self.active_requests.get(request_id)
-            if not req:
+            if not req or req.status in ("COMPLETED", "FAILED", "CANCELLED"):
                 return False
             req.cancel_event.set()
             req.status = "CANCELLED"
@@ -681,6 +697,11 @@ class EngineOrchestrator:
                 assembly.mark_failed()
             self._finalize_request(req)
             return True
+
+    def _is_cancelled(self, request_id: str) -> bool:
+        with self.state_lock:
+            req = self.active_requests.get(request_id)
+            return req is None or req.cancel_event.is_set()
 
     def dispatch(
         self,
@@ -729,12 +750,14 @@ class EngineOrchestrator:
             return ParcelResult(
                 parcel_id=parcel.parcel_id,
                 success=False,
+                status="FAILED",
                 error_message=f"Execution timed out after {timeout}s.",
             )
 
         return req.result or ParcelResult(
             parcel_id=parcel.parcel_id,
             success=req.status == "COMPLETED",
+            status=req.status,
             error_message=req.error_message,
         )
 
@@ -754,6 +777,15 @@ class EngineOrchestrator:
             current_sr=getattr(self.cluster, "sample_rate", 24000),
         )
         with self.state_lock:
+            old_req = self.active_requests.get(req_id)
+            if old_req is not None and old_req.status in ("QUEUED", "RUNNING"):
+                old_req.cancel_event.set()
+                old_req.status = "CANCELLED"
+                old_req.error_message = "Superseded by newer attempt."
+                old_assembly = self.tts_assemblies.pop(req_id, None)
+                if old_assembly:
+                    old_assembly.mark_failed()
+                old_req.completion_event.set()
             self.active_requests[req_id] = req
         return req
 
@@ -776,6 +808,10 @@ class EngineOrchestrator:
             self._report_progress(req, str(t_type.value), 0.05, f"Starting stage '{t_type.value}'...")
 
             job_extra = dict(req.parcel.payload) if req.parcel.payload else {}
+            if req.parcel.upload_targets and "upload_targets" not in job_extra:
+                job_extra["upload_targets"] = req.parcel.upload_targets
+            if isinstance(next_task.params, dict) and next_task.params:
+                job_extra.update(next_task.params)
             if req.transcript and not (isinstance(job_extra.get("transcript"), str) and job_extra["transcript"].strip()):
                 job_extra["transcript"] = req.transcript
 
@@ -1130,21 +1166,7 @@ class EngineOrchestrator:
                 if not req or req.cancel_event.is_set():
                     continue
 
-                if not event.success:
-                    req.status = "FAILED"
-                    req.error_message = event.error_message or f"Task '{event.task_type.value}' failed."
-                    self._finalize_request(req)
-                    continue
-
-                req.completed_stages += 1
                 req.stage_timings[event.task_type.value] = round(event.stage_timing_s, 3)
-
-                if event.output_pcm is not None:
-                    req.current_pcm = event.output_pcm
-                    req.current_sr = event.output_sr
-                    if req.raw_audio_pcm is None and event.task_type in (TaskType.TTS, TaskType.STITCH):
-                        req.raw_audio_pcm = event.output_pcm.copy()
-
                 for k, v in event.artifacts.items():
                     req.artifacts[k] = v
                     if k == "transcript":
@@ -1157,6 +1179,20 @@ class EngineOrchestrator:
                         req.upload_results.update(v)
                     elif k == "fallback_artifact_bytes":
                         req.artifact_bytes.update(v)
+
+                if not event.success:
+                    req.status = "FAILED"
+                    req.error_message = event.error_message or f"Task '{event.task_type.value}' failed."
+                    self._finalize_request(req)
+                    continue
+
+                req.completed_stages += 1
+
+                if event.output_pcm is not None:
+                    req.current_pcm = event.output_pcm
+                    req.current_sr = event.output_sr
+                    if req.raw_audio_pcm is None and event.task_type in (TaskType.TTS, TaskType.STITCH):
+                        req.raw_audio_pcm = event.output_pcm.copy()
 
                 self._report_progress(req, event.task_type.value, 1.0, f"Completed stage '{event.task_type.value}'.")
                 self._enqueue_next_task(req)
@@ -1176,6 +1212,7 @@ class EngineOrchestrator:
             result = ParcelResult(
                 parcel_id=req.request_id,
                 success=(req.status == "COMPLETED"),
+                status=req.status,
                 error_message=req.error_message,
                 duration_s=dur_s,
                 chunks_count=req.metadata.get("chunks_count", 1),
@@ -1407,6 +1444,9 @@ class EngineOrchestrator:
             except queue.Empty:
                 continue
 
+            if self._is_cancelled(job.request_id):
+                continue
+
             t0 = time.time()
             try:
                 pcm = job.input_pcm
@@ -1485,6 +1525,9 @@ class EngineOrchestrator:
             except queue.Empty:
                 continue
 
+            if self._is_cancelled(job.request_id):
+                continue
+
             t0 = time.time()
             try:
                 pcm = job.input_pcm
@@ -1545,6 +1588,9 @@ class EngineOrchestrator:
             except queue.Empty:
                 continue
 
+            if self._is_cancelled(job.request_id):
+                continue
+
             t0 = time.time()
             try:
                 pcm = job.input_pcm
@@ -1603,6 +1649,9 @@ class EngineOrchestrator:
             except queue.Empty:
                 continue
 
+            if self._is_cancelled(job.request_id):
+                continue
+
             t0 = time.time()
             try:
                 pcm = job.input_pcm
@@ -1640,9 +1689,16 @@ class EngineOrchestrator:
             except queue.Empty:
                 continue
 
+            if self._is_cancelled(job.request_id):
+                continue
+
             t0 = time.time()
             try:
-                upload_targets = job.extra.get("upload_targets") or {}
+                upload_targets = (
+                    (job.params.get("targets") if isinstance(job.params, dict) else None)
+                    or job.extra.get("upload_targets")
+                    or {}
+                )
                 if not upload_targets:
                     self.completion_queue.put(
                         JobDoneEvent(
@@ -1654,28 +1710,30 @@ class EngineOrchestrator:
                     )
                     continue
 
-                upload_results = {}
-                fallback_bytes = {}
-                any_failed = False
+                upload_results: Dict[str, Dict[str, Any]] = {}
+                fallback_bytes: Dict[str, bytes] = {}
+                failed_errors: List[str] = []
                 current_pcm = job.input_pcm
                 current_sr = job.input_sr
 
                 with self.state_lock:
                     req = self.active_requests.get(job.request_id)
-                    subs = req.subtitles_srt if req else None
-                    txt = req.transcript if req else None
-                    v_bytes = req.voice_bytes if req else None
-                    raw_pcm = req.raw_audio_pcm if req else None
-                    toks = req.tokens if req else None
+                    if req is None or req.cancel_event.is_set():
+                        continue
+                    subs = req.subtitles_srt
+                    txt = req.transcript if req.transcript is not None else job.extra.get("transcript")
+                    v_bytes = req.voice_bytes
+                    raw_pcm = req.raw_audio_pcm
+                    toks = req.tokens
 
                 def get_bytes(name: str) -> Tuple[Optional[bytes], str]:
                     if name == "audio_mp3" and current_pcm is not None:
                         return encode_pcm_to_mp3_bytes(current_pcm, current_sr), "audio/mpeg"
                     elif name == "audio_wav" and current_pcm is not None:
                         return encode_pcm_to_wav_bytes(current_pcm, current_sr), "audio/wav"
-                    elif name == "subtitles_srt" and subs:
+                    elif name == "subtitles_srt" and subs is not None:
                         return subs.encode("utf-8"), "application/x-subrip"
-                    elif name == "transcript_txt" and txt:
+                    elif name == "transcript_txt" and txt is not None:
                         return txt.encode("utf-8"), "text/plain; charset=utf-8"
                     elif name == "voice_breeze" and v_bytes:
                         return v_bytes, "application/octet-stream"
@@ -1686,41 +1744,128 @@ class EngineOrchestrator:
                         return json.dumps(toks).encode("utf-8"), "application/json"
                     return None, "application/octet-stream"
 
-                for art_name, target_url in upload_targets.items():
-                    art_bytes, mime = get_bytes(art_name)
+                def put_with_retries(url: str, data: bytes, mime_type: str, max_attempts: int = 3) -> Tuple[bool, int, str]:
+                    last_status = 0
+                    last_err = ""
+                    for attempt_idx in range(max_attempts):
+                        if self._is_cancelled(job.request_id):
+                            return False, 0, "CANCELLED"
+                        try:
+                            req_http = urllib.request.Request(
+                                url,
+                                data=data,
+                                headers={"Content-Type": mime_type, "Content-Length": str(len(data))},
+                                method="PUT",
+                            )
+                            with urllib.request.urlopen(req_http, timeout=30.0) as resp:
+                                last_status = getattr(resp, "status", 200)
+                                if last_status in (200, 201, 204):
+                                    return True, last_status, ""
+                                last_err = f"HTTP {last_status}"
+                        except urllib.error.HTTPError as http_err:
+                            last_status = http_err.code
+                            last_err = f"HTTP {http_err.code}: {http_err.reason}"
+                            # Never retry client errors except 429 Too Many Requests
+                            if 400 <= http_err.code < 500 and http_err.code != 429:
+                                return False, last_status, last_err
+                        except Exception as up_err:
+                            last_err = str(up_err)
+
+                        if attempt_idx + 1 < max_attempts:
+                            time.sleep(0.5 * (2 ** attempt_idx))
+                    return False, last_status, last_err
+
+                for art_name, target_spec in upload_targets.items():
+                    if self._is_cancelled(job.request_id):
+                        break
+
+                    if isinstance(target_spec, dict):
+                        target_url = target_spec.get("url") or target_spec.get("upload_url") or ""
+                        override_mime = target_spec.get("mime_type") or ""
+                        allow_inline = bool(target_spec.get("allow_inline_fallback", False))
+                        max_inline = int(target_spec.get("max_inline_bytes", 0) or 0)
+                    else:
+                        target_url = str(target_spec or "")
+                        override_mime = ""
+                        allow_inline = False
+                        max_inline = 0
+
+                    art_bytes, default_mime = get_bytes(art_name)
+                    mime = override_mime or default_mime
                     if art_bytes is None:
-                        upload_results[art_name] = {"success": False, "error": f"Artifact '{art_name}' not available."}
-                        any_failed = True
+                        err_msg = f"Artifact '{art_name}' not available."
+                        upload_results[art_name] = {
+                            "success": False,
+                            "uploaded": False,
+                            "size_bytes": 0,
+                            "sha256": "",
+                            "mime_type": mime,
+                            "error": err_msg,
+                        }
+                        failed_errors.append(err_msg)
                         continue
 
-                    try:
-                        req_http = urllib.request.Request(
-                            target_url,
-                            data=art_bytes,
-                            headers={"Content-Type": mime, "Content-Length": str(len(art_bytes))},
-                            method="PUT",
+                    size_bytes = len(art_bytes)
+                    sha256_hex = hashlib.sha256(art_bytes).hexdigest()
+
+                    if target_url:
+                        ok, status_code, err_str = put_with_retries(target_url, art_bytes, mime)
+                        if ok:
+                            upload_results[art_name] = {
+                                "success": True,
+                                "uploaded": True,
+                                "status": status_code,
+                                "size_bytes": size_bytes,
+                                "sha256": sha256_hex,
+                                "mime_type": mime,
+                            }
+                            continue
+                        if err_str == "CANCELLED":
+                            break
+                    else:
+                        status_code = 0
+                        err_str = "no upload_url provided"
+
+                    # Primary PUT skipped or failed: evaluate inline fallback policy
+                    if allow_inline and (max_inline == 0 or size_bytes <= max_inline):
+                        fallback_bytes[art_name] = art_bytes
+                        upload_results[art_name] = {
+                            "success": True,
+                            "uploaded": False,
+                            "fallback_inline": True,
+                            "status": status_code,
+                            "size_bytes": size_bytes,
+                            "sha256": sha256_hex,
+                            "mime_type": mime,
+                            "upload_error": err_str if target_url else "",
+                        }
+                    else:
+                        reason = (
+                            f"Artifact '{art_name}' upload failed ({err_str}) and exceeds max_inline_bytes ({size_bytes} > {max_inline})"
+                            if (allow_inline and max_inline > 0 and size_bytes > max_inline)
+                            else f"Artifact '{art_name}' upload failed ({err_str}) with inline fallback disabled."
                         )
-                        with urllib.request.urlopen(req_http, timeout=30.0) as resp:
-                            if resp.status in (200, 201, 204):
-                                upload_results[art_name] = {"success": True, "status": resp.status}
-                            else:
-                                upload_results[art_name] = {"success": False, "status": resp.status}
-                                any_failed = True
-                    except Exception as up_err:
-                        upload_results[art_name] = {"success": False, "error": str(up_err)}
-                        any_failed = True
+                        upload_results[art_name] = {
+                            "success": False,
+                            "uploaded": False,
+                            "status": status_code,
+                            "size_bytes": size_bytes,
+                            "sha256": sha256_hex,
+                            "mime_type": mime,
+                            "error": reason,
+                        }
+                        failed_errors.append(reason)
 
-                if any_failed:
-                    for art_name in upload_targets.keys():
-                        b, _ = get_bytes(art_name)
-                        if b:
-                            fallback_bytes[art_name] = b
+                if self._is_cancelled(job.request_id):
+                    continue
 
+                all_ok = len(failed_errors) == 0
                 self.completion_queue.put(
                     JobDoneEvent(
                         request_id=job.request_id,
                         task_type=TaskType.UPLOAD,
-                        success=True,
+                        success=all_ok,
+                        error_message="; ".join(failed_errors) if not all_ok else None,
                         output_pcm=current_pcm,
                         output_sr=current_sr,
                         artifacts={

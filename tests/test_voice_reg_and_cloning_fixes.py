@@ -516,38 +516,55 @@ int main() {
 
     def test_gateway_parse_dispatch_job_auto_gate_and_explicit_enhance(self):
         import json
-        from types import SimpleNamespace
         from bz_ggml.gateway import MTLSGatewayClient
+        from bz_ggml.proto import worker_pb2
 
         gw = MTLSGatewayClient.__new__(MTLSGatewayClient)
 
-        d_vreg = SimpleNamespace(
-            job_type_name="voice_registration",
+        d_vreg = worker_pb2.Dispatch(
+            job_type="voice_registration",
             quality="standard",
-            params=json.dumps({"voice_name": "cilian", "audio_input": "/tmp/sample.wav"}).encode("utf-8"),
+            params_json=json.dumps({"voice_name": "cilian", "audio_input": "/tmp/sample.wav"}).encode("utf-8"),
         )
-        p_vreg = gw._parse_dispatch_job("job_vreg", d_vreg)
+        p_vreg = gw.parse_dispatch_to_parcel("job_vreg", d_vreg)
         types_vreg = [t.task_type for t in p_vreg.tasks]
         self.assertEqual(types_vreg, [TaskType.ENHANCE, TaskType.MASTER, TaskType.ASR, TaskType.VOICE_REGISTER])
         self.assertEqual(p_vreg.tasks[0].params.get("auto_gate"), True)
         self.assertEqual(p_vreg.tasks[0].params.get("min_snr_db"), 30.0)
 
-        d_studio_raw = SimpleNamespace(
-            job_type_name="tts_clone",
+        d_studio_raw = worker_pb2.Dispatch(
+            job_type="tts_clone",
             quality="studio",
-            params=json.dumps({"script_text": "hello", "enhance": False, "master": True}).encode("utf-8"),
+            params_json=json.dumps({"script_text": "hello", "enhance": False, "master": True}).encode("utf-8"),
         )
-        p_studio_raw = gw._parse_dispatch_job("job_studio_raw", d_studio_raw)
+        p_studio_raw = gw.parse_dispatch_to_parcel("job_studio_raw", d_studio_raw)
         types_raw = [t.task_type for t in p_studio_raw.tasks]
         self.assertEqual(types_raw, [TaskType.TTS, TaskType.MASTER])
 
-        d_studio_def = SimpleNamespace(
-            job_type_name="tts_clone",
+        d_studio_def = worker_pb2.Dispatch(
+            job_type="tts_clone",
             quality="studio",
-            params=json.dumps({"script_text": "hello"}).encode("utf-8"),
+            params_json=json.dumps({"script_text": "hello"}).encode("utf-8"),
         )
-        p_studio_def = gw._parse_dispatch_job("job_studio_def", d_studio_def)
+        p_studio_def = gw.parse_dispatch_to_parcel("job_studio_def", d_studio_def)
         self.assertEqual([t.task_type for t in p_studio_def.tasks], [TaskType.TTS, TaskType.ENHANCE, TaskType.MASTER])
+
+        # Verify explicit Dispatch.stages[] aliases + auto_gate preservation + voice_breeze ref hint
+        d_explicit = worker_pb2.Dispatch(
+            job_type="voice_registration",
+            quality="standard",
+            stages=[
+                worker_pb2.StageSpec(stage_type="audio_enhance", params_json=b'{"chunk_seconds": 10.0}'),
+                worker_pb2.StageSpec(stage_type="voice_reg", params_json=b"{}"),
+            ],
+            input_assets=[worker_pb2.InputAsset(role="voice_breeze", inline_bytes=b"mock")],
+            params_json=json.dumps({"voice_name": "cilian"}).encode("utf-8"),
+        )
+        p_explicit = gw.parse_dispatch_to_parcel("job_explicit", d_explicit)
+        self.assertEqual([t.task_type for t in p_explicit.tasks], [TaskType.ENHANCE, TaskType.VOICE_REGISTER])
+        self.assertTrue(p_explicit.tasks[0].params.get("auto_gate"))
+        self.assertEqual(p_explicit.tasks[0].params.get("min_snr_db"), 30.0)
+        self.assertTrue(p_explicit.payload.get("_has_voice_ref_hint"))
 
     def test_gradio_app_option_a_defaults_and_helpers(self):
         repo_python = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python")

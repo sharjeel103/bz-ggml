@@ -1,81 +1,185 @@
 syntax = "proto3";
-
 package workerpb;
 
-enum JobType {
-  UNKNOWN       = 0;
-  REGISTER      = 1;
-  REGISTER_ACK  = 2;
-  DISPATCH      = 3;
-  ACK           = 4;
-  DENY          = 5;
-  CHUNK         = 6;
-  STATUS        = 7;
-  CANCEL        = 8;
-  CANCEL_ACK    = 9;
-  SYNC_REQUEST  = 10;
-  SYNC_RESPONSE = 11;
-}
+option go_package = "server/internal/cluster/workerpb";
 
+// Single-pass binary envelope for all Worker <-> Go Monolith traffic over mTLS WebSocket.
+// Completely job-type-agnostic: the core routes based on capabilities, stages, and capacity.
 message Envelope {
-  string  job_id     = 1;
-  int32   attempt    = 2;
-  JobType type       = 3;
-  bytes   payload    = 4;   // marshalled bytes of whichever message matches `type`
-  int64   ts_unix_ms = 5;
+  string job_id     = 1; // Empty for worker-level messages (Register, Telemetry, Sync)
+  uint32 attempt    = 2; // Fencing token monotonically incremented on each dispatch attempt
+  int64  ts_unix_ms = 3;
+
+  oneof msg {
+    Register     register      = 10;
+    RegisterAck  register_ack  = 11;
+    Dispatch     dispatch      = 12;
+    Ack          ack           = 13;
+    Deny         deny          = 14;
+    Progress     progress      = 15;
+    JobResult    result        = 16;
+    Cancel       cancel        = 17;
+    CancelAck    cancel_ack    = 18;
+    Telemetry    telemetry     = 19;
+    SyncRequest  sync_request  = 20;
+    SyncResponse sync_response = 21;
+  }
 }
 
-message RegisterRequest {
-  int32 gpu_count                      = 1;
-  int32 vram_gb                        = 2;
-  repeated JobTypeCapability job_types = 3;
-  int32 global_max_concurrent          = 4;
-  int64 declared_lease_seconds         = 5;
+message GPUInfo {
+  uint32 index         = 1;
+  string model         = 2;
+  uint32 vram_total_mb = 3;
 }
 
-message JobTypeCapability {
-  string job_type_name            = 1;  // "tts_clone", "tts_clone_edit", "tts_voice_description"
-  repeated string quality_tiers   = 2;
-  int32   max_concurrent          = 3;
-  double  throughput_unit_per_sec = 4;
+message Capability {
+  string          name                    = 1; // e.g. "tts_clone", "audio_enhance", "speech_to_text", "video_gen"
+  repeated string quality_tiers           = 2;
+  uint32          max_concurrent_jobs     = 3;
+  double          throughput_unit_per_sec = 4;
 }
 
-message RegisterAck { string worker_id = 1; }
-
-message DispatchJob {
-  string job_type_name = 1;
-  string quality       = 2;
-  bytes  params         = 3;
-  int32  priority        = 4;
+message Register {
+  string              node_id                = 1;
+  string              instance_type          = 2;
+  repeated GPUInfo    gpus                   = 3;
+  repeated Capability capabilities           = 4;
+  uint32              global_max_concurrent  = 5;
+  map<string, uint32> stage_queue_limits     = 6; // e.g. {"tts": 150, "enhance": 8, "asr": 20}
+  int64               declared_lease_seconds = 7; // 0 = permanent / no known lease limit
 }
 
-message AckJob { double eta_seconds = 1; }
-message DenyJob { string reason = 1; }
-
-message Chunk {
-  int64 seq      = 1;
-  bytes data     = 2;
-  bool  is_final = 3;
+message RegisterAck {
+  bool   accepted              = 1;
+  string worker_id             = 2;
+  uint32 telemetry_interval_ms = 3;
+  string rejection_reason      = 4;
 }
 
-message JobStatus {
-  enum State { RUNNING = 0; COMPLETED = 1; FAILED = 2; }
-  State  state = 1;
-  string error = 2;
+message StageSpec {
+  string stage_type  = 1; // Generic stage name, e.g. "tts", "enhance", "master", "asr", "upload"
+  bytes  params_json = 2;
 }
 
-message CancelJob {}
-message CancelAck { bool found = 1; }
+message InputAsset {
+  string role      = 1; // e.g. "reference_audio", "voice_breeze", "audio_input", "init_image"
+  string mime_type = 2;
+  string sha256    = 3; // Hex SHA-256 used for worker local LRU cache & integrity check
+  oneof source {
+    string url          = 4; // Primary: short-lived presigned GET URL
+    bytes  inline_bytes = 5; // Fallback / small input: raw bytes inline
+  }
+}
+
+message OutputTarget {
+  string key                   = 1; // e.g. "audio_mp3", "audio_wav", "subtitles_srt", "voice_breeze"
+  string upload_url            = 2; // Primary: presigned PUT URL (empty => return inline_bytes directly)
+  string mime_type             = 3;
+  bool   allow_inline_fallback = 4; // If PUT fails after retries, return inline_bytes if <= max_inline_bytes
+  uint64 max_inline_bytes      = 5; // 0 = unlimited when fallback is enabled, otherwise strict byte cap
+}
+
+message Dispatch {
+  string                job_type       = 1;
+  string                quality        = 2;
+  uint32                priority       = 3;
+  int64                 deadline_ms    = 4;
+  repeated StageSpec    stages         = 5; // Optional explicit ordered parcel pipeline
+  repeated InputAsset   input_assets   = 6;
+  repeated OutputTarget output_targets = 7;
+  bytes                 params_json    = 8; // Validated modality-specific parameters
+}
+
+message Ack {
+  double eta_seconds    = 1;
+  uint32 queue_position = 2;
+}
+
+message Deny {
+  enum Reason {
+    UNKNOWN         = 0;
+    QUEUE_FULL      = 1;
+    STAGE_SATURATED = 2;
+    VRAM_PRESSURE   = 3;
+    DRAINING        = 4;
+    UNSUPPORTED     = 5;
+    INVALID_PARAMS  = 6;
+  }
+  Reason reason         = 1;
+  uint32 retry_after_ms = 2;
+  string detail         = 3;
+}
+
+message Progress {
+  string stage           = 1;
+  float  progress_pct    = 2; // 0.0 - 100.0
+  float  eta_remaining_s = 3;
+  string message         = 4;
+}
+
+message ArtifactResult {
+  string              key          = 1;
+  bool                uploaded     = 2; // true = PUT to bucket succeeded; false = returned in inline_bytes
+  uint64              size_bytes   = 3;
+  string              sha256       = 4;
+  string              mime_type    = 5;
+  bytes               inline_bytes = 6; // Populated only when uploaded == false
+  map<string, string> meta         = 7; // Generic per-artifact metadata (duration_s, sample_rate, etc.)
+}
+
+message JobResult {
+  enum Status {
+    UNKNOWN   = 0;
+    COMPLETED = 1;
+    FAILED    = 2;
+    CANCELLED = 3;
+  }
+  Status                  status             = 1;
+  string                  error_code         = 2;
+  string                  error_message      = 3;
+  double                  compute_units_used = 4;
+  repeated ArtifactResult artifacts          = 5;
+  map<string, float>      stage_timings      = 6;
+  bytes                   metadata_json      = 7; // Optional modality metadata (transcript, chunks_count, etc.)
+}
+
+message Cancel {}
+
+message CancelAck {
+  bool found = 1;
+}
+
+message GPUTelemetry {
+  uint32 index         = 1;
+  float  sm_util_pct   = 2;
+  uint32 vram_used_mb  = 3;
+  uint32 vram_total_mb = 4;
+  int32  active_load   = 5; // Optional worker-specific load metric (e.g. active KV tokens)
+  int32  load_ceiling  = 6;
+}
+
+message Telemetry {
+  float                 cpu_pct                 = 1;
+  uint32                ram_used_mb             = 2;
+  uint32                ram_total_mb            = 3;
+  repeated GPUTelemetry gpus                    = 4;
+  map<string, uint32>   stage_queue_depths      = 5;
+  uint32                active_jobs             = 6;
+  int64                 remaining_lease_seconds = 7;
+}
 
 message SyncRequest {
   repeated string believed_running_job_ids = 1;
 }
 
 message SyncResponse {
-  message RunningJob { string job_id = 1; int32 attempt = 2; }
-  repeated RunningJob actual_running = 1;
-  int32   free_capacity             = 2;
-  double  gpu_util_pct              = 3;
-  double  vram_used_gb              = 4;
-  int64   remaining_lease_seconds   = 5;
+  message RunningJob {
+    string job_id       = 1;
+    uint32 attempt      = 2;
+    string stage        = 3;
+    float  progress_pct = 4;
+  }
+  repeated RunningJob actual_running          = 1;
+  uint32              free_capacity           = 2;
+  int64               remaining_lease_seconds = 3;
 }
